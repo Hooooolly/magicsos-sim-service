@@ -91,6 +91,8 @@ try:
     _settings.set("/app/livestream/port", WEBRTC_PORT)
     _settings.set("/app/livestream/fixedHostPort", MEDIA_PORT)
     _settings.set("/exts/omni.services.transport.server.http/port", KIT_API_PORT)
+    # Keep Isaac app alive when control-ui websocket disconnects.
+    _settings.set("/app/livestream/nvcf/allowSessionResume", True)
     print(f"[interactive] Carb settings: livestream/port={WEBRTC_PORT}, "
           f"fixedHostPort={MEDIA_PORT}, http/port={KIT_API_PORT}")
 except Exception as exc:
@@ -333,65 +335,26 @@ def code_execute():
 
 # ── Data collection ──────────────────────────────────────────
 
-_collect_thread = None
 _collect_stop = threading.Event()
+_collect_request = None
 
 @bridge.route("/collect/start", methods=["POST"])
 def collect_start():
-    global _collect_thread
-    if _state["collecting"]:
-        return jsonify({"error": "Collection already running"}), 409
-    if not _state["physics"]:
-        return jsonify({"error": "Physics must be running first (POST /physics/play)"}), 400
-
     data = flask_request.get_json(silent=True) or {}
-    num_episodes = data.get("num_episodes", 10)
+    num_episodes = int(data.get("num_episodes", 10))
     output_dir = data.get("output_dir", "/data/collections/latest")
-    skill = data.get("skill", "grasp")
+    skill = str(data.get("skill", "pick_place") or "pick_place")
 
-    _collect_stop.clear()
-    _state["collecting"] = True
-    _state["collect_progress"] = {
-        "total": num_episodes,
-        "completed": 0,
-        "skill": skill,
-        "output_dir": output_dir,
-        "status": "running",
-    }
+    if num_episodes <= 0:
+        return jsonify({"error": "num_episodes must be > 0"}), 400
 
-    def _run_collection():
-        try:
-            print(f"[collect] Starting {num_episodes} episodes → {output_dir}")
-            os.makedirs(output_dir, exist_ok=True)
-
-            for ep in range(num_episodes):
-                if _collect_stop.is_set():
-                    print(f"[collect] Stopped at episode {ep}")
-                    break
-
-                # TODO: Replace with actual MagicSim AutoCollect or IK controller
-                # For now, just step physics and record placeholder data
-                for step in range(100):
-                    if _collect_stop.is_set():
-                        break
-                    # Physics stepping happens in main loop via world.step()
-                    time.sleep(1.0 / 30.0)
-
-                _state["collect_progress"]["completed"] = ep + 1
-                print(f"[collect] Episode {ep + 1}/{num_episodes} done")
-
-            _state["collect_progress"]["status"] = "done"
-            print(f"[collect] Collection complete: {_state['collect_progress']['completed']} episodes")
-        except Exception as exc:
-            print(f"[collect] ERROR: {exc}")
-            _state["collect_progress"]["status"] = f"error: {exc}"
-        finally:
-            _state["collecting"] = False
-
-    _collect_thread = threading.Thread(target=_run_collection, daemon=True, name="collector")
-    _collect_thread.start()
-
-    return jsonify({"status": "started", "num_episodes": num_episodes, "output_dir": output_dir})
+    # Main-thread execution only (Isaac Sim API is not thread-safe).
+    return _enqueue_cmd(
+        "collect_start",
+        num_episodes=num_episodes,
+        output_dir=output_dir,
+        skill=skill,
+    )
 
 
 @bridge.route("/collect/status", methods=["GET"])
@@ -407,6 +370,8 @@ def collect_stop():
     if not _state["collecting"]:
         return jsonify({"error": "No collection running"}), 400
     _collect_stop.set()
+    if _state["collect_progress"]:
+        _state["collect_progress"]["status"] = "stopping"
     return jsonify({"status": "stopping"})
 
 
@@ -426,7 +391,7 @@ print(f"[interactive] Ready. WebRTC port={WEBRTC_PORT}, Kit API=8011, Bridge={BR
 # ── Main-thread command processor ────────────────────────────
 def _process_commands():
     """Drain command queue and execute on main thread (called each frame)."""
-    global PHYSICS_RUNNING
+    global PHYSICS_RUNNING, _collect_request
     while not _cmd_queue.empty():
         try:
             cmd = _cmd_queue.get_nowait()
@@ -453,20 +418,26 @@ def _process_commands():
                 usd_path = cmd["usd_path"]
                 ctx = omni.usd.get_context()
                 print(f"[interactive] Loading scene: {usd_path}")
-                # open_stage returns bool (True=success), NOT a tuple
-                ok = ctx.open_stage(usd_path)
-                if not ok:
-                    cmd["error"] = f"Failed to open stage: {usd_path}"
+
+                # Guard against invalid paths. Some Isaac builds may shutdown app
+                # after open_stage() failures on missing files.
+                if not os.path.exists(usd_path):
+                    cmd["error"] = f"Scene file not found: {usd_path}"
                 else:
-                    for _ in range(300):
-                        simulation_app.update()
-                        if ctx.get_stage_state() == omni.usd.StageState.OPENED:
-                            break
-                        time.sleep(0.05)
-                    _state["scene"] = usd_path
-                    _state["robots"] = {}
-                    print(f"[interactive] Scene loaded: {usd_path}")
-                    cmd["result"] = {"success": True, "scene": usd_path}
+                    # open_stage returns bool (True=success), NOT a tuple
+                    ok = ctx.open_stage(usd_path)
+                    if not ok:
+                        cmd["error"] = f"Failed to open stage: {usd_path}"
+                    else:
+                        for _ in range(300):
+                            simulation_app.update()
+                            if ctx.get_stage_state() == omni.usd.StageState.OPENED:
+                                break
+                            time.sleep(0.05)
+                        _state["scene"] = usd_path
+                        _state["robots"] = {}
+                        print(f"[interactive] Scene loaded: {usd_path}")
+                        cmd["result"] = {"success": True, "scene": usd_path}
 
             elif cmd_type == "robot_spawn":
                 stage = _get_stage()
@@ -532,6 +503,43 @@ def _process_commands():
                     simulation_app.update()
                 cmd["result"] = {"success": True, "output": stdout_capture.getvalue()}
 
+            elif cmd_type == "collect_start":
+                if _state["collecting"]:
+                    cmd["error"] = "Collection already running"
+                elif not _state["physics"]:
+                    cmd["error"] = "Physics must be running first (POST /physics/play)"
+                else:
+                    num_episodes = int(cmd.get("num_episodes", 10))
+                    output_dir = str(cmd.get("output_dir", "/data/collections/latest"))
+                    skill = str(cmd.get("skill", "pick_place") or "pick_place")
+                    if num_episodes <= 0:
+                        cmd["error"] = "num_episodes must be > 0"
+                    else:
+                        _collect_stop.clear()
+                        _state["collecting"] = True
+                        _state["collect_progress"] = {
+                            "total": num_episodes,
+                            "completed": 0,
+                            "skill": skill,
+                            "output_dir": output_dir,
+                            "status": "running",
+                        }
+                        _collect_request = {
+                            "num_episodes": num_episodes,
+                            "output_dir": output_dir,
+                            "skill": skill,
+                        }
+                        cmd["result"] = {
+                            "status": "started",
+                            "num_episodes": num_episodes,
+                            "output_dir": output_dir,
+                            "skill": skill,
+                        }
+                        print(
+                            f"[collect] queued main-thread collection: skill={skill}, "
+                            f"episodes={num_episodes}, output={output_dir}"
+                        )
+
             else:
                 cmd["error"] = f"Unknown command: {cmd_type}"
 
@@ -542,12 +550,57 @@ def _process_commands():
             cmd["event"].set()
 
 
+def _run_pending_collection():
+    """Run queued collection request on the main thread."""
+    global _collect_request
+    if not _collect_request:
+        return
+
+    req = _collect_request
+    _collect_request = None
+    num_episodes = int(req.get("num_episodes", 10))
+    output_dir = str(req.get("output_dir", "/data/collections/latest"))
+    skill = str(req.get("skill", "pick_place"))
+
+    try:
+        os.makedirs(output_dir, exist_ok=True)
+        print(f"[collect] start main-thread run: skill={skill}, episodes={num_episodes}, output={output_dir}")
+
+        from isaac_pick_place_collector import run_collection_in_process
+
+        result = run_collection_in_process(
+            world=world,
+            simulation_app=simulation_app,
+            num_episodes=num_episodes,
+            output_dir=output_dir,
+            stop_event=_collect_stop,
+            progress_callback=lambda ep: _state["collect_progress"].update({"completed": ep}),
+            task_name=skill,
+        )
+
+        final_status = "stopped" if _collect_stop.is_set() else "done"
+        _state["collect_progress"]["status"] = final_status
+        _state["collect_progress"]["result"] = result
+        print(
+            f"[collect] finished: status={final_status}, "
+            f"completed={_state['collect_progress'].get('completed', 0)}"
+        )
+    except Exception as exc:
+        traceback.print_exc()
+        _state["collect_progress"]["status"] = f"error: {exc}"
+        print(f"[collect] ERROR: {exc}")
+    finally:
+        _state["collecting"] = False
+
+
 # ── Main render loop ─────────────────────────────────────────
 step = 0
 try:
     while simulation_app.is_running():
         _process_commands()
-        if world and PHYSICS_RUNNING:
+        if _state["collecting"] and _collect_request is not None:
+            _run_pending_collection()
+        elif world and PHYSICS_RUNNING:
             world.step(render=True)
         else:
             simulation_app.update()
