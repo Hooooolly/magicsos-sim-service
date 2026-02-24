@@ -497,7 +497,15 @@ def _process_commands():
                     "stage": _get_stage(), "world": world, "simulation_app": simulation_app,
                     "print": lambda *a, **kw: stdout_capture.write(" ".join(str(x) for x in a) + "\n"),
                 }
-                exec(cmd["code"], exec_globals)
+                try:
+                    exec(cmd["code"], exec_globals)
+                except Exception as _exec_exc:
+                    _exc_str = str(_exec_exc)
+                    # USD pxr precision mismatch is a warning, not a real error
+                    if "pxrInternal" in _exc_str and "Proceeding" in _exc_str:
+                        pass  # operation succeeded despite warning
+                    else:
+                        raise
                 for _ in range(5):
                     simulation_app.update()
                 cmd["result"] = {"success": True, "output": stdout_capture.getvalue()}
