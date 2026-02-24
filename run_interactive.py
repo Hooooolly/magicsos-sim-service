@@ -491,11 +491,28 @@ def _process_commands():
 
             elif cmd_type == "code_execute":
                 import io as _io
+                import builtins as _builtins
+                from pxr import UsdPhysics, UsdShade, Sdf, Vt
                 stdout_capture = _io.StringIO()
+                # Try importing common Isaac Sim utilities
+                _extra_globals = {}
+                try:
+                    from omni.isaac.core.utils.stage import add_reference_to_stage
+                    _extra_globals["add_reference_to_stage"] = add_reference_to_stage
+                except ImportError:
+                    pass
+                try:
+                    from omni.isaac.core.utils.prims import create_prim
+                    _extra_globals["create_prim"] = create_prim
+                except ImportError:
+                    pass
                 exec_globals = {
-                    "omni": omni, "Gf": Gf, "UsdGeom": UsdGeom, "Usd": Usd,
+                    "__builtins__": _builtins,
+                    "omni": omni, "Gf": Gf, "Sdf": Sdf, "Vt": Vt,
+                    "UsdGeom": UsdGeom, "Usd": Usd, "UsdPhysics": UsdPhysics, "UsdShade": UsdShade,
                     "stage": _get_stage(), "world": world, "simulation_app": simulation_app,
                     "print": lambda *a, **kw: stdout_capture.write(" ".join(str(x) for x in a) + "\n"),
+                    **_extra_globals,
                 }
                 try:
                     exec(cmd["code"], exec_globals)
