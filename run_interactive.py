@@ -523,6 +523,11 @@ def _process_commands():
                         pass  # operation succeeded despite warning
                     else:
                         raise
+                # Clear selection to hide gizmo overlay in WebRTC stream
+                try:
+                    omni.usd.get_context().get_selection().clear_selected_prim_paths()
+                except Exception:
+                    pass
                 for _ in range(5):
                     simulation_app.update()
                 cmd["result"] = {"success": True, "output": stdout_capture.getvalue()}
