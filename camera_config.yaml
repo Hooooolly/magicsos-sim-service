@@ -1,0 +1,42 @@
+# Camera configuration for Franka tabletop manipulation data collection.
+# Scene-independent, task-dependent. MagicSim CameraManager reads this.
+# Two cameras: overhead (cam_high) + wrist-mounted (cam_wrist).
+
+cam_high:
+  camera:
+    type: camera
+    mesh: pinhole
+    resolution: [224, 224]
+    frequency: 30
+    pos: [0.5, 0.0, 1.2]
+    ori: [0, -70, 0]
+    focal_length: 24.0
+    clipping_range: [0.1, 5.0]
+    random:
+      pos: {min: [0, 0, 0], max: [0, 0, 0]}
+      ori: {min: [0, 0, 0], max: [0, 0, 0]}
+  annotator:
+    enabled: true
+    rgb_capture:
+      type: rgb
+      device: cpu
+
+cam_wrist:
+  camera:
+    type: camera
+    mesh: pinhole
+    resolution: [224, 224]
+    frequency: 30
+    pos: [0.04, 0.0, 0.0]
+    ori: [0, -40, 0]
+    mount_link: "robot_0/panda_hand"
+    focal_length: 24.0
+    clipping_range: [0.01, 2.0]
+    random:
+      pos: {min: [0, 0, 0], max: [0, 0, 0]}
+      ori: {min: [0, 0, 0], max: [0, 0, 0]}
+  annotator:
+    enabled: true
+    rgb_capture:
+      type: rgb
+      device: cpu
