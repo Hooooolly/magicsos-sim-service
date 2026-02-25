@@ -101,6 +101,10 @@ IK_PLACE_MIN_CLEARANCE_FROM_TABLE = 0.02
 GRASP_MAX_ATTEMPTS = 3
 REACH_BEFORE_CLOSE_MAX_OBJECT_EEF_DISTANCE = 0.16
 REACH_BEFORE_CLOSE_MAX_OBJECT_EEF_XY_DISTANCE = 0.08
+REACH_BEFORE_CLOSE_MAX_OBJECT_TIP_MID_DISTANCE = 0.03
+REACH_BEFORE_CLOSE_MAX_OBJECT_TIP_MID_XY_DISTANCE = 0.022
+REACH_BEFORE_CLOSE_MAX_ABS_TIP_MID_Z_DELTA = 0.03
+REACH_REQUIRE_TIP_MID = True
 CLOSE_HOLD_STEPS = 8
 VERIFY_CLOSE_MIN_GRIPPER_WIDTH = 0.0025
 VERIFY_CLOSE_MAX_OBJECT_EEF_DISTANCE = 0.25
@@ -1288,6 +1292,51 @@ def _resolve_eef_prim(stage: Any, robot_prim_path: str, get_prim_at_path: Any) -
     return None
 
 
+def _resolve_finger_prim_paths(
+    stage: Any,
+    robot_prim_path: str,
+    get_prim_at_path: Any,
+) -> tuple[str | None, str | None]:
+    left_candidates = [
+        f"{robot_prim_path}/panda_leftfinger",
+        f"{robot_prim_path}/leftfinger",
+        f"{robot_prim_path}/left_finger",
+    ]
+    right_candidates = [
+        f"{robot_prim_path}/panda_rightfinger",
+        f"{robot_prim_path}/rightfinger",
+        f"{robot_prim_path}/right_finger",
+    ]
+
+    def _first_valid(paths: Sequence[str]) -> str | None:
+        for p in paths:
+            prim = get_prim_at_path(p)
+            if prim and prim.IsValid():
+                return p
+        return None
+
+    left = _first_valid(left_candidates)
+    right = _first_valid(right_candidates)
+    if left and right:
+        return left, right
+
+    # Fallback: discover from names under robot hierarchy.
+    for prim in stage.Traverse():
+        if not prim.IsValid():
+            continue
+        path = prim.GetPath().pathString
+        if not path.startswith(robot_prim_path):
+            continue
+        low = path.lower()
+        if left is None and ("leftfinger" in low or "left_finger" in low):
+            left = path
+        if right is None and ("rightfinger" in low or "right_finger" in low):
+            right = path
+        if left and right:
+            break
+    return left, right
+
+
 def _get_eef_pose(
     stage: Any,
     eef_prim_path: str,
@@ -1456,6 +1505,7 @@ def _make_pick_place_waypoints(
     place_pos: tuple[float, float],
     rng: np.random.Generator,
     work_center: tuple[float, float],
+    home_arm: np.ndarray | None = None,
 ) -> list[tuple[str, np.ndarray, float]]:
     def add_noise(base: np.ndarray) -> np.ndarray:
         noise = rng.uniform(-WAYPOINT_NOISE_RAD, WAYPOINT_NOISE_RAD, size=base.shape).astype(np.float32)
@@ -1469,8 +1519,10 @@ def _make_pick_place_waypoints(
     move_place = add_noise(APPROACH_BASE + place_offset)
     down_place = add_noise(DOWN_BASE + place_offset)
 
+    home = _pad_or_trim(_to_numpy(home_arm), 7) if home_arm is not None else HOME.copy()
+
     return [
-        ("HOME", HOME.copy(), GRIPPER_OPEN),
+        ("HOME", home.copy(), GRIPPER_OPEN),
         ("APPROACH_PICK", approach_pick, GRIPPER_OPEN),
         ("DOWN_PICK", down_pick, GRIPPER_OPEN),
         ("CLOSE", down_pick, GRIPPER_CLOSED),
@@ -1479,7 +1531,7 @@ def _make_pick_place_waypoints(
         ("DOWN_PLACE", down_place, GRIPPER_CLOSED),
         ("OPEN", down_place, GRIPPER_OPEN),
         ("RETRACT", move_place, GRIPPER_OPEN),
-        ("HOME_END", HOME.copy(), GRIPPER_OPEN),
+        ("HOME_END", home.copy(), GRIPPER_OPEN),
     ]
 
 
@@ -1493,6 +1545,7 @@ def _make_pick_place_waypoints_ik(
     place_approach_z: float,
     rng: np.random.Generator,
     target_orientation: np.ndarray | None = None,
+    home_arm: np.ndarray | None = None,
 ) -> list[tuple[str, np.ndarray, float]] | None:
     if ik_solver is None:
         return None
@@ -1518,8 +1571,10 @@ def _make_pick_place_waypoints_ik(
         noise = rng.uniform(-0.01, 0.01, size=q.shape).astype(np.float32)
         solved[name] = (q + noise).astype(np.float32)
 
+    home = _pad_or_trim(_to_numpy(home_arm), 7) if home_arm is not None else HOME.copy()
+
     return [
-        ("HOME", HOME.copy(), GRIPPER_OPEN),
+        ("HOME", home.copy(), GRIPPER_OPEN),
         ("APPROACH_PICK", solved["APPROACH_PICK"], GRIPPER_OPEN),
         ("DOWN_PICK", solved["DOWN_PICK"], GRIPPER_OPEN),
         ("CLOSE", solved["DOWN_PICK"], GRIPPER_CLOSED),
@@ -1528,7 +1583,7 @@ def _make_pick_place_waypoints_ik(
         ("DOWN_PLACE", solved["DOWN_PLACE"], GRIPPER_CLOSED),
         ("OPEN", solved["DOWN_PLACE"], GRIPPER_OPEN),
         ("RETRACT", solved["MOVE_TO_PLACE"], GRIPPER_OPEN),
-        ("HOME_END", HOME.copy(), GRIPPER_OPEN),
+        ("HOME_END", home.copy(), GRIPPER_OPEN),
     ]
 
 
@@ -1605,6 +1660,8 @@ def _compute_grasp_metrics(
     object_prim_path: str,
     table_top_z: float,
     object_height: float,
+    finger_left_prim_path: str | None = None,
+    finger_right_prim_path: str | None = None,
 ) -> dict[str, float]:
     joints = _to_numpy(franka.get_joint_positions())
     if joints.size >= 9:
@@ -1619,13 +1676,27 @@ def _compute_grasp_metrics(
     delta = obj_pos - eef_pos
     obj_eef_dist = float(np.linalg.norm(delta))
     obj_eef_xy_dist = float(np.linalg.norm(delta[:2]))
+    tip_mid_metrics: dict[str, float] = {}
+    if finger_left_prim_path and finger_right_prim_path:
+        left_pos, _ = _get_prim_world_pose(stage, finger_left_prim_path, usd, usd_geom)
+        right_pos, _ = _get_prim_world_pose(stage, finger_right_prim_path, usd, usd_geom)
+        if np.all(np.isfinite(left_pos[:3])) and np.all(np.isfinite(right_pos[:3])):
+            tip_mid = 0.5 * (left_pos[:3] + right_pos[:3])
+            tip_delta = obj_pos - tip_mid
+            tip_mid_metrics = {
+                "object_tip_mid_distance": float(np.linalg.norm(tip_delta)),
+                "object_tip_mid_xy_distance": float(np.linalg.norm(tip_delta[:2])),
+                "object_tip_mid_z_delta": float(tip_delta[2]),
+            }
     lift_height = float(obj_pos[2] - (float(table_top_z) + 0.5 * float(object_height)))
-    return {
+    out = {
         "gripper_width": gripper_width,
         "object_eef_distance": obj_eef_dist,
         "object_eef_xy_distance": obj_eef_xy_dist,
         "lift_height": lift_height,
     }
+    out.update(tip_mid_metrics)
+    return out
 
 
 def _verify_after_close(metrics: dict[str, float]) -> bool:
@@ -1645,10 +1716,24 @@ def _verify_after_retrieval(metrics: dict[str, float]) -> bool:
 
 
 def _verify_reach_before_close(metrics: dict[str, float]) -> bool:
-    return bool(
+    eef_ok = bool(
         metrics.get("object_eef_distance", 1e9) <= REACH_BEFORE_CLOSE_MAX_OBJECT_EEF_DISTANCE
         and metrics.get("object_eef_xy_distance", 1e9) <= REACH_BEFORE_CLOSE_MAX_OBJECT_EEF_XY_DISTANCE
     )
+    tip_dist = float(metrics.get("object_tip_mid_distance", np.nan))
+    tip_xy = float(metrics.get("object_tip_mid_xy_distance", np.nan))
+    tip_dz = float(metrics.get("object_tip_mid_z_delta", np.nan))
+    tip_available = np.isfinite(tip_dist) and np.isfinite(tip_xy) and np.isfinite(tip_dz)
+    if not tip_available:
+        return eef_ok
+    tip_ok = bool(
+        tip_dist <= REACH_BEFORE_CLOSE_MAX_OBJECT_TIP_MID_DISTANCE
+        and tip_xy <= REACH_BEFORE_CLOSE_MAX_OBJECT_TIP_MID_XY_DISTANCE
+        and abs(tip_dz) <= REACH_BEFORE_CLOSE_MAX_ABS_TIP_MID_Z_DELTA
+    )
+    if REACH_REQUIRE_TIP_MID:
+        return tip_ok
+    return bool(eef_ok or tip_ok)
 
 
 def _run_pick_place_episode(
@@ -1674,6 +1759,8 @@ def _run_pick_place_episode(
     gf: Any,
     stop_event: threading.Event | None = None,
     episode_timeout_sec: float = DEFAULT_EPISODE_TIMEOUT_SEC,
+    finger_left_prim_path: str | None = None,
+    finger_right_prim_path: str | None = None,
 ) -> tuple[int, bool, bool]:
     world.reset()
     for _ in range(10):
@@ -1866,7 +1953,7 @@ def _run_pick_place_episode(
                     world.step(render=True)
                     _record_frame(arm_target=end_arm, gripper_target=end_gripper)
 
-    def _retreat_to_home_open(home_arm: np.ndarray, lift_arm: np.ndarray) -> None:
+    def _prepare_replan_from_current(lift_arm: np.ndarray) -> None:
         nonlocal stopped
         for _ in range(20):
             if _timeout_triggered():
@@ -1877,13 +1964,14 @@ def _run_pick_place_episode(
             _record_frame(arm_target=lift_arm, gripper_target=GRIPPER_OPEN)
         if stopped:
             return
-        for _ in range(30):
+        for _ in range(8):
             if _timeout_triggered():
                 break
-            arm_cmd, gr_cmd = _step_toward_joint_targets(franka, home_arm, GRIPPER_OPEN)
+            cur_arm = _current_arm_target()
+            arm_cmd, gr_cmd = _step_toward_joint_targets(franka, cur_arm, GRIPPER_OPEN)
             _set_joint_targets(franka, arm_cmd, gr_cmd, physics_control=True)
             world.step(render=True)
-            _record_frame(arm_target=home_arm, gripper_target=GRIPPER_OPEN)
+            _record_frame(arm_target=cur_arm, gripper_target=GRIPPER_OPEN)
 
     for attempt in range(1, GRASP_MAX_ATTEMPTS + 1):
         if _timeout_triggered():
@@ -2005,6 +2093,7 @@ def _run_pick_place_episode(
             world.step(render=True)
             _record_frame()
 
+        attempt_home_arm = _current_arm_target()
         waypoints = _make_pick_place_waypoints_ik(
             ik_solver=ik_solver,
             pick_pos=last_pick_pos,
@@ -2015,9 +2104,16 @@ def _run_pick_place_episode(
             place_approach_z=float(z_targets["place_approach_z"]),
             rng=rng,
             target_orientation=ik_target_orientation,
+            home_arm=attempt_home_arm,
         )
         if waypoints is None:
-            waypoints = _make_pick_place_waypoints(last_pick_pos, place_pos, rng, work_center=work_center)
+            waypoints = _make_pick_place_waypoints(
+                last_pick_pos,
+                place_pos,
+                rng,
+                work_center=work_center,
+                home_arm=attempt_home_arm,
+            )
 
         names = [wp[0] for wp in waypoints]
         if "CLOSE" not in names or "LIFT" not in names:
@@ -2069,6 +2165,8 @@ def _run_pick_place_episode(
             object_prim_path=object_prim_path,
             table_top_z=table_top_z,
             object_height=object_height,
+            finger_left_prim_path=finger_left_prim_path,
+            finger_right_prim_path=finger_right_prim_path,
         )
         reach_ok = _verify_reach_before_close(reach_metrics)
         if not reach_ok:
@@ -2079,7 +2177,7 @@ def _run_pick_place_episode(
                 reach_metrics,
             )
             lift_arm = waypoints[lift_idx][1]
-            _retreat_to_home_open(home_arm=home_arm, lift_arm=lift_arm)
+            _prepare_replan_from_current(lift_arm=lift_arm)
             if stopped:
                 break
             continue
@@ -2106,6 +2204,8 @@ def _run_pick_place_episode(
             object_prim_path=object_prim_path,
             table_top_z=table_top_z,
             object_height=object_height,
+            finger_left_prim_path=finger_left_prim_path,
+            finger_right_prim_path=finger_right_prim_path,
         )
         close_ok = _verify_after_close(close_metrics)
         if not close_ok:
@@ -2116,7 +2216,7 @@ def _run_pick_place_episode(
                 close_metrics,
             )
             lift_arm = waypoints[lift_idx][1]
-            _retreat_to_home_open(home_arm=home_arm, lift_arm=lift_arm)
+            _prepare_replan_from_current(lift_arm=lift_arm)
             if stopped:
                 break
             continue
@@ -2135,6 +2235,8 @@ def _run_pick_place_episode(
             object_prim_path=object_prim_path,
             table_top_z=table_top_z,
             object_height=object_height,
+            finger_left_prim_path=finger_left_prim_path,
+            finger_right_prim_path=finger_right_prim_path,
         )
         retrieval_ok = _verify_after_retrieval(retrieval_metrics)
 
@@ -2151,7 +2253,7 @@ def _run_pick_place_episode(
         )
 
         lift_arm = waypoints[lift_idx][1]
-        _retreat_to_home_open(home_arm=home_arm, lift_arm=lift_arm)
+        _prepare_replan_from_current(lift_arm=lift_arm)
         if stopped:
             break
 
@@ -2403,6 +2505,16 @@ def _setup_pick_place_scene_template(
     eef_prim_path = _resolve_eef_prim(stage, ROBOT_PRIM_PATH, get_prim_at_path)
     if eef_prim_path is None:
         eef_prim_path = f"{ROBOT_PRIM_PATH}/panda_hand"
+    finger_left_prim_path, finger_right_prim_path = _resolve_finger_prim_paths(
+        stage=stage,
+        robot_prim_path=ROBOT_PRIM_PATH,
+        get_prim_at_path=get_prim_at_path,
+    )
+    if not (finger_left_prim_path and finger_right_prim_path):
+        LOG.warning(
+            "collect: fingertip prims not resolved under %s; reach gate falls back to panda_hand distance",
+            ROBOT_PRIM_PATH,
+        )
     ik_solver = _create_franka_ik_solver(
         franka=franka,
         stage=stage,
@@ -2432,6 +2544,8 @@ def _setup_pick_place_scene_template(
         "object_prim_path": OBJECT_PRIM_PATH,
         "robot_prim_path": ROBOT_PRIM_PATH,
         "eef_prim_path": eef_prim_path,
+        "finger_left_prim_path": finger_left_prim_path,
+        "finger_right_prim_path": finger_right_prim_path,
         "get_prim_at_path": get_prim_at_path,
         "usd": Usd,
         "usd_geom": UsdGeom,
@@ -2682,6 +2796,16 @@ def _setup_pick_place_scene_reuse_or_patch(
     from omni.isaac.core.utils.prims import get_prim_at_path
 
     eef_prim_path = _resolve_eef_prim(stage, robot_prim_path, get_prim_at_path) or f"{robot_prim_path}/panda_hand"
+    finger_left_prim_path, finger_right_prim_path = _resolve_finger_prim_paths(
+        stage=stage,
+        robot_prim_path=robot_prim_path,
+        get_prim_at_path=get_prim_at_path,
+    )
+    if not (finger_left_prim_path and finger_right_prim_path):
+        LOG.warning(
+            "collect: fingertip prims not resolved under %s; reach gate falls back to panda_hand distance",
+            robot_prim_path,
+        )
     ik_solver = _create_franka_ik_solver(
         franka=franka,
         stage=stage,
@@ -2700,6 +2824,8 @@ def _setup_pick_place_scene_reuse_or_patch(
         "object_prim_path": object_prim_path,
         "robot_prim_path": robot_prim_path,
         "eef_prim_path": eef_prim_path,
+        "finger_left_prim_path": finger_left_prim_path,
+        "finger_right_prim_path": finger_right_prim_path,
         "get_prim_at_path": get_prim_at_path,
         "usd": Usd,
         "usd_geom": UsdGeom,
@@ -2809,6 +2935,8 @@ def run_collection_in_process(
                     gf=ctx["gf"],
                     stop_event=stop_event,
                     episode_timeout_sec=episode_timeout_sec,
+                    finger_left_prim_path=ctx.get("finger_left_prim_path"),
+                    finger_right_prim_path=ctx.get("finger_right_prim_path"),
                 )
             finally:
                 writer.finish_episode(

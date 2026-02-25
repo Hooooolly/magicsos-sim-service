@@ -588,3 +588,31 @@ Files in platform repo:
   - Runtime summary:
     - VLM region labels were returned, but face back-projection produced zero guided faces for this mesh.
     - script fell back to blind antipodal + top-down and generated 54 body grasps.
+
+## Hotfix (2026-02-25 07:25 UTC, tip-mid reach gate + replan from current state)
+- User issue:
+  - Collector frequently failed `reach_before_close` and "poked" around the object.
+  - Existing gate only used `object <-> panda_hand` residual, which is offset from true finger contact region.
+
+- Root-cause level updates in `sim-service/isaac_pick_place_collector.py`:
+  - Added fingertip-prim discovery:
+    - `_resolve_finger_prim_paths(...)` resolves left/right finger links (`panda_leftfinger`, `panda_rightfinger`) with fallback discovery under robot hierarchy.
+  - Upgraded grasp metrics:
+    - `_compute_grasp_metrics(...)` now computes:
+      - `object_tip_mid_distance`
+      - `object_tip_mid_xy_distance`
+      - `object_tip_mid_z_delta`
+    - based on finger midpoint `(left + right) / 2`.
+  - Upgraded reach gate:
+    - `_verify_reach_before_close(...)` now prioritizes fingertip-midpoint thresholds.
+    - If fingertip links are unavailable, falls back to previous `panda_hand`-distance gate.
+  - Replan behavior switched to current-state replanning:
+    - retry no longer forces hard retreat to fixed `HOME`.
+    - on reach/close/retrieval verify failure, collector now:
+      - opens gripper
+      - lifts to safe arm target
+      - replans next attempt from current arm state (`home_arm=_current_arm_target()` in waypoint generation).
+
+- Expected effect:
+  - Close command triggers at more physically meaningful contact geometry (finger midpoint).
+  - Retry loop keeps continuity and reduces unnecessary long round-trips to fixed home pose.
