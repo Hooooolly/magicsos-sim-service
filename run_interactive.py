@@ -890,7 +890,13 @@ _collect_request = None
 @bridge.route("/collect/start", methods=["POST"])
 def collect_start():
     if _state["collecting"] or _collect_request is not None:
-        return jsonify({"error": "Collection already running"}), 409
+        return jsonify(
+            {
+                "status": "already_running",
+                "collecting": True,
+                "progress": _state.get("collect_progress"),
+            }
+        ), 200
     data = flask_request.get_json(silent=True) or {}
     try:
         num_episodes = int(data.get("num_episodes", 10))

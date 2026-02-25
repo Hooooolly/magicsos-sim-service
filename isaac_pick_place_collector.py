@@ -83,10 +83,10 @@ WAYPOINT_NOISE_RAD = 0.05
 OBJECT_SIZE = 0.04
 OBJECT_MASS = 0.1
 MIN_PICK_PLACE_DIST = 0.1
-STEPS_PER_SEGMENT = 70
+STEPS_PER_SEGMENT = 50
 TABLE_MARGIN = 0.08
-MAX_ARM_STEP_RAD = 0.03
-MAX_GRIPPER_STEP = 0.004
+MAX_ARM_STEP_RAD = 0.05
+MAX_GRIPPER_STEP = 0.008
 
 TABLE_X_RANGE = (0.3, 0.7)
 TABLE_Y_RANGE = (-0.3, 0.3)
@@ -101,17 +101,19 @@ IK_PLACE_MIN_CLEARANCE_FROM_TABLE = 0.02
 GRASP_MAX_ATTEMPTS = 3
 REACH_BEFORE_CLOSE_MAX_OBJECT_EEF_DISTANCE = 0.10
 REACH_BEFORE_CLOSE_MAX_OBJECT_EEF_XY_DISTANCE = 0.04
-CLOSE_HOLD_STEPS = 15
-VERIFY_CLOSE_MIN_GRIPPER_WIDTH = 0.006
-VERIFY_CLOSE_MAX_OBJECT_EEF_DISTANCE = 0.12
-VERIFY_CLOSE_MAX_OBJECT_EEF_XY_DISTANCE = 0.05
-VERIFY_RETRIEVAL_MIN_LIFT = 0.015
-VERIFY_RETRIEVAL_MAX_OBJECT_EEF_DISTANCE = 0.15
+CLOSE_HOLD_STEPS = 8
+VERIFY_CLOSE_MIN_GRIPPER_WIDTH = 0.0025
+VERIFY_CLOSE_MAX_OBJECT_EEF_DISTANCE = 0.25
+VERIFY_CLOSE_MAX_OBJECT_EEF_XY_DISTANCE = 0.08
+VERIFY_RETRIEVAL_MIN_LIFT = 0.008
+VERIFY_RETRIEVAL_MAX_OBJECT_EEF_DISTANCE = 0.30
 ROBOT_REACH_RADIUS_X = 0.75
 ROBOT_REACH_RADIUS_Y = 0.75
 REACH_INTERSECTION_MIN_SPAN = 0.25
 PICK_CLAMP_MAX_DELTA = 0.03
 DEFAULT_EPISODE_TIMEOUT_SEC = 180.0
+WRIST_CAM_TRANSLATE = (0.05, 0.0, 0.04)
+WRIST_CAM_ROTATE_XYZ = (10.0, 90.0, 0.0)
 
 COLLECTOR_ROOT = "/World/PickPlaceCollector"
 TABLE_PRIM_PATH = f"{COLLECTOR_ROOT}/Table"
@@ -459,7 +461,7 @@ def _build_frame_extras(
     usd_geom: Any,
     current_target: Optional[dict[str, Any]],
 ) -> dict[str, Any]:
-    obj_pos, obj_quat = _get_prim_world_pose(stage, object_prim_path, usd, usd_geom)
+    obj_pos, obj_quat = _get_object_tracking_pose(stage, object_prim_path, usd, usd_geom)
     object_pose = np.concatenate([obj_pos[:3], _normalize_quat_wxyz(obj_quat)], axis=0).astype(np.float32)
 
     source_id = GRASP_POSE_SOURCE_IDS["none"]
@@ -892,6 +894,35 @@ def _match_target_hint(name: str, hints: Sequence[str]) -> bool:
     return False
 
 
+def _prim_matches_target_hint_deep(prim: Any, hints: Sequence[str]) -> bool:
+    """Match hints against root + descendant names/paths.
+
+    This helps disambiguate assets like different mug variants where the root
+    prim may be generic (/World/Mug) but children contain SM_Mug_C1/B1 tokens.
+    """
+    if prim is None or not prim.IsValid() or not hints:
+        return False
+    try:
+        if _match_target_hint(prim.GetName(), hints):
+            return True
+        if _match_target_hint(prim.GetPath().pathString, hints):
+            return True
+    except Exception:
+        pass
+
+    for sub in _iter_descendants(prim):
+        if sub is None or not sub.IsValid():
+            continue
+        try:
+            if _match_target_hint(sub.GetName(), hints):
+                return True
+            if _match_target_hint(sub.GetPath().pathString, hints):
+                return True
+        except Exception:
+            continue
+    return False
+
+
 def _resolve_target_object_prim(
     stage: Any,
     usd_geom: Any,
@@ -918,7 +949,7 @@ def _resolve_target_object_prim(
 
     if target_hints:
         for prim in candidates:
-            if _match_target_hint(prim.GetName(), target_hints):
+            if _prim_matches_target_hint_deep(prim, target_hints):
                 return prim.GetPath().pathString
 
     # Prefer common tabletop manipulands.
@@ -1072,6 +1103,27 @@ def _get_prim_world_pose(stage: Any, prim_path: str, usd: Any, usd_geom: Any) ->
         quat = np.array([float(q.GetReal()), float(imag[0]), float(imag[1]), float(imag[2])], dtype=np.float32)
     except Exception:
         pass
+    return pos, quat
+
+
+def _get_object_tracking_pose(
+    stage: Any,
+    object_prim_path: str,
+    usd: Any,
+    usd_geom: Any,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Stable object pose for logging/verification.
+
+    For many referenced assets, root pivot is not the visual/physical center.
+    Use bbox center for position tracking, while keeping root quaternion.
+    """
+    pos, quat = _get_prim_world_pose(stage, object_prim_path, usd, usd_geom)
+    bbox = _compute_prim_bbox(stage, object_prim_path, usd_geom)
+    if bbox:
+        mn, mx = bbox
+        center = 0.5 * (mn + mx)
+        if np.all(np.isfinite(center)):
+            pos = center.astype(np.float32)
     return pos, quat
 
 
@@ -1470,7 +1522,7 @@ def _compute_grasp_metrics(
     else:
         gripper_width = 0.0
 
-    obj_pos, _ = _get_prim_world_pose(stage, object_prim_path, usd, usd_geom)
+    obj_pos, _ = _get_object_tracking_pose(stage, object_prim_path, usd, usd_geom)
     eef_pos, _ = _get_eef_pose(stage, eef_prim_path, get_prim_at_path, usd, usd_geom)
     delta = obj_pos - eef_pos
     obj_eef_dist = float(np.linalg.norm(delta))
@@ -1970,6 +2022,17 @@ def _run_pick_place_episode(
     else:
         LOG.info("Episode %d interrupted by stop event", episode_index + 1)
 
+    # Ensure each episode ends in a predictable home/open pose unless an explicit stop is active.
+    if not stopped and not (stop_event is not None and stop_event.is_set()):
+        try:
+            for _ in range(45):
+                arm_cmd, gr_cmd = _step_toward_joint_targets(franka, HOME, GRIPPER_OPEN)
+                _set_joint_targets(franka, arm_cmd, gr_cmd, physics_control=True)
+                world.step(render=True)
+            LOG.info("Episode %d returned to HOME pose", episode_index + 1)
+        except Exception as exc:
+            LOG.warning("Episode %d failed to return HOME pose: %s", episode_index + 1, exc)
+
     return frame_index, stopped, grasp_succeeded
 
 
@@ -2038,8 +2101,8 @@ def _setup_pick_place_scene_template(
     wrist_xform.ClearXformOpOrder()
     # Place wrist camera slightly in front of the hand and pitch downward
     # so fingers + grasp target remain in view.
-    wrist_xform.AddTranslateOp().Set(Gf.Vec3d(0.03, 0.0, 0.06))
-    wrist_xform.AddRotateXYZOp().Set(Gf.Vec3f(70.0, 0.0, 0.0))
+    wrist_xform.AddTranslateOp().Set(Gf.Vec3d(*WRIST_CAM_TRANSLATE))
+    wrist_xform.AddRotateXYZOp().Set(Gf.Vec3f(*WRIST_CAM_ROTATE_XYZ))
     wrist_cam_usd.GetFocalLengthAttr().Set(14.0)
     wrist_cam_usd.GetClippingRangeAttr().Set(Gf.Vec2f(0.01, 1000.0))
 
@@ -2358,8 +2421,8 @@ def _setup_pick_place_scene_reuse_or_patch(
         wrist_usd = UsdGeom.Camera(wrist_prim)
         wrist_xf = UsdGeom.Xformable(wrist_prim)
         wrist_xf.ClearXformOpOrder()
-        wrist_xf.AddTranslateOp().Set(Gf.Vec3d(0.03, 0.0, 0.06))
-        wrist_xf.AddRotateXYZOp().Set(Gf.Vec3f(70.0, 0.0, 0.0))
+        wrist_xf.AddTranslateOp().Set(Gf.Vec3d(*WRIST_CAM_TRANSLATE))
+        wrist_xf.AddRotateXYZOp().Set(Gf.Vec3f(*WRIST_CAM_ROTATE_XYZ))
         try:
             wrist_usd.GetFocalLengthAttr().Set(14.0)
             wrist_usd.GetClippingRangeAttr().Set(Gf.Vec2f(0.01, 1000.0))
