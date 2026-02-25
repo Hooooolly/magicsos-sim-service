@@ -616,3 +616,52 @@ Files in platform repo:
 - Expected effect:
   - Close command triggers at more physically meaningful contact geometry (finger midpoint).
   - Retry loop keeps continuity and reduces unnecessary long round-trips to fixed home pose.
+
+## Hotfix (2026-02-25 08:20 UTC, scene/collector Franka URL fallback repair)
+- User issue:
+  - Scene asset fetch occasionally failed with stale S3 URLs.
+  - Running `posecheck/posetest` instance still showed old Franka fallback (`Isaac/4.5/.../franka.usd`) in live runtime helper.
+
+- Root-cause updates:
+  - `sim-service/run_interactive.py`:
+    - `_runtime_create_franka(...)` fallback list replaced invalid `Isaac/4.5/.../franka.usd`
+      with valid `Isaac/2023.1.1/Isaac/Robots/Franka/franka.usd`.
+  - `sim-service/isaac_pick_place_collector.py`:
+    - `_franka_usd_candidates(...)` fallback list replaced invalid `4.5` Franka URL
+      with valid `2023.1.1` Franka URL.
+  - `infra-backend/apis/sim.py`:
+    - Added `_normalize_known_broken_asset_urls(code)` for deterministic URL rewrite before bridge execution.
+    - Scene-chat now auto-rewrites known broken paths, including:
+      - `Isaac/4.5/.../FrankaPanda/franka.usd` -> `Isaac/5.1/.../FrankaPanda/franka.usd`
+      - `Isaac/5.1/.../Robots/Franka/franka.usd` -> `Isaac/2023.1.1/.../Robots/Franka/franka.usd`
+      - `YCB Axis_Aligned(_Physics)/025_mug.usd` -> `Props/Mugs/SM_Mug_C1.usd`
+    - Applied rewrite in all code generation/repair paths (initial, retry, verification-fix).
+    - Updated inline Franka candidate lists in scene-chat helper paths to use `2023.1.1` fallback.
+
+- Verification notes:
+  - Runtime introspection on active HGX instance confirmed it was still running old helper code before redeploy,
+    so pod/service restart or rolling refresh is required for runtime to pick up the new helper.
+
+## Hotfix (2026-02-25 08:50 UTC, local-first scene asset loading for mug/franka helpers)
+- User request:
+  - Avoid depending on remote URL fetch for every scene object placement.
+  - Prefer local Isaac asset root where available.
+
+- Changes in `sim-service/run_interactive.py`:
+  - Added runtime helper `create_mug(...)` exposed to scene-chat execution globals.
+  - `create_mug(...)` candidate resolution order:
+    1) explicit `usd_path`
+    2) local `get_assets_root_path()` mug paths
+    3) public S3 mug paths as fallback
+  - `create_mug(...)` applies correct transform scale (0.01), rigid body, and mesh collision.
+  - `create_franka(...)` fallback URL updated from invalid `Isaac/4.5/...` to valid `Isaac/2023.1.1/...`.
+  - Runtime helper import stripping and stage-mutation detection now include `create_mug`.
+
+- Changes in `infra-backend/apis/sim.py`:
+  - Scene-chat prompt now advertises `create_mug(...)` helper and instructs mug creation through helper.
+  - Added dynamic helper injection for `create_mug(...)` when LLM references helper without definition.
+  - Added deterministic URL normalization for known stale paths before bridge execution/retry/fix phases.
+
+- Expected effect:
+  - For supported objects (Franka + Mug), scene-chat no longer relies on a single remote URL path;
+    local asset root is attempted first and network becomes fallback.

@@ -328,7 +328,7 @@ def _strip_runtime_helper_imports(code: str) -> str:
     """Remove invalid helper imports that LLM may generate for runtime-injected helpers."""
     if not code:
         return code
-    helper_names = {"create_table", "create_franka"}
+    helper_names = {"create_table", "create_franka", "create_mug"}
     stage_import_re = re.compile(r"^(\s*from\s+omni\.isaac\.core\.utils\.stage\s+import\s+)(.+)$")
     cleaned = []
     for line in code.splitlines():
@@ -349,7 +349,7 @@ def _strip_runtime_helper_imports(code: str) -> str:
 
         if "import" in raw and any(h in raw for h in helper_names) and "def " not in raw:
             tmp = re.sub(
-                r"\b(create_table|create_franka)\b(?:\s+as\s+[A-Za-z_][A-Za-z0-9_]*)?\s*,?\s*",
+                r"\b(create_table|create_franka|create_mug)\b(?:\s+as\s+[A-Za-z_][A-Za-z0-9_]*)?\s*,?\s*",
                 "",
                 raw,
             )
@@ -471,7 +471,7 @@ def _runtime_create_franka(
         [
             "/home/user/magicphysics/MagicPhysics/packages/MagicSim/Assets/Robots/franka_umi.usd",
             "https://omniverse-content-production.s3-us-west-2.amazonaws.com/Assets/Isaac/5.1/Isaac/Robots/FrankaRobotics/FrankaPanda/franka.usd",
-            "https://omniverse-content-production.s3-us-west-2.amazonaws.com/Assets/Isaac/4.5/Isaac/Robots/FrankaRobotics/FrankaPanda/franka.usd",
+            "https://omniverse-content-production.s3-us-west-2.amazonaws.com/Assets/Isaac/2023.1.1/Isaac/Robots/Franka/franka.usd",
         ]
     )
     candidates = _unique_preserve_order(candidates)
@@ -523,6 +523,106 @@ def _runtime_create_franka(
     return prim_path
 
 
+def _runtime_create_mug(
+    stage=None,
+    prim_path: str = "/World/Mug",
+    position=(0.30, 0.00, 0.823),
+    variant: str = "C1",
+    usd_path: str | None = None,
+):
+    """Runtime scene helper exposed to scene-chat code as create_mug(...)."""
+    from pxr import UsdGeom, UsdPhysics, Gf
+    from omni.isaac.core.utils.stage import add_reference_to_stage
+
+    stage = stage or _get_stage()
+    if stage is None:
+        raise RuntimeError("No USD stage available")
+
+    variant_clean = str(variant or "C1").strip().upper()
+    if variant_clean not in {"A2", "B1", "C1", "D1"}:
+        variant_clean = "C1"
+
+    candidates = []
+    if usd_path:
+        candidates.append(str(usd_path))
+
+    try:
+        from omni.isaac.core.utils.nucleus import get_assets_root_path
+
+        assets_root = get_assets_root_path()
+        if assets_root:
+            candidates.append(f"{assets_root}/Isaac/Props/Mugs/SM_Mug_{variant_clean}.usd")
+            for v in ("C1", "A2", "B1", "D1"):
+                candidates.append(f"{assets_root}/Isaac/Props/Mugs/SM_Mug_{v}.usd")
+    except Exception:
+        pass
+
+    candidates.extend(
+        [
+            f"https://omniverse-content-production.s3-us-west-2.amazonaws.com/Assets/Isaac/5.1/Isaac/Props/Mugs/SM_Mug_{variant_clean}.usd",
+            "https://omniverse-content-production.s3-us-west-2.amazonaws.com/Assets/Isaac/5.1/Isaac/Props/Mugs/SM_Mug_C1.usd",
+            "https://omniverse-content-production.s3-us-west-2.amazonaws.com/Assets/Isaac/5.1/Isaac/Props/Mugs/SM_Mug_A2.usd",
+            "https://omniverse-content-production.s3-us-west-2.amazonaws.com/Assets/Isaac/5.1/Isaac/Props/Mugs/SM_Mug_B1.usd",
+            "https://omniverse-content-production.s3-us-west-2.amazonaws.com/Assets/Isaac/5.1/Isaac/Props/Mugs/SM_Mug_D1.usd",
+        ]
+    )
+    candidates = _unique_preserve_order(candidates)
+
+    existing = stage.GetPrimAtPath(prim_path)
+    if existing and existing.IsValid():
+        try:
+            stage.RemovePrim(prim_path)
+            for _ in range(2):
+                simulation_app.update()
+        except Exception:
+            pass
+
+    loaded_ok = False
+    last_error = ""
+    for mug_usd in candidates:
+        try:
+            add_reference_to_stage(usd_path=mug_usd, prim_path=prim_path)
+            for _ in range(8):
+                simulation_app.update()
+            prim = stage.GetPrimAtPath(prim_path)
+            if prim and prim.IsValid():
+                loaded_ok = True
+                break
+            stage.RemovePrim(prim_path)
+        except Exception as exc:
+            last_error = str(exc)
+            continue
+
+    if not loaded_ok:
+        raise RuntimeError(
+            f"Mug prim invalid at {prim_path}. last_error={last_error or 'none'}"
+        )
+
+    prim = stage.GetPrimAtPath(prim_path)
+    xf = UsdGeom.Xformable(prim)
+    xf.ClearXformOpOrder()
+    px, py, pz = position
+    xf.AddTranslateOp().Set(Gf.Vec3d(float(px), float(py), float(pz)))
+    xf.AddScaleOp().Set(Gf.Vec3d(0.01, 0.01, 0.01))
+
+    try:
+        UsdPhysics.RigidBodyAPI.Apply(prim)
+    except Exception:
+        pass
+    for p in stage.Traverse():
+        path = str(p.GetPath())
+        if not path.startswith(prim_path):
+            continue
+        try:
+            if p.IsA(UsdGeom.Mesh):
+                UsdPhysics.CollisionAPI.Apply(p)
+                UsdPhysics.MeshCollisionAPI.Apply(p)
+        except Exception:
+            continue
+
+    return prim_path
+
+
 def _code_may_mutate_stage(code: str) -> bool:
     """Best-effort detection for code that mutates USD stage topology/transforms."""
     txt = str(code or "")
@@ -542,6 +642,7 @@ def _code_may_mutate_stage(code: str) -> bool:
         r"MeshCollisionAPI\.Apply\(",
         r"\bcreate_table\(",
         r"\bcreate_franka\(",
+        r"\bcreate_mug\(",
     ]
     return any(re.search(p, txt) for p in mutation_patterns)
 
@@ -1099,6 +1200,7 @@ def _process_commands():
                     "stage": _get_stage(), "world": world, "simulation_app": simulation_app,
                     "create_table": _runtime_create_table,
                     "create_franka": _runtime_create_franka,
+                    "create_mug": _runtime_create_mug,
                     "print": lambda *a, **kw: stdout_capture.write(" ".join(str(x) for x in a) + "\n"),
                     **_extra_globals,
                 }

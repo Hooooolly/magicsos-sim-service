@@ -763,7 +763,7 @@ def _franka_usd_candidates(assets_root: str) -> list[str]:
     candidates = [
         # Prefer known-good public Isaac asset URLs first (used by scene-chat path).
         "https://omniverse-content-production.s3-us-west-2.amazonaws.com/Assets/Isaac/5.1/Isaac/Robots/FrankaRobotics/FrankaPanda/franka.usd",
-        "https://omniverse-content-production.s3-us-west-2.amazonaws.com/Assets/Isaac/4.5/Isaac/Robots/FrankaRobotics/FrankaPanda/franka.usd",
+        "https://omniverse-content-production.s3-us-west-2.amazonaws.com/Assets/Isaac/2023.1.1/Isaac/Robots/Franka/franka.usd",
     ]
     if root:
         candidates.extend(
