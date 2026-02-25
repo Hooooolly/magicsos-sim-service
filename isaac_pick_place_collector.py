@@ -2790,6 +2790,7 @@ def _run_pick_place_episode(
     if annotation_path is not None:
         annotation_candidates, annotation_meta = _load_grasp_pose_candidates(annotation_path)
         if annotation_candidates:
+            loaded_annotation_candidates = list(annotation_candidates)
             hint_scale = float(annotation_meta.get("position_scale_hint", 1.0))
             infer_scale = _infer_annotation_position_scale(
                 stage=stage,
@@ -2821,6 +2822,16 @@ def _run_pick_place_episode(
                     annotation_path,
                     object_prim_path,
                     sanitize_report,
+                )
+            if not annotation_candidates and _read_bool_env("COLLECT_ALLOW_UNSANITIZED_ANNOTATION_FALLBACK", True):
+                annotation_candidates = loaded_annotation_candidates
+                annotation_local_pos_scale = float(hint_scale)
+                LOG.warning(
+                    "collect: sanitize dropped all candidates; fallback to unsanitized annotation set "
+                    "(count=%d, path=%s, local_pos_scale=%.5f)",
+                    len(annotation_candidates),
+                    annotation_path,
+                    float(annotation_local_pos_scale),
                 )
             if annotation_candidates:
                 LOG.info(
@@ -3065,37 +3076,6 @@ def _run_pick_place_episode(
         if stop_event is not None and stop_event.is_set():
             stopped = True
             break
-        if _read_bool_env("COLLECT_RECENTER_OBJECT_EACH_ATTEMPT", True):
-            fix = _ensure_object_within_workspace(
-                stage=stage,
-                object_prim_path=object_prim_path,
-                usd=usd,
-                usd_geom=usd_geom,
-                gf=gf,
-                table_x_range=table_x_range,
-                table_y_range=table_y_range,
-                table_top_z=table_top_z,
-                work_center=work_center,
-            )
-            if fix:
-                LOG.warning(
-                    "collect: attempt %d recentered object raw=(%.3f, %.3f, z:[%.3f, %.3f]) -> "
-                    "(%.3f, %.3f, %.3f) reason_xy=%s reason_z=%s",
-                    attempt,
-                    float(fix["raw_x"]),
-                    float(fix["raw_y"]),
-                    float(fix.get("raw_bottom_z", float("nan"))),
-                    float(fix.get("raw_top_z", float("nan"))),
-                    float(fix["target_x"]),
-                    float(fix["target_y"]),
-                    float(fix["target_z"]),
-                    bool(fix.get("reason_xy", 0.0)),
-                    bool(fix.get("reason_z", 0.0)),
-                )
-                for _ in range(6):
-                    world.step(render=True)
-                    _record_frame()
-
         annotation_target = _select_annotation_grasp_target(
             stage=stage,
             object_prim_path=object_prim_path,
@@ -3925,56 +3905,7 @@ def _setup_pick_place_scene_reuse_or_patch(
         table_top_z=table_top_z,
         work_center=work_center,
     )
-    if _read_bool_env("COLLECT_ALIGN_ROBOT_BASE", True):
-        try:
-            bx, by, bz, byaw = _align_robot_base_for_collect(
-                stage=stage,
-                robot_prim_path=robot_prim_path,
-                usd_geom=UsdGeom,
-                gf=Gf,
-                table_x_range=table_x_range,
-                table_y_range=table_y_range,
-                table_top_z=table_top_z,
-                work_center=work_center,
-            )
-            LOG.info(
-                "collect: aligned robot base for collect at (%.3f, %.3f, %.3f), yaw=%.1fdeg",
-                bx,
-                by,
-                bz,
-                byaw,
-            )
-        except Exception as exc:
-            LOG.warning("collect: failed to align robot base (%s), keep current pose", exc)
-    if _read_bool_env("COLLECT_RECENTER_OBJECT_IF_OUTSIDE_WORKSPACE", True):
-        try:
-            fix = _ensure_object_within_workspace(
-                stage=stage,
-                object_prim_path=object_prim_path,
-                usd=Usd,
-                usd_geom=UsdGeom,
-                gf=Gf,
-                table_x_range=table_x_range,
-                table_y_range=table_y_range,
-                table_top_z=table_top_z,
-                work_center=work_center,
-            )
-            if fix:
-                LOG.warning(
-                    "collect: object out of workspace raw=(%.3f, %.3f, z:[%.3f, %.3f]) recentered to "
-                    "(%.3f, %.3f, %.3f) reason_xy=%s reason_z=%s",
-                    float(fix["raw_x"]),
-                    float(fix["raw_y"]),
-                    float(fix.get("raw_bottom_z", float("nan"))),
-                    float(fix.get("raw_top_z", float("nan"))),
-                    float(fix["target_x"]),
-                    float(fix["target_y"]),
-                    float(fix["target_z"]),
-                    bool(fix.get("reason_xy", 0.0)),
-                    bool(fix.get("reason_z", 0.0)),
-                )
-        except Exception as exc:
-            LOG.warning("collect: object workspace recenter failed (%s), keep current pose", exc)
+    # Keep user-arranged scene intact: do not auto-move robot base or object here.
 
     overhead_cam_path = "/World/OverheadCam"
     overhead_prim = stage.GetPrimAtPath(overhead_cam_path)

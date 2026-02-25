@@ -58,3 +58,19 @@ If required scene elements are missing, collect fails with a direct reason inste
 ## Rollback note
 - Rolled back `run_interactive.py` and `isaac_pick_place_collector.py` to commit `0af7cf6` behavior to restore previously working scene collect flow.
 - Reason: strict-mode regression caused articulation initialization failures and unstable collect behavior.
+
+## Update (annotation + scene-stability hotfix, 2026-02-25 20:4x)
+- `grasp_poses/mug_grasp_pose.json`
+  - Added metadata scale hint for Isaac C1 mug:
+    - `position_scale_hint: 0.01`
+    - `position_unit: cm`
+- `isaac_pick_place_collector.py`
+  - Removed collect-time automatic scene mutation calls:
+    - no auto robot base alignment during collect setup
+    - no auto object recenter during collect setup
+    - no per-attempt object recenter loop
+  - Added annotation sanitize fallback:
+    - if sanitize filters all candidates, fallback to unsanitized annotation set (enabled by default via `COLLECT_ALLOW_UNSANITIZED_ANNOTATION_FALLBACK=1`).
+  - Motivation:
+    - keep user-arranged scene stable
+    - avoid false-negative “annotation missing” when sanitize is over-restrictive for valid mug annotations.

@@ -948,9 +948,9 @@
     ]
   },
   "metadata": {
-    "source": "manual_mug_template_v3",
+    "source": "manual_mug_template_v3+scale_hint_fix_20260225",
     "quaternion_order": "wxyz",
-    "position_unit": "mesh_local_units",
+    "position_unit": "cm",
     "num_total": 52,
     "num_handle": 40,
     "num_body_side": 8,
@@ -975,6 +975,7 @@
         0.021131380641983066
       ],
       "used_vlm_handle_hint": true
-    }
+    },
+    "position_scale_hint": 0.01
   }
 }
