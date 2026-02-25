@@ -92,12 +92,22 @@ TABLE_Y_RANGE = (-0.3, 0.3)
 TABLE_Z = 0.41
 IK_APPROACH_Z_OFFSET = 0.18
 IK_GRASP_Z_OFFSET = 0.07
+IK_PICK_APPROACH_EXTRA_Z = 0.12
+IK_PLACE_APPROACH_EXTRA_Z = 0.10
+IK_PICK_GRASP_HEIGHT_RATIO = 0.60
+IK_PICK_MIN_CLEARANCE_FROM_TABLE = 0.01
+IK_PLACE_MIN_CLEARANCE_FROM_TABLE = 0.02
 GRASP_MAX_ATTEMPTS = 3
 VERIFY_CLOSE_MIN_GRIPPER_WIDTH = 0.006
 VERIFY_CLOSE_MAX_OBJECT_EEF_DISTANCE = 0.12
 VERIFY_CLOSE_MAX_OBJECT_EEF_XY_DISTANCE = 0.05
 VERIFY_RETRIEVAL_MIN_LIFT = 0.015
 VERIFY_RETRIEVAL_MAX_OBJECT_EEF_DISTANCE = 0.15
+ROBOT_REACH_RADIUS_X = 0.75
+ROBOT_REACH_RADIUS_Y = 0.75
+REACH_INTERSECTION_MIN_SPAN = 0.25
+PICK_CLAMP_MAX_DELTA = 0.03
+DEFAULT_EPISODE_TIMEOUT_SEC = 180.0
 
 COLLECTOR_ROOT = "/World/PickPlaceCollector"
 TABLE_PRIM_PATH = f"{COLLECTOR_ROOT}/Table"
@@ -150,6 +160,12 @@ def _parse_args() -> argparse.Namespace:
         default="pick_place",
         help="Task label recorded in dataset episode metadata.",
     )
+    parser.add_argument(
+        "--episode-timeout-sec",
+        type=float,
+        default=_read_float_env("COLLECT_EPISODE_TIMEOUT_SEC", DEFAULT_EPISODE_TIMEOUT_SEC),
+        help="Per-episode hard timeout in seconds (0 disables timeout).",
+    )
     return parser.parse_args()
 
 
@@ -177,6 +193,17 @@ def _default_dataset_repo_id(output_dir: str) -> str:
     dataset_id = re.sub(r"[^a-zA-Z0-9._-]+", "_", Path(output_dir).name.strip()).strip("._-")
     dataset_id = dataset_id or "sim_collect"
     return f"local/{dataset_id}"
+
+
+def _read_float_env(name: str, default: float) -> float:
+    raw = os.environ.get(name)
+    if raw is None:
+        return float(default)
+    try:
+        return float(raw)
+    except Exception:
+        LOG.warning("Invalid float env %s=%r, fallback %.3f", name, raw, float(default))
+        return float(default)
 
 
 def _select_ik_frame_name(frame_names: Sequence[str], eef_prim_path: str) -> Optional[str]:
@@ -226,13 +253,29 @@ def _create_franka_ik_solver(
         return None
 
 
-def _solve_ik_arm_target(ik_solver: Any, target_position: np.ndarray) -> np.ndarray | None:
+def _solve_ik_arm_target(
+    ik_solver: Any,
+    target_position: np.ndarray,
+    target_orientation: np.ndarray | None = None,
+) -> np.ndarray | None:
     if ik_solver is None:
         return None
     try:
+        orient = None
+        if target_orientation is not None:
+            orient = np.asarray(target_orientation, dtype=np.float32).reshape(-1)
+            if orient.size >= 4:
+                orient = orient[:4]
+                norm = float(np.linalg.norm(orient))
+                if np.isfinite(norm) and norm > 1e-6:
+                    orient = (orient / norm).astype(np.float32)
+                else:
+                    orient = None
+            else:
+                orient = None
         action, success = ik_solver.compute_inverse_kinematics(
             target_position=np.asarray(target_position, dtype=np.float32),
-            target_orientation=None,
+            target_orientation=orient,
             position_tolerance=0.01,
         )
         if not success or action is None:
@@ -696,24 +739,33 @@ def _adjust_workspace_for_robot_reach(
         LOG.warning("collect: abnormal table_top_z=%.3f, fallback to 0.770", top_z)
         top_z = 0.77
 
-    # Keep sampled pick/place points in a conservative reachable zone for the
-    # current Franka base, intersected with inferred table bounds.
+    # Keep sampled points inside table bounds first. Then intersect with a
+    # broad Franka reach disk if valid; otherwise keep full table range.
     rx, ry = robot_xy
-    reach_x = (rx - 0.05, rx + 0.15)
-    reach_y = (ry - 0.12, ry + 0.12)
+    reach_x = (rx - ROBOT_REACH_RADIUS_X, rx + ROBOT_REACH_RADIUS_X)
+    reach_y = (ry - ROBOT_REACH_RADIUS_Y, ry + ROBOT_REACH_RADIUS_Y)
 
     x_min = max(float(table_x_range[0]), float(reach_x[0]))
     x_max = min(float(table_x_range[1]), float(reach_x[1]))
     y_min = max(float(table_y_range[0]), float(reach_y[0]))
     y_max = min(float(table_y_range[1]), float(reach_y[1]))
 
-    if (x_max - x_min) < 0.08:
-        x_min, x_max = reach_x
-    if (y_max - y_min) < 0.08:
-        y_min, y_max = reach_y
-
-    x_range = (float(x_min), float(x_max))
-    y_range = (float(y_min), float(y_max))
+    if (x_max - x_min) >= REACH_INTERSECTION_MIN_SPAN and (y_max - y_min) >= REACH_INTERSECTION_MIN_SPAN:
+        x_range = (float(x_min), float(x_max))
+        y_range = (float(y_min), float(y_max))
+    else:
+        LOG.warning(
+            "collect: robot/table reach intersection too small (robot=(%.3f, %.3f), table_x=(%.3f, %.3f), "
+            "table_y=(%.3f, %.3f)); using full table workspace",
+            rx,
+            ry,
+            float(table_x_range[0]),
+            float(table_x_range[1]),
+            float(table_y_range[0]),
+            float(table_y_range[1]),
+        )
+        x_range = (float(table_x_range[0]), float(table_x_range[1]))
+        y_range = (float(table_y_range[0]), float(table_y_range[1]))
     center = (float((x_range[0] + x_range[1]) * 0.5), float((y_range[0] + y_range[1]) * 0.5))
     return x_range, y_range, top_z, center
 
@@ -984,25 +1036,31 @@ def _make_pick_place_waypoints_ik(
     ik_solver: Any,
     pick_pos: tuple[float, float],
     place_pos: tuple[float, float],
-    table_top_z: float,
-    object_height: float,
+    pick_grasp_z: float,
+    pick_approach_z: float,
+    place_grasp_z: float,
+    place_approach_z: float,
     rng: np.random.Generator,
+    target_orientation: np.ndarray | None = None,
 ) -> list[tuple[str, np.ndarray, float]] | None:
     if ik_solver is None:
         return None
 
-    grasp_z = float(table_top_z + max(IK_GRASP_Z_OFFSET, object_height + 0.02))
-    approach_z = float(grasp_z + IK_APPROACH_Z_OFFSET)
     pose_targets = {
-        "APPROACH_PICK": np.array([pick_pos[0], pick_pos[1], approach_z], dtype=np.float32),
-        "DOWN_PICK": np.array([pick_pos[0], pick_pos[1], grasp_z], dtype=np.float32),
-        "MOVE_TO_PLACE": np.array([place_pos[0], place_pos[1], approach_z], dtype=np.float32),
-        "DOWN_PLACE": np.array([place_pos[0], place_pos[1], grasp_z], dtype=np.float32),
+        "APPROACH_PICK": np.array([pick_pos[0], pick_pos[1], float(pick_approach_z)], dtype=np.float32),
+        "DOWN_PICK": np.array([pick_pos[0], pick_pos[1], float(pick_grasp_z)], dtype=np.float32),
+        "MOVE_TO_PLACE": np.array([place_pos[0], place_pos[1], float(place_approach_z)], dtype=np.float32),
+        "DOWN_PLACE": np.array([place_pos[0], place_pos[1], float(place_grasp_z)], dtype=np.float32),
     }
 
     solved: dict[str, np.ndarray] = {}
     for name in ("APPROACH_PICK", "DOWN_PICK", "MOVE_TO_PLACE", "DOWN_PLACE"):
-        q = _solve_ik_arm_target(ik_solver, pose_targets[name])
+        q = _solve_ik_arm_target(ik_solver, pose_targets[name], target_orientation=target_orientation)
+        if q is None and target_orientation is not None:
+            # Orientation constraints improve top-down behavior but can fail near singularities.
+            q = _solve_ik_arm_target(ik_solver, pose_targets[name], target_orientation=None)
+            if q is not None:
+                LOG.warning("IK waypoint '%s' fallback to unconstrained orientation", name)
         if q is None:
             LOG.warning("IK waypoint '%s' failed, falling back to joint-offset planner", name)
             return None
@@ -1021,6 +1079,51 @@ def _make_pick_place_waypoints_ik(
         ("RETRACT", solved["MOVE_TO_PLACE"], GRIPPER_OPEN),
         ("HOME_END", HOME.copy(), GRIPPER_OPEN),
     ]
+
+
+def _compute_pick_place_z_targets(
+    stage: Any,
+    object_prim_path: str,
+    usd_geom: Any,
+    table_top_z: float,
+    fallback_object_height: float,
+) -> dict[str, float]:
+    bbox = _compute_prim_bbox(stage, object_prim_path, usd_geom)
+    if not bbox:
+        obj_h = max(float(fallback_object_height), 0.01)
+        pick_grasp_z = float(table_top_z + max(IK_GRASP_Z_OFFSET, obj_h * 0.6))
+        pick_approach_z = float(pick_grasp_z + IK_APPROACH_Z_OFFSET)
+        place_grasp_z = float(table_top_z + max(IK_PLACE_MIN_CLEARANCE_FROM_TABLE + 0.5 * obj_h, 0.04))
+        place_approach_z = float(place_grasp_z + IK_PLACE_APPROACH_EXTRA_Z)
+        return {
+            "object_height": obj_h,
+            "pick_grasp_z": pick_grasp_z,
+            "pick_approach_z": pick_approach_z,
+            "place_grasp_z": place_grasp_z,
+            "place_approach_z": place_approach_z,
+        }
+
+    mn, mx = bbox
+    obj_h = max(float(mx[2] - mn[2]), 0.01)
+    obj_top_z = float(mx[2])
+    obj_bottom_z = float(mn[2])
+    pick_grasp_z = float(obj_bottom_z + IK_PICK_GRASP_HEIGHT_RATIO * obj_h)
+    pick_grasp_z = max(pick_grasp_z, float(table_top_z) + IK_PICK_MIN_CLEARANCE_FROM_TABLE)
+    pick_grasp_z = min(pick_grasp_z, obj_top_z - 0.004)
+    if pick_grasp_z <= float(table_top_z) + IK_PICK_MIN_CLEARANCE_FROM_TABLE:
+        pick_grasp_z = float(table_top_z) + IK_PICK_MIN_CLEARANCE_FROM_TABLE + 0.005
+
+    pick_approach_z = max(obj_top_z + IK_PICK_APPROACH_EXTRA_Z, pick_grasp_z + 0.08)
+    place_grasp_z = max(float(table_top_z) + IK_PLACE_MIN_CLEARANCE_FROM_TABLE + 0.5 * obj_h, float(table_top_z) + 0.04)
+    place_approach_z = place_grasp_z + IK_PLACE_APPROACH_EXTRA_Z
+
+    return {
+        "object_height": obj_h,
+        "pick_grasp_z": float(pick_grasp_z),
+        "pick_approach_z": float(pick_approach_z),
+        "place_grasp_z": float(place_grasp_z),
+        "place_approach_z": float(place_approach_z),
+    }
 
 
 def _sample_place_from_pick(
@@ -1112,7 +1215,8 @@ def _run_pick_place_episode(
     work_center: tuple[float, float],
     gf: Any,
     stop_event: threading.Event | None = None,
-) -> tuple[int, bool]:
+    episode_timeout_sec: float = DEFAULT_EPISODE_TIMEOUT_SEC,
+) -> tuple[int, bool, bool]:
     world.reset()
     for _ in range(10):
         world.step(render=True)
@@ -1130,6 +1234,25 @@ def _run_pick_place_episode(
     last_pick_pos: tuple[float, float] = (float(work_center[0]), float(work_center[1]))
     grasp_succeeded = False
     attempt_used = 0
+    ik_target_orientation: np.ndarray | None = None
+    episode_started = time.monotonic()
+    timeout_sec = max(0.0, float(episode_timeout_sec))
+
+    def _timeout_triggered() -> bool:
+        nonlocal stopped
+        if timeout_sec <= 0.0:
+            return False
+        if (time.monotonic() - episode_started) < timeout_sec:
+            return False
+        LOG.error(
+            "collect: episode %d exceeded timeout %.1fs; requesting stop",
+            episode_index + 1,
+            timeout_sec,
+        )
+        if stop_event is not None:
+            stop_event.set()
+        stopped = True
+        return True
 
     def _execute_transitions(transitions: list[tuple[Any, Any]]) -> None:
         nonlocal frame_index, stopped
@@ -1138,6 +1261,8 @@ def _run_pick_place_episode(
             end_name, end_arm, end_gripper = end_wp
 
             for step in range(steps_per_segment):
+                if _timeout_triggered():
+                    return
                 if stop_event is not None and stop_event.is_set():
                     stopped = True
                     return
@@ -1171,38 +1296,73 @@ def _run_pick_place_episode(
 
             if end_name == "CLOSE":
                 for _ in range(20):
+                    if _timeout_triggered():
+                        return
                     arm_cmd, gr_cmd = _step_toward_joint_targets(franka, end_arm, end_gripper)
                     _set_joint_targets(franka, arm_cmd, gr_cmd, physics_control=True)
                     world.step(render=True)
 
             if end_name == "OPEN":
                 for _ in range(10):
+                    if _timeout_triggered():
+                        return
                     arm_cmd, gr_cmd = _step_toward_joint_targets(franka, end_arm, end_gripper)
                     _set_joint_targets(franka, arm_cmd, gr_cmd, physics_control=True)
                     world.step(render=True)
 
     for attempt in range(1, GRASP_MAX_ATTEMPTS + 1):
+        if _timeout_triggered():
+            break
         attempt_used = attempt
         if stop_event is not None and stop_event.is_set():
             stopped = True
             break
 
         obj_pos, _ = _get_prim_world_pose(stage, object_prim_path, usd, usd_geom)
-        pick_x = float(np.clip(obj_pos[0], table_x_range[0], table_x_range[1]))
-        pick_y = float(np.clip(obj_pos[1], table_y_range[0], table_y_range[1]))
+        raw_pick_x = float(obj_pos[0])
+        raw_pick_y = float(obj_pos[1])
+        pick_x = float(np.clip(raw_pick_x, table_x_range[0], table_x_range[1]))
+        pick_y = float(np.clip(raw_pick_y, table_y_range[0], table_y_range[1]))
+        clamp_delta = float(np.linalg.norm(np.array([pick_x - raw_pick_x, pick_y - raw_pick_y], dtype=np.float32)))
+        if clamp_delta > PICK_CLAMP_MAX_DELTA and np.isfinite(raw_pick_x) and np.isfinite(raw_pick_y):
+            LOG.warning(
+                "collect: attempt %d workspace mismatch (raw=(%.3f, %.3f), clamped=(%.3f, %.3f), delta=%.3f) -> using raw pick pose",
+                attempt,
+                raw_pick_x,
+                raw_pick_y,
+                pick_x,
+                pick_y,
+                clamp_delta,
+            )
+            pick_x, pick_y = raw_pick_x, raw_pick_y
         last_pick_pos = (pick_x, pick_y)
-        if abs(pick_x - float(obj_pos[0])) > 1e-3 or abs(pick_y - float(obj_pos[1])) > 1e-3:
+        if abs(pick_x - raw_pick_x) > 1e-3 or abs(pick_y - raw_pick_y) > 1e-3:
             LOG.warning(
                 "collect: attempt %d pick pose clamped: raw=(%.3f, %.3f), clamped=(%.3f, %.3f)",
                 attempt,
-                float(obj_pos[0]),
-                float(obj_pos[1]),
+                raw_pick_x,
+                raw_pick_y,
                 pick_x,
                 pick_y,
             )
         if place_pos is None:
             place_pos = _sample_place_from_pick(rng, table_x_range, table_y_range, last_pick_pos)
         object_height = _estimate_object_height(stage, object_prim_path, usd_geom, fallback=OBJECT_SIZE)
+        z_targets = _compute_pick_place_z_targets(
+            stage=stage,
+            object_prim_path=object_prim_path,
+            usd_geom=usd_geom,
+            table_top_z=table_top_z,
+            fallback_object_height=object_height,
+        )
+        object_height = float(z_targets["object_height"])
+        if ik_target_orientation is None:
+            _, cand_quat = _get_eef_pose(stage, eef_prim_path, get_prim_at_path, usd, usd_geom)
+            cand_quat = np.asarray(cand_quat, dtype=np.float32).reshape(-1)
+            if cand_quat.size >= 4 and np.all(np.isfinite(cand_quat[:4])):
+                norm = float(np.linalg.norm(cand_quat[:4]))
+                if np.isfinite(norm) and norm > 1e-6:
+                    ik_target_orientation = (cand_quat[:4] / norm).astype(np.float32)
 
         for _ in range(8):
             world.step(render=True)
@@ -1211,9 +1371,12 @@ def _run_pick_place_episode(
             ik_solver=ik_solver,
             pick_pos=last_pick_pos,
             place_pos=place_pos,
-            table_top_z=table_top_z,
-            object_height=object_height,
+            pick_grasp_z=float(z_targets["pick_grasp_z"]),
+            pick_approach_z=float(z_targets["pick_approach_z"]),
+            place_grasp_z=float(z_targets["place_grasp_z"]),
+            place_approach_z=float(z_targets["place_approach_z"]),
             rng=rng,
+            target_orientation=ik_target_orientation,
         )
         if waypoints is None:
             waypoints = _make_pick_place_waypoints(last_pick_pos, place_pos, rng, work_center=work_center)
@@ -1226,9 +1389,13 @@ def _run_pick_place_episode(
 
         _, home_arm, home_gripper = waypoints[0]
         for _ in range(30):
+            if _timeout_triggered():
+                break
             arm_cmd, gr_cmd = _step_toward_joint_targets(franka, home_arm, home_gripper)
             _set_joint_targets(franka, arm_cmd, gr_cmd, physics_control=True)
             world.step(render=True)
+        if stopped:
+            break
 
         pick_transitions = list(zip(waypoints[:lift_idx], waypoints[1 : lift_idx + 1]))
         place_transitions = list(zip(waypoints[lift_idx:-1], waypoints[lift_idx + 1 :]))
@@ -1267,13 +1434,21 @@ def _run_pick_place_episode(
 
         lift_arm = waypoints[lift_idx][1]
         for _ in range(20):
+            if _timeout_triggered():
+                break
             arm_cmd, gr_cmd = _step_toward_joint_targets(franka, lift_arm, GRIPPER_OPEN)
             _set_joint_targets(franka, arm_cmd, gr_cmd, physics_control=True)
             world.step(render=True)
+        if stopped:
+            break
         for _ in range(30):
+            if _timeout_triggered():
+                break
             arm_cmd, gr_cmd = _step_toward_joint_targets(franka, home_arm, GRIPPER_OPEN)
             _set_joint_targets(franka, arm_cmd, gr_cmd, physics_control=True)
             world.step(render=True)
+        if stopped:
+            break
 
     # Mark this episode's final frame as done.
     for i in range(len(writer.all_frames) - 1, -1, -1):
@@ -1303,7 +1478,7 @@ def _run_pick_place_episode(
     else:
         LOG.info("Episode %d interrupted by stop event", episode_index + 1)
 
-    return frame_index, stopped
+    return frame_index, stopped, grasp_succeeded
 
 
 def _setup_pick_place_scene_template(
@@ -1783,6 +1958,7 @@ def run_collection_in_process(
     scene_mode: str = "auto",
     target_objects: Optional[Sequence[str]] = None,
     dataset_repo_id: Optional[str] = None,
+    episode_timeout_sec: float | None = None,
 ) -> dict[str, Any]:
     if num_episodes <= 0:
         raise ValueError("num_episodes must be > 0")
@@ -1792,6 +1968,9 @@ def run_collection_in_process(
         raise ValueError("steps_per_segment must be > 0")
     task_name = str(task_name or "pick_place")
     scene_mode = str(scene_mode or "auto").lower()
+    if episode_timeout_sec is None:
+        episode_timeout_sec = _read_float_env("COLLECT_EPISODE_TIMEOUT_SEC", DEFAULT_EPISODE_TIMEOUT_SEC)
+    episode_timeout_sec = max(0.0, float(episode_timeout_sec))
 
     os.makedirs(output_dir, exist_ok=True)
 
@@ -1825,6 +2004,7 @@ def run_collection_in_process(
     )
 
     completed = 0
+    successful_episodes = 0
     try:
         for episode in range(num_episodes):
             if stop_event.is_set():
@@ -1835,8 +2015,9 @@ def run_collection_in_process(
             episode_start = time.time()
             episode_frames = 0
             stopped = False
+            episode_success = False
             try:
-                episode_frames, stopped = _run_pick_place_episode(
+                episode_frames, stopped, episode_success = _run_pick_place_episode(
                     episode_index=episode,
                     world=world,
                     franka=ctx["franka"],
@@ -1858,6 +2039,7 @@ def run_collection_in_process(
                     work_center=ctx["work_center"],
                     gf=ctx["gf"],
                     stop_event=stop_event,
+                    episode_timeout_sec=episode_timeout_sec,
                 )
             finally:
                 writer.finish_episode(
@@ -1873,6 +2055,8 @@ def run_collection_in_process(
                 )
 
             completed += 1
+            if episode_success:
+                successful_episodes += 1
             if progress_callback is not None:
                 progress_callback(completed)
 
@@ -1886,11 +2070,14 @@ def run_collection_in_process(
 
     return {
         "completed": completed,
+        "successful_episodes": successful_episodes,
+        "failed_episodes": max(0, completed - successful_episodes),
         "requested": num_episodes,
         "output_dir": output_dir,
         "stopped": bool(stop_event.is_set()),
         "scene_mode": actual_scene_mode,
         "target_object": ctx["object_prim_path"],
+        "episode_timeout_sec": episode_timeout_sec,
     }
 
 
@@ -1963,6 +2150,7 @@ def main() -> int:
             steps_per_segment=args.steps_per_segment,
             seed=args.seed,
             task_name=args.task_name,
+            episode_timeout_sec=args.episode_timeout_sec,
         )
 
         LOG.info("Collection complete: %s", result)

@@ -400,3 +400,59 @@ Files in platform repo:
 - Expected effect:
   - Fewer false-positive "grasped" episodes.
   - More recoverable attempts when initial close misses object contact.
+
+## Hotfix (2026-02-25 03:20 UTC, root-cause fix for off-target waving + collect stuck perception)
+- Symptoms observed:
+  - Arm "waves" near wrong XY and cannot reach object although object is visible.
+  - Frontend can appear stuck in `collecting` when a bad episode runs too long.
+
+- Root causes identified:
+  - Workspace shrink logic around robot base was too tight in some loaded scenes, causing pick XY to be clamped far from real object pose.
+  - No hard episode timeout in collector loop, so bad physics/IK episodes could run for a long time before status changed.
+
+- Changes in `sim-service/isaac_pick_place_collector.py`:
+  - Reworked workspace-reach adjustment:
+    - use broad reach envelope (`±0.75m`) and only intersect when overlap is sufficiently large.
+    - if robot/table intersection is too small, fallback to full inferred table workspace instead of over-shrinking.
+  - Added clamp-delta guard:
+    - if pick pose clamp shifts object XY by more than `3cm`, collector now logs mismatch and uses raw object XY for grasp planning.
+  - Added per-episode timeout support:
+    - `episode_timeout_sec` (default from env `COLLECT_EPISODE_TIMEOUT_SEC`, fallback `180s`).
+    - timeout triggers stop event and exits episode safely.
+
+- Changes in `sim-service/run_interactive.py`:
+  - Increased bridge command wait default:
+    - `_CMD_TIMEOUT` now from `BRIDGE_CMD_TIMEOUT_SEC`, default `30s` (was 10s).
+  - Collect API now accepts/propagates `episode_timeout_sec`.
+  - Added numeric input validation for collect params to return `400` instead of runtime `500`.
+  - Collect progress now updates `updated_at` timestamp to improve UI polling behavior.
+
+- Expected effect:
+  - Pick target stays on the actual object instead of being clamped away.
+  - Long-running bad episodes converge to `stopped/error` instead of appearing indefinitely running in UI.
+
+## Hotfix (2026-02-25 03:45 UTC, grasp ground-truth Z tracking + failure-aware completion)
+- User issue:
+  - Collector can knock the mug first, then continue poking table.
+  - Need explicit distinction between "episode finished" and "grasp failed".
+
+- Changes in `sim-service/isaac_pick_place_collector.py`:
+  - IK planning now uses object-aware Z targets from live object world bbox each attempt:
+    - pick approach Z from object top + clearance
+    - pick grasp Z from object height ratio (not fixed table offset)
+    - place Z separated from pick Z
+  - Added optional IK orientation constraint (seeded from current EEF quaternion):
+    - keeps approach posture more stable for top-down grasp style
+    - auto-fallback to unconstrained IK if constrained solve fails
+  - Collector result now exports failure-aware stats:
+    - `successful_episodes`
+    - `failed_episodes`
+
+- Changes in `sim-service/run_interactive.py`:
+  - Final collect status now distinguishes partial failure:
+    - `done` when all attempted episodes succeeded
+    - `done_with_failures` when episode finished but grasp checks failed
+
+- Expected effect:
+  - Better use of real-time object ground-truth Z in planning.
+  - UI/backend can report completion with failure semantics instead of only "done".

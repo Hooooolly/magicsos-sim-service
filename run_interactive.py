@@ -239,7 +239,10 @@ _state = {
 import queue
 import inspect
 _cmd_queue = queue.Queue()
-_CMD_TIMEOUT = 10  # seconds to wait for main thread to process
+try:
+    _CMD_TIMEOUT = float(os.environ.get("BRIDGE_CMD_TIMEOUT_SEC", "30"))
+except Exception:
+    _CMD_TIMEOUT = 30.0
 _estop_event = threading.Event()
 
 # ── Health server (port 5900) ────────────────────────────────
@@ -716,8 +719,12 @@ def collect_start():
     if _state["collecting"] or _collect_request is not None:
         return jsonify({"error": "Collection already running"}), 409
     data = flask_request.get_json(silent=True) or {}
-    num_episodes = int(data.get("num_episodes", 10))
-    steps_per_segment = int(data.get("steps_per_segment", os.environ.get("COLLECT_STEPS_PER_SEGMENT_DEFAULT", "70")))
+    try:
+        num_episodes = int(data.get("num_episodes", 10))
+        steps_per_segment = int(data.get("steps_per_segment", os.environ.get("COLLECT_STEPS_PER_SEGMENT_DEFAULT", "70")))
+        episode_timeout_sec = float(data.get("episode_timeout_sec", os.environ.get("COLLECT_EPISODE_TIMEOUT_SEC", "180")))
+    except Exception:
+        return jsonify({"error": "num_episodes/steps_per_segment/episode_timeout_sec must be numeric"}), 400
     skill = str(data.get("skill", "pick_place") or "pick_place")
     output_dir = _normalize_collect_output_dir(data.get("output_dir"), skill)
     scene_mode = str(data.get("scene_mode", "auto") or "auto")
@@ -729,12 +736,15 @@ def collect_start():
         return jsonify({"error": "num_episodes must be > 0"}), 400
     if steps_per_segment <= 0:
         return jsonify({"error": "steps_per_segment must be > 0"}), 400
+    if episode_timeout_sec < 0:
+        return jsonify({"error": "episode_timeout_sec must be >= 0"}), 400
 
     # Main-thread execution only (Isaac Sim API is not thread-safe).
     return _enqueue_cmd(
         "collect_start",
         num_episodes=num_episodes,
         steps_per_segment=steps_per_segment,
+        episode_timeout_sec=episode_timeout_sec,
         output_dir=output_dir,
         skill=skill,
         scene_mode=scene_mode,
@@ -959,8 +969,13 @@ def _process_commands():
                 elif not _state["physics"]:
                     cmd["error"] = "Physics must be running first (POST /physics/play)"
                 else:
-                    num_episodes = int(cmd.get("num_episodes", 10))
-                    steps_per_segment = int(cmd.get("steps_per_segment", os.environ.get("COLLECT_STEPS_PER_SEGMENT_DEFAULT", "70")))
+                    try:
+                        num_episodes = int(cmd.get("num_episodes", 10))
+                        steps_per_segment = int(cmd.get("steps_per_segment", os.environ.get("COLLECT_STEPS_PER_SEGMENT_DEFAULT", "70")))
+                        episode_timeout_sec = float(cmd.get("episode_timeout_sec", os.environ.get("COLLECT_EPISODE_TIMEOUT_SEC", "180")))
+                    except Exception:
+                        cmd["error"] = "num_episodes/steps_per_segment/episode_timeout_sec must be numeric"
+                        continue
                     skill = str(cmd.get("skill", "pick_place") or "pick_place")
                     output_dir = _normalize_collect_output_dir(cmd.get("output_dir"), skill)
                     scene_mode = str(cmd.get("scene_mode", "auto") or "auto")
@@ -969,22 +984,29 @@ def _process_commands():
                         cmd["error"] = "num_episodes must be > 0"
                     elif steps_per_segment <= 0:
                         cmd["error"] = "steps_per_segment must be > 0"
+                    elif episode_timeout_sec < 0:
+                        cmd["error"] = "episode_timeout_sec must be >= 0"
                     else:
                         _collect_stop.clear()
+                        now_ts = time.time()
                         _state["collecting"] = True
                         _state["collect_progress"] = {
                             "total": num_episodes,
                             "completed": 0,
                             "skill": skill,
                             "steps_per_segment": steps_per_segment,
+                            "episode_timeout_sec": episode_timeout_sec,
                             "output_dir": output_dir,
                             "status": "running",
                             "scene_mode": scene_mode,
                             "target_objects": target_objects,
+                            "started_at": now_ts,
+                            "updated_at": now_ts,
                         }
                         _collect_request = {
                             "num_episodes": num_episodes,
                             "steps_per_segment": steps_per_segment,
+                            "episode_timeout_sec": episode_timeout_sec,
                             "output_dir": output_dir,
                             "skill": skill,
                             "scene_mode": scene_mode,
@@ -994,6 +1016,7 @@ def _process_commands():
                             "status": "started",
                             "num_episodes": num_episodes,
                             "steps_per_segment": steps_per_segment,
+                            "episode_timeout_sec": episode_timeout_sec,
                             "output_dir": output_dir,
                             "skill": skill,
                             "scene_mode": scene_mode,
@@ -1002,7 +1025,7 @@ def _process_commands():
                         print(
                             f"[collect] queued main-thread collection: skill={skill}, "
                             f"scene_mode={scene_mode}, episodes={num_episodes}, "
-                            f"steps_per_segment={steps_per_segment}, output={output_dir}"
+                            f"steps_per_segment={steps_per_segment}, timeout={episode_timeout_sec}s, output={output_dir}"
                         )
 
             else:
@@ -1025,6 +1048,7 @@ def _run_pending_collection():
     _collect_request = None
     num_episodes = int(req.get("num_episodes", 10))
     steps_per_segment = int(req.get("steps_per_segment", os.environ.get("COLLECT_STEPS_PER_SEGMENT_DEFAULT", "70")))
+    episode_timeout_sec = float(req.get("episode_timeout_sec", os.environ.get("COLLECT_EPISODE_TIMEOUT_SEC", "180")))
     skill = str(req.get("skill", "pick_place"))
     output_dir = _normalize_collect_output_dir(req.get("output_dir"), skill)
     scene_mode = str(req.get("scene_mode", "auto") or "auto")
@@ -1035,7 +1059,7 @@ def _run_pending_collection():
         print(
             f"[collect] start main-thread run: skill={skill}, scene_mode={scene_mode}, "
             f"episodes={num_episodes}, steps_per_segment={steps_per_segment}, "
-            f"output={output_dir}, targets={target_objects}"
+            f"timeout={episode_timeout_sec}s, output={output_dir}, targets={target_objects}"
         )
 
         from isaac_pick_place_collector import run_collection_in_process
@@ -1047,7 +1071,7 @@ def _run_pending_collection():
             "output_dir": output_dir,
             "steps_per_segment": steps_per_segment,
             "stop_event": _collect_stop,
-            "progress_callback": lambda ep: _state["collect_progress"].update({"completed": ep}),
+            "progress_callback": lambda ep: _state["collect_progress"].update({"completed": ep, "updated_at": time.time()}),
         }
         # Backward compatibility: older collector builds may not accept task_name.
         try:
@@ -1059,13 +1083,23 @@ def _run_pending_collection():
                 collect_kwargs["target_objects"] = target_objects
             if "dataset_repo_id" in inspect.signature(run_collection_in_process).parameters:
                 collect_kwargs["dataset_repo_id"] = f"local/{os.path.basename(output_dir.rstrip('/'))}"
+            if "episode_timeout_sec" in inspect.signature(run_collection_in_process).parameters:
+                collect_kwargs["episode_timeout_sec"] = episode_timeout_sec
         except Exception:
             pass
 
         result = run_collection_in_process(**collect_kwargs)
 
         final_status = "stopped" if _collect_stop.is_set() else "done"
+        try:
+            completed_eps = int(result.get("completed", 0))
+            success_eps = int(result.get("successful_episodes", completed_eps))
+            if (not _collect_stop.is_set()) and completed_eps > 0 and success_eps < completed_eps:
+                final_status = "done_with_failures"
+        except Exception:
+            pass
         _state["collect_progress"]["status"] = final_status
+        _state["collect_progress"]["updated_at"] = time.time()
         _state["collect_progress"]["result"] = result
         print(
             f"[collect] finished: status={final_status}, "
@@ -1074,6 +1108,7 @@ def _run_pending_collection():
     except Exception as exc:
         traceback.print_exc()
         _state["collect_progress"]["status"] = f"error: {exc}"
+        _state["collect_progress"]["updated_at"] = time.time()
         print(f"[collect] ERROR: {exc}")
     finally:
         _state["collecting"] = False
