@@ -352,3 +352,27 @@ Files in platform repo:
   - Reload verification in instance:
     - `has_FixedJoint False`
     - `has_attach_fn False`
+
+## Hotfix (2026-02-25 02:10 UTC, emergency stop + main-thread timeout guard)
+- Problem observed:
+  - Bridge API sometimes returned `Timeout waiting for main thread` while collect was running.
+  - Operators needed an immediate kill-switch to stop collect safely.
+
+- Changes in `sim-service/run_interactive.py`:
+  - Added bridge endpoint:
+    - `POST /emergency_stop`
+    - effect: set collect stop event immediately, cancel queued commands, request main-thread physics pause.
+  - Added emergency-stop state and latch:
+    - `_estop_event`
+    - `_request_emergency_stop(...)`
+    - `_apply_emergency_stop_if_requested(...)`
+  - Added queued-command drain for estop:
+    - `_drain_pending_commands(...)`
+    - pending requests now fail fast with `Command cancelled by emergency stop`.
+  - Improved timeout message in `_enqueue_cmd(...)`:
+    - when collect is active, timeout message now explicitly says main thread is busy collecting and suggests `/emergency_stop`.
+
+- Intended behavior after fix:
+  - E-stop can be triggered even when main thread is busy in collection loop.
+  - collect stops as soon as collector loop observes `stop_event`.
+  - physics is paused on next main-loop tick.

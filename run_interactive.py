@@ -224,6 +224,9 @@ _state = {
     "step": 0,
     "collecting": False,
     "collect_progress": None,
+    "estop_requested": False,
+    "last_estop_reason": None,
+    "last_estop_at": None,
     "autosave_enabled": AUTOSAVE_ENABLED,
     "autosave_stage_path": AUTOSAVE_STAGE_PATH if AUTOSAVE_ENABLED else None,
     "restored_from_autosave": False,
@@ -237,6 +240,7 @@ import queue
 import inspect
 _cmd_queue = queue.Queue()
 _CMD_TIMEOUT = 10  # seconds to wait for main thread to process
+_estop_event = threading.Event()
 
 # ── Health server (port 5900) ────────────────────────────────
 from http.server import HTTPServer, BaseHTTPRequestHandler
@@ -627,10 +631,46 @@ def _enqueue_cmd(cmd_type, **kwargs):
     cmd = {"type": cmd_type, "result": None, "error": None, "event": result_event, **kwargs}
     _cmd_queue.put(cmd)
     if not result_event.wait(timeout=_CMD_TIMEOUT):
+        if _state.get("collecting"):
+            return jsonify({"error": "Timeout waiting for main thread (busy collecting). Use /emergency_stop to interrupt immediately."}), 504
         return jsonify({"error": "Timeout waiting for main thread"}), 504
     if cmd["error"]:
         return jsonify({"error": cmd["error"]}), 500
     return jsonify(cmd["result"])
+
+
+def _drain_pending_commands(error_message: str) -> int:
+    """Fail all queued commands immediately (used by emergency stop)."""
+    drained = 0
+    while True:
+        try:
+            cmd = _cmd_queue.get_nowait()
+        except queue.Empty:
+            break
+        cmd["error"] = error_message
+        cmd.get("event").set()
+        drained += 1
+    return drained
+
+
+def _request_emergency_stop(reason: str = "manual_estop") -> dict:
+    """Emergency-stop entrypoint safe to call from bridge thread."""
+    global _collect_request
+    _collect_stop.set()
+    _collect_request = None
+    _estop_event.set()
+    _state["estop_requested"] = True
+    _state["last_estop_reason"] = str(reason)
+    _state["last_estop_at"] = time.time()
+    if _state.get("collect_progress"):
+        _state["collect_progress"]["status"] = "emergency_stop_requested"
+    drained = _drain_pending_commands("Command cancelled by emergency stop")
+    return {
+        "status": "estop_requested",
+        "collecting": bool(_state.get("collecting")),
+        "drained_commands": drained,
+        "reason": str(reason),
+    }
 
 
 @bridge.route("/physics/play", methods=["POST"])
@@ -718,6 +758,15 @@ def collect_stop():
     if _state["collect_progress"]:
         _state["collect_progress"]["status"] = "stopping"
     return jsonify({"status": "stopping"})
+
+
+@bridge.route("/emergency_stop", methods=["POST"])
+def emergency_stop():
+    """Immediate kill-switch: stop collect + cancel queued commands + pause physics on next frame."""
+    data = flask_request.get_json(silent=True) or {}
+    reason = data.get("reason", "manual_estop")
+    result = _request_emergency_stop(reason=reason)
+    return jsonify(result)
 
 
 # ── Start Bridge API in daemon thread ────────────────────────
@@ -1030,10 +1079,28 @@ def _run_pending_collection():
         _state["collecting"] = False
 
 
+def _apply_emergency_stop_if_requested():
+    """Main-thread side effects for emergency stop (Isaac API calls)."""
+    global PHYSICS_RUNNING
+    if not _estop_event.is_set():
+        return
+    try:
+        if world is not None:
+            world.pause()
+    except Exception as exc:
+        print(f"[estop] WARNING: world.pause() failed: {exc}")
+    PHYSICS_RUNNING = False
+    _state["physics"] = False
+    _state["collecting"] = False
+    _estop_event.clear()
+    print(f"[estop] Applied emergency stop (reason={_state.get('last_estop_reason')})")
+
+
 # ── Main render loop ─────────────────────────────────────────
 step = 0
 try:
     while simulation_app.is_running():
+        _apply_emergency_stop_if_requested()
         _process_commands()
         if _state["collecting"] and _collect_request is not None:
             _run_pending_collection()
