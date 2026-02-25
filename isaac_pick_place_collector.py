@@ -550,6 +550,27 @@ def _object_token_candidates(object_prim_path: str) -> list[str]:
     return [t for t in ordered if t]
 
 
+def _iter_mug_annotation_candidate_paths() -> list[Path]:
+    candidates = [
+        SCRIPT_DIR / "grasp_poses" / "mug_grasp_pose.json",
+        Path("/sim-service/grasp_poses/mug_grasp_pose.json"),
+        Path("/code/grasp_poses/mug_grasp_pose.json"),
+        Path.cwd() / "grasp_poses" / "mug_grasp_pose.json",
+    ]
+    unique: list[Path] = []
+    seen: set[str] = set()
+    for cand in candidates:
+        try:
+            key = str(cand.resolve())
+        except Exception:
+            key = str(cand)
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(cand)
+    return unique
+
+
 def _resolve_grasp_annotation_path(stage: Any, object_prim_path: str) -> Optional[Path]:
     explicit = os.environ.get("COLLECT_GRASP_POSE_PATH", "").strip()
     if explicit:
@@ -604,6 +625,11 @@ def _resolve_grasp_annotation_path(stage: Any, object_prim_path: str) -> Optiona
                         return cand
             except Exception:
                 pass
+    if "mug" in set(tokens):
+        for cand in _iter_mug_annotation_candidate_paths():
+            if cand.exists():
+                LOG.info("collect: using mug annotation fallback path: %s", cand)
+                return cand
     return None
 
 
@@ -2792,6 +2818,10 @@ def _run_pick_place_episode(
     ik_target_orientation: np.ndarray | None = None
     episode_started = time.monotonic()
     timeout_sec = max(0.0, float(episode_timeout_sec))
+    object_tokens = set(_object_token_candidates(object_prim_path))
+    is_mug_target = "mug" in object_tokens
+    require_mug_annotation = _read_bool_env("COLLECT_REQUIRE_MUG_ANNOTATION", True)
+    enforce_mug_annotation_target = _read_bool_env("COLLECT_ENFORCE_MUG_ANNOTATION_TARGET", True)
 
     annotation_path = _resolve_grasp_annotation_path(stage=stage, object_prim_path=object_prim_path)
     annotation_candidates: list[dict[str, Any]] = []
@@ -2833,15 +2863,23 @@ def _run_pick_place_episode(
                     object_prim_path,
                     sanitize_report,
                 )
-            if not annotation_candidates and _read_bool_env("COLLECT_ALLOW_UNSANITIZED_ANNOTATION_FALLBACK", True):
+            allow_unsanitized_fallback = _read_bool_env("COLLECT_ALLOW_UNSANITIZED_ANNOTATION_FALLBACK", True)
+            force_unsanitized_for_required_mug = bool(
+                require_mug_annotation and is_mug_target and loaded_annotation_candidates
+            )
+            if not annotation_candidates and (allow_unsanitized_fallback or force_unsanitized_for_required_mug):
                 annotation_candidates = loaded_annotation_candidates
                 annotation_local_pos_scale = float(hint_scale)
+                fallback_reason = (
+                    "required_mug_annotation" if force_unsanitized_for_required_mug else "allow_unsanitized_env"
+                )
                 LOG.warning(
                     "collect: sanitize dropped all candidates; fallback to unsanitized annotation set "
-                    "(count=%d, path=%s, local_pos_scale=%.5f)",
+                    "(count=%d, path=%s, local_pos_scale=%.5f, reason=%s)",
                     len(annotation_candidates),
                     annotation_path,
                     float(annotation_local_pos_scale),
+                    fallback_reason,
                 )
             if annotation_candidates:
                 LOG.info(
@@ -2863,6 +2901,30 @@ def _run_pick_place_episode(
                 )
         else:
             LOG.warning("collect: grasp annotation file had no usable poses: %s", annotation_path)
+    if require_mug_annotation and is_mug_target and not annotation_candidates:
+        for mug_fallback_path in _iter_mug_annotation_candidate_paths():
+            if not mug_fallback_path.exists():
+                continue
+            try:
+                if annotation_path is not None and mug_fallback_path.resolve() == annotation_path.resolve():
+                    continue
+            except Exception:
+                if annotation_path is not None and str(mug_fallback_path) == str(annotation_path):
+                    continue
+            fallback_candidates, fallback_meta = _load_grasp_pose_candidates(mug_fallback_path)
+            if not fallback_candidates:
+                continue
+            annotation_path = mug_fallback_path
+            annotation_meta = fallback_meta
+            annotation_candidates = list(fallback_candidates)
+            annotation_local_pos_scale = float(annotation_meta.get("position_scale_hint", 1.0))
+            LOG.warning(
+                "collect: recovered mug grasp annotation from fallback path=%s count=%d local_pos_scale=%.5f",
+                mug_fallback_path,
+                len(annotation_candidates),
+                float(annotation_local_pos_scale),
+            )
+            break
     if annotation_path is not None and annotation_meta:
         if str(annotation_meta.get("quat_order", "wxyz")) == "xyzw":
             LOG.warning(
@@ -2881,10 +2943,6 @@ def _run_pick_place_episode(
             existing_failed_ids,
         )
     no_annotation_available = len(annotation_candidates) == 0
-    object_tokens = set(_object_token_candidates(object_prim_path))
-    is_mug_target = "mug" in object_tokens
-    require_mug_annotation = _read_bool_env("COLLECT_REQUIRE_MUG_ANNOTATION", True)
-    enforce_mug_annotation_target = _read_bool_env("COLLECT_ENFORCE_MUG_ANNOTATION_TARGET", True)
     if require_mug_annotation and is_mug_target and no_annotation_available:
         raise RuntimeError(
             "Mug grasp annotation required but none found. "
