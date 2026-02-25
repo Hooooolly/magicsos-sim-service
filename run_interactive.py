@@ -730,6 +730,16 @@ def _runtime_create_mug(
     xf.AddTranslateOp().Set(Gf.Vec3d(float(px), float(py), float(pz)))
     xf.AddScaleOp().Set(Gf.Vec3d(0.01, 0.01, 0.01))
 
+    # Bind mug grasp annotation explicitly so collector resolves the intended file first.
+    try:
+        ann_path = Path(__file__).resolve().parent / "grasp_poses" / "mug_grasp_pose.json"
+        if ann_path.exists():
+            ann_abs = str(ann_path.resolve())
+            prim.SetCustomDataByKey("grasp_pose_path", ann_abs)
+            prim.SetCustomDataByKey("annotation_path", ann_abs)
+    except Exception:
+        pass
+
     try:
         UsdPhysics.RigidBodyAPI.Apply(prim)
     except Exception:

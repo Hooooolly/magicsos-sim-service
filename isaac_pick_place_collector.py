@@ -2860,6 +2860,15 @@ def _run_pick_place_episode(
             existing_failed_ids,
         )
     no_annotation_available = len(annotation_candidates) == 0
+    object_tokens = set(_object_token_candidates(object_prim_path))
+    is_mug_target = "mug" in object_tokens
+    require_mug_annotation = _read_bool_env("COLLECT_REQUIRE_MUG_ANNOTATION", True)
+    enforce_mug_annotation_target = _read_bool_env("COLLECT_ENFORCE_MUG_ANNOTATION_TARGET", True)
+    if require_mug_annotation and is_mug_target and no_annotation_available:
+        raise RuntimeError(
+            "Mug grasp annotation required but none found. "
+            "Expected grasp_poses/mug_grasp_pose.json (or set COLLECT_GRASP_POSE_PATH)."
+        )
     force_topdown_grasp = _read_bool_env("COLLECT_FORCE_TOPDOWN_GRASP", False)
     if force_topdown_grasp:
         LOG.warning(
@@ -3135,6 +3144,10 @@ def _run_pick_place_episode(
             except Exception:
                 pass
         else:
+            if is_mug_target and enforce_mug_annotation_target:
+                raise RuntimeError(
+                    "Mug grasp annotation target selection failed; refusing fallback to bbox/root pose."
+                )
             raw_pick_x, raw_pick_y, pick_source = _query_object_pick_xy(
                 stage=stage,
                 object_prim_path=object_prim_path,
@@ -3165,6 +3178,10 @@ def _run_pick_place_episode(
             # Keep target inside robot-table reachable workspace for physically valid approach.
             if current_grasp_target is not None:
                 if current_grasp_target.get("source") == "annotation":
+                    if is_mug_target and enforce_mug_annotation_target:
+                        raise RuntimeError(
+                            "Mug annotation target projected outside workspace; refusing fallback to bbox target."
+                        )
                     # Annotation can point to unreachable local handles; switch to live bbox target.
                     current_grasp_target = {
                         "target_pos": np.array([pick_x, pick_y, float(table_top_z)], dtype=np.float32),
