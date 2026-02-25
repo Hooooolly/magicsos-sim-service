@@ -815,6 +815,27 @@ def _estimate_object_height(stage: Any, object_prim_path: str, usd_geom: Any, fa
     return max(h, 0.01)
 
 
+def _query_object_pick_xy(
+    stage: Any,
+    object_prim_path: str,
+    usd: Any,
+    usd_geom: Any,
+) -> tuple[float, float, str]:
+    """Pick target XY from live object geometry (bbox center), fallback to root pose."""
+    bbox = _compute_prim_bbox(stage, object_prim_path, usd_geom)
+    if bbox:
+        mn, mx = bbox
+        cx = float((mn[0] + mx[0]) * 0.5)
+        cy = float((mn[1] + mx[1]) * 0.5)
+        if np.isfinite(cx) and np.isfinite(cy):
+            return cx, cy, "bbox_center"
+
+    obj_pos, _ = _get_prim_world_pose(stage, object_prim_path, usd, usd_geom)
+    rx = float(obj_pos[0]) if obj_pos.size >= 1 and np.isfinite(obj_pos[0]) else 0.0
+    ry = float(obj_pos[1]) if obj_pos.size >= 2 and np.isfinite(obj_pos[1]) else 0.0
+    return rx, ry, "root_pose"
+
+
 def _resolve_eef_prim(stage: Any, robot_prim_path: str, get_prim_at_path: Any) -> str | None:
     candidates = [
         f"{robot_prim_path}/panda_hand",
@@ -1318,16 +1339,20 @@ def _run_pick_place_episode(
             stopped = True
             break
 
-        obj_pos, _ = _get_prim_world_pose(stage, object_prim_path, usd, usd_geom)
-        raw_pick_x = float(obj_pos[0])
-        raw_pick_y = float(obj_pos[1])
+        raw_pick_x, raw_pick_y, pick_source = _query_object_pick_xy(
+            stage=stage,
+            object_prim_path=object_prim_path,
+            usd=usd,
+            usd_geom=usd_geom,
+        )
         pick_x = float(np.clip(raw_pick_x, table_x_range[0], table_x_range[1]))
         pick_y = float(np.clip(raw_pick_y, table_y_range[0], table_y_range[1]))
         clamp_delta = float(np.linalg.norm(np.array([pick_x - raw_pick_x, pick_y - raw_pick_y], dtype=np.float32)))
         if clamp_delta > PICK_CLAMP_MAX_DELTA and np.isfinite(raw_pick_x) and np.isfinite(raw_pick_y):
             LOG.warning(
-                "collect: attempt %d workspace mismatch (raw=(%.3f, %.3f), clamped=(%.3f, %.3f), delta=%.3f) -> using raw pick pose",
+                "collect: attempt %d workspace mismatch (%s raw=(%.3f, %.3f), clamped=(%.3f, %.3f), delta=%.3f) -> using raw pick pose",
                 attempt,
+                pick_source,
                 raw_pick_x,
                 raw_pick_y,
                 pick_x,
@@ -1338,8 +1363,9 @@ def _run_pick_place_episode(
         last_pick_pos = (pick_x, pick_y)
         if abs(pick_x - raw_pick_x) > 1e-3 or abs(pick_y - raw_pick_y) > 1e-3:
             LOG.warning(
-                "collect: attempt %d pick pose clamped: raw=(%.3f, %.3f), clamped=(%.3f, %.3f)",
+                "collect: attempt %d pick pose clamped (%s): raw=(%.3f, %.3f), clamped=(%.3f, %.3f)",
                 attempt,
+                pick_source,
                 raw_pick_x,
                 raw_pick_y,
                 pick_x,

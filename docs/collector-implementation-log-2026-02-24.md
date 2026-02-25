@@ -456,3 +456,19 @@ Files in platform repo:
 - Expected effect:
   - Better use of real-time object ground-truth Z in planning.
   - UI/backend can report completion with failure semantics instead of only "done".
+
+## Hotfix (2026-02-25 04:10 UTC, grasp XY from live object center after disturbance)
+- User requirement:
+  - Use object ground-truth position for planning.
+  - If mug gets tipped/pushed, replan from object center instead of stale pivot.
+
+- Changes in `sim-service/isaac_pick_place_collector.py`:
+  - Added `_query_object_pick_xy(...)`:
+    - primary source: live world bbox center `(cx, cy)`
+    - fallback: root prim world pose `(x, y)` when bbox is unavailable
+  - Updated episode retry loop to use `_query_object_pick_xy(...)` every attempt.
+  - Added source-aware logs (`bbox_center` / `root_pose`) for clamp diagnostics.
+
+- Expected effect:
+  - Pick XY tracks the actual object center more robustly after contact disturbances.
+  - Planning no longer depends on object prim pivot alignment for normal cases.
