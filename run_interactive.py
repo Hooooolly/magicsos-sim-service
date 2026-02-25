@@ -1134,7 +1134,7 @@ def collect_start():
         return jsonify({"error": "num_episodes/steps_per_segment/episode_timeout_sec must be numeric"}), 400
     skill = str(data.get("skill", "pick_place") or "pick_place")
     output_dir = _normalize_collect_output_dir(data.get("output_dir"), skill)
-    scene_mode = str(data.get("scene_mode", "strict") or "strict")
+    scene_mode = str(data.get("scene_mode", "auto") or "auto")
     target_objects = data.get("target_objects")
     if target_objects is not None and not isinstance(target_objects, list):
         return jsonify({"error": "target_objects must be a list when provided"}), 400
@@ -1461,17 +1461,15 @@ def _run_pending_collection():
     episode_timeout_sec = float(req.get("episode_timeout_sec", os.environ.get("COLLECT_EPISODE_TIMEOUT_SEC", "180")))
     skill = str(req.get("skill", "pick_place"))
     output_dir = _normalize_collect_output_dir(req.get("output_dir"), skill)
-    scene_mode = str(req.get("scene_mode", "strict") or "strict")
+    scene_mode = str(req.get("scene_mode", "auto") or "auto")
     target_objects = req.get("target_objects")
 
     try:
-        # Strict scene reuse: do not recreate world by default, so we preserve
-        # current articulation/sim context for the user-arranged scene.
-        # Opt-in fallback is available via env when stale-wrapper regressions need it.
-        recreate_before_collect = os.environ.get("COLLECT_RECREATE_WORLD_BEFORE_START", "0").strip() not in {"0", "false", "False", ""}
-        if recreate_before_collect:
-            if not _recreate_world_for_open_stage("collect_start"):
-                raise RuntimeError("Failed to recreate world before collection")
+        # Collect can run after many scene-chat mutations. Recreate World to
+        # clear stale scene registry wrappers (e.g. expired /World/Table
+        # FixedCuboid handles) while preserving the currently opened USD stage.
+        if not _recreate_world_for_open_stage("collect_start"):
+            raise RuntimeError("Failed to recreate world before collection")
         if world is None:
             raise RuntimeError("World is unavailable before collection")
 

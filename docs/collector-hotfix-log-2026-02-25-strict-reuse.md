@@ -54,3 +54,7 @@ If required scene elements are missing, collect fails with a direct reason inste
 - `run_interactive.py`: collect start no longer recreates `World` by default.
   - New env gate: `COLLECT_RECREATE_WORLD_BEFORE_START` (default `0`).
 - `isaac_pick_place_collector.py`: after `world.reset()`, collector now calls `world.play()` and steps a few frames before `franka.initialize()` to ensure articulation view is available.
+
+## Rollback note
+- Rolled back `run_interactive.py` and `isaac_pick_place_collector.py` to commit `0af7cf6` behavior to restore previously working scene collect flow.
+- Reason: strict-mode regression caused articulation initialization failures and unstable collect behavior.
