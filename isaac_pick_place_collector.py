@@ -547,8 +547,10 @@ def _object_token_candidates(object_prim_path: str) -> list[str]:
         "tomato": ("tomato", "soup", "005"),
     }
     expanded = set(tokens)
+    token_blob = " ".join(sorted(tokens))
     for canonical, words in aliases.items():
-        if any(w in tokens for w in words):
+        # Allow compact prim names like "SugarBox"/"MustardBottle".
+        if any((w in tokens) or (w in token_blob) for w in words):
             expanded.add(canonical)
 
     ordered = sorted(expanded)
