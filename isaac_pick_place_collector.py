@@ -3732,6 +3732,7 @@ def _setup_pick_place_scene_reuse_or_patch(
     fps: int,
     rng: np.random.Generator,
     target_objects: Optional[Sequence[str]] = None,
+    allow_patch: bool = True,
 ) -> dict[str, Any]:
     import omni.usd
     from omni.isaac.core.articulations import Articulation
@@ -3744,6 +3745,9 @@ def _setup_pick_place_scene_reuse_or_patch(
     stage = omni.usd.get_context().get_stage()
     if stage is None:
         raise RuntimeError("USD stage is not available")
+    if allow_patch:
+        LOG.warning("collect: scene patching is disabled; forcing strict reuse-only scene validation")
+    allow_patch = False
 
     table_added = False
     table_root = _resolve_table_prim(stage, UsdGeom)
@@ -3752,6 +3756,8 @@ def _setup_pick_place_scene_reuse_or_patch(
             table_root = "/World/Table"
             LOG.info("collect: fallback reusing existing /World/Table")
         else:
+            if not allow_patch:
+                raise RuntimeError("collect(strict): missing table in current scene")
             table_root = "/World/Table"
             table = FixedCuboid(
                 prim_path=table_root,
@@ -3769,6 +3775,8 @@ def _setup_pick_place_scene_reuse_or_patch(
 
     robot_prim_path = _resolve_robot_prim(stage)
     if robot_prim_path is None:
+        if not allow_patch:
+            raise RuntimeError("collect(strict): missing Franka in current scene")
         assets_root = get_assets_root_path()
         if not assets_root:
             raise RuntimeError("Cannot resolve Isaac Sim assets root path for Franka")
@@ -3789,6 +3797,10 @@ def _setup_pick_place_scene_reuse_or_patch(
         for _ in range(6):
             simulation_app.update()
         if not _has_articulation_root(stage, robot_prim_path, UsdPhysics):
+            if not allow_patch:
+                raise RuntimeError(
+                    f"collect(strict): existing Franka at {robot_prim_path} is not articulation-ready"
+                )
             LOG.warning("collect: existing Franka not articulation-ready at %s, reloading", robot_prim_path)
             _remove_prim_if_exists(stage, robot_prim_path)
             assets_root = get_assets_root_path()
@@ -3834,6 +3846,8 @@ def _setup_pick_place_scene_reuse_or_patch(
         table_top_z=table_top_z,
     )
     if object_prim_path is None:
+        if not allow_patch:
+            raise RuntimeError("collect(strict): missing grasp target object in current scene")
         obj_x = float((table_x_range[0] + table_x_range[1]) * 0.5)
         obj_y = float((table_y_range[0] + table_y_range[1]) * 0.5)
         object_prim_path = "/World/PickObject"
@@ -3877,22 +3891,34 @@ def _setup_pick_place_scene_reuse_or_patch(
 
     # Ensure chosen object has basic rigid/collision physics for pure physical grasp.
     obj_root = stage.GetPrimAtPath(object_prim_path)
-    if obj_root and obj_root.IsValid() and not obj_root.HasAPI(UsdPhysics.RigidBodyAPI):
+    if (not obj_root) or (not obj_root.IsValid()):
+        raise RuntimeError(f"collect: resolved target object is invalid: {object_prim_path}")
+    if not obj_root.HasAPI(UsdPhysics.RigidBodyAPI):
+        if not allow_patch:
+            raise RuntimeError(f"collect(strict): target object lacks RigidBody API: {object_prim_path}")
         try:
             UsdPhysics.RigidBodyAPI.Apply(obj_root)
         except Exception:
             pass
+    has_collision = False
     if obj_root and obj_root.IsValid():
         for p in _iter_descendants(obj_root):
             if not p or not p.IsValid() or not p.IsA(UsdGeom.Mesh):
                 continue
             try:
                 if not p.HasAPI(UsdPhysics.CollisionAPI):
+                    if not allow_patch:
+                        continue
                     UsdPhysics.CollisionAPI.Apply(p)
                 if not p.HasAPI(UsdPhysics.MeshCollisionAPI):
+                    if not allow_patch:
+                        continue
                     UsdPhysics.MeshCollisionAPI.Apply(p)
+                has_collision = has_collision or p.HasAPI(UsdPhysics.CollisionAPI)
             except Exception:
                 pass
+    if not has_collision and not allow_patch:
+        raise RuntimeError(f"collect(strict): target object has no mesh collision API: {object_prim_path}")
 
     table_x_range, table_y_range, table_top_z, work_center = _infer_table_workspace(
         stage,
@@ -3908,7 +3934,7 @@ def _setup_pick_place_scene_reuse_or_patch(
         table_top_z=table_top_z,
         work_center=work_center,
     )
-    if _read_bool_env("COLLECT_ALIGN_ROBOT_BASE", True):
+    if allow_patch and _read_bool_env("COLLECT_ALIGN_ROBOT_BASE", True):
         try:
             bx, by, bz, byaw = _align_robot_base_for_collect(
                 stage=stage,
@@ -3929,7 +3955,7 @@ def _setup_pick_place_scene_reuse_or_patch(
             )
         except Exception as exc:
             LOG.warning("collect: failed to align robot base (%s), keep current pose", exc)
-    if _read_bool_env("COLLECT_RECENTER_OBJECT_IF_OUTSIDE_WORKSPACE", True):
+    if allow_patch and _read_bool_env("COLLECT_RECENTER_OBJECT_IF_OUTSIDE_WORKSPACE", True):
         try:
             fix = _ensure_object_within_workspace(
                 stage=stage,
@@ -3962,10 +3988,12 @@ def _setup_pick_place_scene_reuse_or_patch(
     overhead_cam_path = "/World/OverheadCam"
     overhead_prim = stage.GetPrimAtPath(overhead_cam_path)
     if not overhead_prim or not overhead_prim.IsValid() or not overhead_prim.IsA(UsdGeom.Camera):
+        if not allow_patch:
+            raise RuntimeError(f"collect(strict): missing overhead camera at {overhead_cam_path}")
         over_usd = UsdGeom.Camera.Define(stage, overhead_cam_path)
         LOG.info("collect: missing overhead camera -> added %s", overhead_cam_path)
     over_prim = stage.GetPrimAtPath(overhead_cam_path)
-    if over_prim and over_prim.IsValid():
+    if over_prim and over_prim.IsValid() and allow_patch:
         over_usd = UsdGeom.Camera(over_prim)
         over_xf = UsdGeom.Xformable(over_prim)
         over_xf.ClearXformOpOrder()
@@ -3980,10 +4008,12 @@ def _setup_pick_place_scene_reuse_or_patch(
     wrist_cam_path = f"{robot_prim_path}/panda_hand/wrist_cam"
     wrist_prim = stage.GetPrimAtPath(wrist_cam_path)
     if not wrist_prim or not wrist_prim.IsValid() or not wrist_prim.IsA(UsdGeom.Camera):
+        if not allow_patch:
+            raise RuntimeError(f"collect(strict): missing wrist camera at {wrist_cam_path}")
         wrist_usd = UsdGeom.Camera.Define(stage, wrist_cam_path)
         LOG.info("collect: missing wrist camera -> added %s", wrist_cam_path)
     wrist_prim = stage.GetPrimAtPath(wrist_cam_path)
-    if wrist_prim and wrist_prim.IsValid():
+    if wrist_prim and wrist_prim.IsValid() and allow_patch:
         wrist_usd = UsdGeom.Camera(wrist_prim)
         wrist_xf = UsdGeom.Xformable(wrist_prim)
         wrist_xf.ClearXformOpOrder()
@@ -4015,9 +4045,13 @@ def _setup_pick_place_scene_reuse_or_patch(
     world.scene.add(camera_high)
     world.scene.add(camera_wrist)
 
-    world.reset()
-    for _ in range(20):
-        world.step(render=True)
+    if allow_patch:
+        world.reset()
+        for _ in range(20):
+            world.step(render=True)
+    else:
+        for _ in range(20):
+            world.step(render=True)
 
     if hasattr(franka, "initialize"):
         try:
@@ -4031,13 +4065,14 @@ def _setup_pick_place_scene_reuse_or_patch(
                 cam.initialize()
             except Exception as exc:
                 LOG.warning("Camera initialize() failed: %s", exc)
-    _apply_wrist_camera_pose(
-        camera_wrist=camera_wrist,
-        stage=stage,
-        usd_geom=UsdGeom,
-        gf=Gf,
-        wrist_cam_path=wrist_cam_path,
-    )
+    if allow_patch:
+        _apply_wrist_camera_pose(
+            camera_wrist=camera_wrist,
+            stage=stage,
+            usd_geom=UsdGeom,
+            gf=Gf,
+            wrist_cam_path=wrist_cam_path,
+        )
 
     from omni.isaac.core.utils.prims import get_prim_at_path
 
@@ -4095,7 +4130,7 @@ def run_collection_in_process(
     steps_per_segment: int = STEPS_PER_SEGMENT,
     seed: int = 12345,
     task_name: str = "pick_place",
-    scene_mode: str = "auto",
+    scene_mode: str = "strict",
     target_objects: Optional[Sequence[str]] = None,
     dataset_repo_id: Optional[str] = None,
     episode_timeout_sec: float | None = None,
@@ -4107,7 +4142,7 @@ def run_collection_in_process(
     if steps_per_segment <= 0:
         raise ValueError("steps_per_segment must be > 0")
     task_name = str(task_name or "pick_place")
-    scene_mode = str(scene_mode or "auto").lower()
+    scene_mode = str(scene_mode or "strict").lower()
     if episode_timeout_sec is None:
         episode_timeout_sec = _read_float_env("COLLECT_EPISODE_TIMEOUT_SEC", DEFAULT_EPISODE_TIMEOUT_SEC)
     episode_timeout_sec = max(0.0, float(episode_timeout_sec))
@@ -4115,18 +4150,29 @@ def run_collection_in_process(
     os.makedirs(output_dir, exist_ok=True)
 
     rng = np.random.default_rng(seed)
-    if scene_mode in {"auto", "reuse", "existing", "patch", "preserve"}:
+    if scene_mode in {"strict", "reuse_only", "existing_only", "scene_only"}:
         ctx = _setup_pick_place_scene_reuse_or_patch(
             world=world,
             simulation_app=simulation_app,
             fps=fps,
             rng=rng,
             target_objects=target_objects,
+            allow_patch=False,
         )
-        actual_scene_mode = "reuse_or_patch"
+        actual_scene_mode = "reuse_only"
+    elif scene_mode in {"auto", "reuse", "existing", "patch", "preserve"}:
+        LOG.warning("collect: scene_mode=%s mapped to strict reuse-only mode", scene_mode)
+        ctx = _setup_pick_place_scene_reuse_or_patch(
+            world=world,
+            simulation_app=simulation_app,
+            fps=fps,
+            rng=rng,
+            target_objects=target_objects,
+            allow_patch=False,
+        )
+        actual_scene_mode = "reuse_only"
     elif scene_mode in {"template", "generated"}:
-        ctx = _setup_pick_place_scene_template(world=world, simulation_app=simulation_app, fps=fps, rng=rng)
-        actual_scene_mode = "template"
+        raise ValueError("scene_mode=template/generated is disabled; use an existing scene with table+Franka+target+cameras")
     else:
         raise ValueError(f"Unsupported scene_mode: {scene_mode}")
 

@@ -1134,7 +1134,7 @@ def collect_start():
         return jsonify({"error": "num_episodes/steps_per_segment/episode_timeout_sec must be numeric"}), 400
     skill = str(data.get("skill", "pick_place") or "pick_place")
     output_dir = _normalize_collect_output_dir(data.get("output_dir"), skill)
-    scene_mode = str(data.get("scene_mode", "auto") or "auto")
+    scene_mode = str(data.get("scene_mode", "strict") or "strict")
     target_objects = data.get("target_objects")
     if target_objects is not None and not isinstance(target_objects, list):
         return jsonify({"error": "target_objects must be a list when provided"}), 400
@@ -1461,7 +1461,7 @@ def _run_pending_collection():
     episode_timeout_sec = float(req.get("episode_timeout_sec", os.environ.get("COLLECT_EPISODE_TIMEOUT_SEC", "180")))
     skill = str(req.get("skill", "pick_place"))
     output_dir = _normalize_collect_output_dir(req.get("output_dir"), skill)
-    scene_mode = str(req.get("scene_mode", "auto") or "auto")
+    scene_mode = str(req.get("scene_mode", "strict") or "strict")
     target_objects = req.get("target_objects")
 
     try:
