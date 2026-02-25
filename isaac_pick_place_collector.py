@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import math
 import os
 import re
 import sys
@@ -85,8 +86,14 @@ OBJECT_MASS = 0.1
 MIN_PICK_PLACE_DIST = 0.1
 STEPS_PER_SEGMENT = 50
 TABLE_MARGIN = 0.08
-MAX_ARM_STEP_RAD = 0.05
 MAX_GRIPPER_STEP = 0.008
+MAX_IK_WAYPOINT_JUMP_RAD = 1.20
+
+try:
+    MAX_ARM_STEP_RAD = float(os.environ.get("COLLECT_MAX_ARM_STEP_RAD", "0.03"))
+except Exception:
+    MAX_ARM_STEP_RAD = 0.03
+MAX_ARM_STEP_RAD = float(np.clip(MAX_ARM_STEP_RAD, 0.005, 0.10))
 
 TABLE_X_RANGE = (0.3, 0.7)
 TABLE_Y_RANGE = (-0.3, 0.3)
@@ -98,6 +105,8 @@ IK_PLACE_APPROACH_EXTRA_Z = 0.10
 IK_PICK_GRASP_HEIGHT_RATIO = 0.60
 IK_PICK_MIN_CLEARANCE_FROM_TABLE = 0.01
 IK_PLACE_MIN_CLEARANCE_FROM_TABLE = 0.02
+IK_PRE_GRASP_OFFSET = 0.10
+IK_PRE_GRASP_MIN_ABOVE_TABLE = 0.02
 GRASP_MAX_ATTEMPTS = 3
 REACH_BEFORE_CLOSE_MAX_OBJECT_EEF_DISTANCE = 0.16
 REACH_BEFORE_CLOSE_MAX_OBJECT_EEF_XY_DISTANCE = 0.08
@@ -125,6 +134,26 @@ WRIST_CAM_LOCAL_QUAT_ROS = (0.7071068, 0.0, 0.0, 0.7071068)
 # Fallback when Camera.set_local_pose(camera_axes=...) is unavailable.
 WRIST_CAM_FALLBACK_TRANSLATE = (0.0, 0.0, 0.10)
 WRIST_CAM_FALLBACK_ROTATE_XYZ = (0.0, 180.0, 0.0)
+# MagicSim-style heuristic fallback when no annotation exists.
+# Quaternion format: [w, x, y, z]
+TOP_DOWN_FALLBACK_QUAT = np.array([0.0, 1.0, 0.0, 0.0], dtype=np.float32)
+# Treat annotation translations as fingertip-midpoint (TCP) by default, then
+# convert to panda_hand frame for IK target consistency.
+_ANN_FRAME_RAW = os.environ.get("COLLECT_ANNOTATION_POSE_IS_TIP_MID_FRAME", "1").strip().lower()
+ANNOTATION_POSE_IS_TIP_MID_FRAME = _ANN_FRAME_RAW not in {"0", "false", "no", "off"}
+
+# Franka Panda joint limits (radians), used for command clipping + anti-knot safety.
+FRANKA_ARM_LOWER = np.array(
+    [-2.8973, -1.7628, -2.8973, -3.0718, -2.8973, -0.0175, -2.8973],
+    dtype=np.float32,
+)
+FRANKA_ARM_UPPER = np.array(
+    [2.8973, 1.7628, 2.8973, -0.0698, 2.8973, 3.7525, 2.8973],
+    dtype=np.float32,
+)
+TRACKING_BBOX_MAX_EXTENT_M = 0.60
+TRACKING_BBOX_MAX_ROOT_DELTA_M = 0.40
+TRACKING_OBJECT_HEIGHT_MAX_M = 0.25
 
 COLLECTOR_ROOT = "/World/PickPlaceCollector"
 TABLE_PRIM_PATH = f"{COLLECTOR_ROOT}/Table"
@@ -141,6 +170,72 @@ GRASP_POSE_SOURCE_IDS = {
     "bbox_center": 2.0,
     "root_pose": 3.0,
 }
+_FAILED_ANNOTATION_POSE_CACHE: dict[str, set[int]] = {}
+
+try:
+    ANNOTATION_IK_SCREEN_MAX_CANDIDATES = int(
+        os.environ.get("COLLECT_ANNOTATION_IK_SCREEN_MAX_CANDIDATES", "64")
+    )
+except Exception:
+    ANNOTATION_IK_SCREEN_MAX_CANDIDATES = 64
+ANNOTATION_IK_SCREEN_MAX_CANDIDATES = int(
+    np.clip(ANNOTATION_IK_SCREEN_MAX_CANDIDATES, 1, 512)
+)
+
+try:
+    ANNOTATION_MIN_LOCAL_Z_PERCENTILE = float(
+        os.environ.get("COLLECT_ANNOTATION_MIN_LOCAL_Z_PERCENTILE", "0.30")
+    )
+except Exception:
+    ANNOTATION_MIN_LOCAL_Z_PERCENTILE = 0.30
+ANNOTATION_MIN_LOCAL_Z_PERCENTILE = float(
+    np.clip(ANNOTATION_MIN_LOCAL_Z_PERCENTILE, 0.0, 0.90)
+)
+
+try:
+    ANNOTATION_BODY_MIN_LOCAL_Z_PERCENTILE = float(
+        os.environ.get("COLLECT_ANNOTATION_BODY_MIN_LOCAL_Z_PERCENTILE", "0.45")
+    )
+except Exception:
+    ANNOTATION_BODY_MIN_LOCAL_Z_PERCENTILE = 0.45
+ANNOTATION_BODY_MIN_LOCAL_Z_PERCENTILE = float(
+    np.clip(ANNOTATION_BODY_MIN_LOCAL_Z_PERCENTILE, 0.0, 0.95)
+)
+
+try:
+    ANNOTATION_MIN_GROUP_KEEP = int(
+        os.environ.get("COLLECT_ANNOTATION_MIN_GROUP_KEEP", "4")
+    )
+except Exception:
+    ANNOTATION_MIN_GROUP_KEEP = 4
+ANNOTATION_MIN_GROUP_KEEP = int(np.clip(ANNOTATION_MIN_GROUP_KEEP, 1, 32))
+
+_ANN_VALIDATE_RAW = os.environ.get("COLLECT_ANNOTATION_VALIDATE_STRICT", "1").strip().lower()
+ANNOTATION_VALIDATE_STRICT = _ANN_VALIDATE_RAW not in {"0", "false", "no", "off"}
+try:
+    ANNOTATION_MAX_POS_RADIUS_FACTOR = float(
+        os.environ.get("COLLECT_ANNOTATION_MAX_POS_RADIUS_FACTOR", "2.8")
+    )
+except Exception:
+    ANNOTATION_MAX_POS_RADIUS_FACTOR = 2.8
+ANNOTATION_MAX_POS_RADIUS_FACTOR = float(np.clip(ANNOTATION_MAX_POS_RADIUS_FACTOR, 1.2, 20.0))
+
+try:
+    ANNOTATION_BBOX_MARGIN_FACTOR = float(
+        os.environ.get("COLLECT_ANNOTATION_BBOX_MARGIN_FACTOR", "0.25")
+    )
+except Exception:
+    ANNOTATION_BBOX_MARGIN_FACTOR = 0.25
+ANNOTATION_BBOX_MARGIN_FACTOR = float(np.clip(ANNOTATION_BBOX_MARGIN_FACTOR, 0.01, 2.0))
+
+try:
+    ANNOTATION_MIN_VALID_KEEP_RATIO = float(
+        os.environ.get("COLLECT_ANNOTATION_MIN_VALID_KEEP_RATIO", "0.30")
+    )
+except Exception:
+    ANNOTATION_MIN_VALID_KEEP_RATIO = 0.30
+ANNOTATION_MIN_VALID_KEEP_RATIO = float(np.clip(ANNOTATION_MIN_VALID_KEEP_RATIO, 0.05, 1.0))
+
 FRAME_EXTRA_FEATURES: dict[str, dict[str, Any]] = {
     "observation.object_pose_world": {"dtype": "float32", "shape": [7]},
     "observation.grasp_target_pose_world": {"dtype": "float32", "shape": [7]},
@@ -237,6 +332,74 @@ def _read_float_env(name: str, default: float) -> float:
         return float(default)
 
 
+def _read_bool_env(name: str, default: bool) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return bool(default)
+    value = str(raw).strip().lower()
+    if value in {"1", "true", "yes", "on"}:
+        return True
+    if value in {"0", "false", "no", "off"}:
+        return False
+    LOG.warning("Invalid bool env %s=%r, fallback %s", name, raw, bool(default))
+    return bool(default)
+
+
+def _resolve_collector_log_dir(output_dir: str | None = None) -> Path | None:
+    candidates: list[Path] = []
+    env_dir = os.environ.get("COLLECT_LOG_DIR", "").strip()
+    if env_dir:
+        candidates.append(Path(env_dir))
+    if output_dir:
+        try:
+            candidates.append(Path(output_dir).resolve() / "_logs")
+        except Exception:
+            candidates.append(Path(output_dir) / "_logs")
+    sim_log_dir = os.environ.get("SIM_LOG_DIR", "").strip()
+    if sim_log_dir:
+        candidates.append(Path(sim_log_dir) / "collector")
+    candidates.extend(
+        [
+            Path("/data/embodied/logs/sim-service/collector"),
+            Path("/data/datasets/embodied/logs/sim-service/collector"),
+            Path("/tmp/sim-service-logs/collector"),
+        ]
+    )
+    for candidate in candidates:
+        try:
+            candidate.mkdir(parents=True, exist_ok=True)
+            return candidate
+        except Exception:
+            continue
+    return None
+
+
+def _configure_collector_logging(output_dir: str | None = None) -> str | None:
+    level = getattr(logging, os.environ.get("COLLECT_LOG_LEVEL", "INFO").upper(), logging.INFO)
+    handlers: list[logging.Handler] = [logging.StreamHandler(sys.stdout)]
+    log_path: str | None = None
+    log_dir = _resolve_collector_log_dir(output_dir=output_dir)
+    if log_dir is not None:
+        ts = time.strftime("%Y%m%d_%H%M%S", time.localtime())
+        log_file = log_dir / f"isaac_pick_place_collector_{ts}_{os.getpid()}.log"
+        try:
+            handlers.append(logging.FileHandler(log_file, encoding="utf-8"))
+            log_path = str(log_file)
+        except Exception:
+            pass
+    logging.basicConfig(
+        level=level,
+        format="%(asctime)s [%(name)s] %(levelname)s %(message)s",
+        handlers=handlers,
+        force=True,
+    )
+    if log_path:
+        LOG.info("Persistent collector log enabled: %s", log_path)
+    else:
+        LOG.warning("Collector file logging unavailable; using stdout only")
+    return log_path
+
+
 def _normalize_quat_wxyz(quat: np.ndarray) -> np.ndarray:
     q = _to_numpy(quat, dtype=np.float32).reshape(-1)
     if q.size < 4:
@@ -299,6 +462,23 @@ def _transform_local_pose_to_world(
     world_pos = obj_p[:3] + rot @ loc_p[:3]
     world_quat = _quat_mul_wxyz(obj_q, loc_q)
     return world_pos.astype(np.float32), world_quat.astype(np.float32)
+
+
+def _convert_tip_mid_local_pose_to_hand_local(
+    local_pos: np.ndarray,
+    local_quat: np.ndarray,
+    tip_mid_offset_in_hand: np.ndarray,
+) -> np.ndarray:
+    """Convert a TCP/tip-mid local translation to panda_hand local translation."""
+    pos = _to_numpy(local_pos, dtype=np.float32).reshape(-1)
+    if pos.size < 3:
+        pos = np.zeros((3,), dtype=np.float32)
+    quat = _normalize_quat_wxyz(local_quat)
+    offset_h = _to_numpy(tip_mid_offset_in_hand, dtype=np.float32).reshape(-1)
+    if offset_h.size < 3 or not np.all(np.isfinite(offset_h[:3])):
+        return pos[:3].astype(np.float32)
+    offset_world_from_hand = _quat_to_rot_wxyz(quat) @ offset_h[:3]
+    return (pos[:3] - offset_world_from_hand.astype(np.float32)).astype(np.float32)
 
 
 def _apply_wrist_camera_pose(
@@ -427,27 +607,74 @@ def _resolve_grasp_annotation_path(stage: Any, object_prim_path: str) -> Optiona
     return None
 
 
-def _load_grasp_pose_candidates(annotation_path: Path) -> list[dict[str, Any]]:
+def _load_grasp_pose_candidates(annotation_path: Path) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     try:
         with annotation_path.open("r") as f:
             data = json.load(f)
     except Exception as exc:
         LOG.warning("collect: failed to read grasp annotation %s: %s", annotation_path, exc)
-        return []
+        return [], {}
 
     out: list[dict[str, Any]] = []
+    metadata = data.get("metadata", {})
+    if not isinstance(metadata, dict):
+        metadata = {}
+
+    quat_order_raw = str(
+        metadata.get(
+            "quat_order",
+            metadata.get("quaternion_order", metadata.get("quat_format", "wxyz")),
+        )
+    ).strip().lower()
+    quat_order = "xyzw" if quat_order_raw in {"xyzw", "x,y,z,w", "xyz_w", "quat_xyzw"} else "wxyz"
+
+    pos_scale_hint = 1.0
+    for key in ("position_scale_hint", "position_scale", "position_scale_to_m", "local_pos_scale"):
+        raw = metadata.get(key, None)
+        try:
+            v = float(raw)
+            if np.isfinite(v) and v > 0.0:
+                pos_scale_hint = float(v)
+                break
+        except Exception:
+            pass
+    if abs(float(pos_scale_hint) - 1.0) < 1e-8:
+        unit = str(metadata.get("position_unit", metadata.get("position_units", ""))).strip().lower()
+        if unit in {"cm", "centimeter", "centimeters"}:
+            pos_scale_hint = 0.01
+        elif unit in {"mm", "millimeter", "millimeters"}:
+            pos_scale_hint = 0.001
+        elif unit in {"m", "meter", "meters"}:
+            pos_scale_hint = 1.0
+
+    meta_info: dict[str, Any] = {
+        "quat_order": quat_order,
+        "position_scale_hint": float(pos_scale_hint),
+        "source": str(metadata.get("source", "")),
+    }
 
     def _append_pose(label: str, pose: Any, source: str) -> None:
         arr = _to_numpy(pose, dtype=np.float32).reshape(-1)
         if arr.size < 7:
             return
         pos = arr[:3].astype(np.float32, copy=False)
-        quat = _normalize_quat_wxyz(arr[3:7])
+        raw_quat = arr[3:7].astype(np.float32, copy=False)
+        if quat_order == "xyzw":
+            raw_quat = np.asarray(
+                [raw_quat[3], raw_quat[0], raw_quat[1], raw_quat[2]],
+                dtype=np.float32,
+            )
+        quat = _normalize_quat_wxyz(raw_quat)
         if not np.all(np.isfinite(pos)):
             return
         approach_z = abs(float((-_quat_to_rot_wxyz(quat)[:, 2])[2]))
-        label_l = str(label or "body").lower()
-        label_bonus = 2.0 if "handle" in label_l else 0.0
+        label_l = str(label or "body").strip().lower()
+        label_bonus = 0.0
+        if "handle" in label_l:
+            label_bonus = 2.0
+        elif "topdown" in label_l or "top_down" in label_l:
+            # Keep top-down candidates as explicit fallback below side/handle pinches.
+            label_bonus = -0.2
         score = label_bonus + max(0.0, 1.0 - approach_z)
         out.append(
             {
@@ -463,8 +690,9 @@ def _load_grasp_pose_candidates(annotation_path: Path) -> list[dict[str, Any]]:
     if isinstance(functional, dict):
         for label, poses in functional.items():
             if isinstance(poses, list):
+                src = f"functional_grasp.{str(label).strip().lower()}"
                 for p in poses:
-                    _append_pose(str(label), p, "functional_grasp")
+                    _append_pose(str(label), p, src)
 
     grasp = data.get("grasp", {})
     if isinstance(grasp, dict):
@@ -474,7 +702,208 @@ def _load_grasp_pose_candidates(annotation_path: Path) -> list[dict[str, Any]]:
                 _append_pose("body", p, "grasp.body")
 
     out.sort(key=lambda x: float(x.get("score", 0.0)), reverse=True)
-    return out
+    meta_info["num_loaded"] = int(len(out))
+    return out, meta_info
+
+
+def _infer_annotation_position_scale(
+    stage: Any,
+    object_prim_path: str,
+    candidates: Sequence[dict[str, Any]],
+    usd: Any,
+    usd_geom: Any,
+    preset_pos_scale: float = 1.0,
+) -> float:
+    """Infer local translation scale correction for annotation poses.
+
+    Some annotation files are authored in a different local scale than the prim.
+    We compare median candidate translation norm with local mesh radius and only
+    apply correction on clear mismatch.
+    """
+    if stage is None or not candidates:
+        return 1.0
+    try:
+        prim = stage.GetPrimAtPath(object_prim_path)
+        if prim is None or not prim.IsValid():
+            return 1.0
+
+        bbox_cache = usd_geom.BBoxCache(
+            usd.TimeCode.Default(),
+            [usd_geom.Tokens.default_],
+            useExtentsHint=True,
+        )
+        bbox = bbox_cache.ComputeLocalBound(prim)
+        rng = bbox.GetRange()
+        min_pt = np.asarray(rng.GetMin(), dtype=np.float32)
+        max_pt = np.asarray(rng.GetMax(), dtype=np.float32)
+        half = 0.5 * np.abs(max_pt - min_pt)
+        mesh_radius = float(np.max(half))
+        if not np.isfinite(mesh_radius) or mesh_radius < 1e-6:
+            return 1.0
+
+        norms: list[float] = []
+        preset = float(preset_pos_scale)
+        if not np.isfinite(preset) or preset <= 0.0:
+            preset = 1.0
+        for cand in candidates:
+            lp = _to_numpy(cand.get("local_pos"), dtype=np.float32).reshape(-1)
+            if lp.size < 3 or not np.all(np.isfinite(lp[:3])):
+                continue
+            norms.append(float(np.linalg.norm(lp[:3] * preset)))
+        if len(norms) < 3:
+            return 1.0
+
+        median_norm = float(np.median(np.asarray(norms, dtype=np.float32)))
+        if not np.isfinite(median_norm) or median_norm < 1e-6:
+            return 1.0
+
+        # Only correct large mismatches (MagicSim-style conservative threshold).
+        if median_norm > mesh_radius * 3.0 or median_norm < mesh_radius / 3.0:
+            scale = float(np.clip(mesh_radius / median_norm, 1e-4, 1e4))
+            return scale
+        return 1.0
+    except Exception as exc:
+        LOG.debug("collect: annotation scale inference failed for %s: %s", object_prim_path, exc)
+        return 1.0
+
+
+def _sanitize_annotation_candidates(
+    stage: Any,
+    object_prim_path: str,
+    candidates: Sequence[dict[str, Any]],
+    usd: Any,
+    usd_geom: Any,
+    local_pos_scale: float,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    report: dict[str, Any] = {
+        "total": int(len(candidates)),
+        "kept": 0,
+        "dropped_non_finite": 0,
+        "dropped_too_far": 0,
+        "dropped_outside_bbox": 0,
+        "rejected_file": False,
+    }
+    if not candidates:
+        return [], report
+    if stage is None:
+        kept = list(candidates)
+        report["kept"] = int(len(kept))
+        return kept, report
+    try:
+        prim = stage.GetPrimAtPath(object_prim_path)
+        if prim is None or not prim.IsValid():
+            kept = list(candidates)
+            report["kept"] = int(len(kept))
+            return kept, report
+
+        bbox_cache = usd_geom.BBoxCache(
+            usd.TimeCode.Default(),
+            [usd_geom.Tokens.default_],
+            useExtentsHint=True,
+        )
+        bbox = bbox_cache.ComputeLocalBound(prim)
+        rng = bbox.GetRange()
+        min_pt = np.asarray(rng.GetMin(), dtype=np.float32)
+        max_pt = np.asarray(rng.GetMax(), dtype=np.float32)
+        half = 0.5 * np.abs(max_pt - min_pt)
+        mesh_radius = float(np.max(half))
+        if not np.isfinite(mesh_radius) or mesh_radius < 1e-6:
+            kept = list(candidates)
+            report["kept"] = int(len(kept))
+            return kept, report
+
+        margin = max(0.002, mesh_radius * float(ANNOTATION_BBOX_MARGIN_FACTOR))
+        min_allowed = min_pt - margin
+        max_allowed = max_pt + margin
+        max_norm = mesh_radius * float(ANNOTATION_MAX_POS_RADIUS_FACTOR)
+        scale = float(local_pos_scale)
+        if not np.isfinite(scale) or scale <= 0.0:
+            scale = 1.0
+
+        kept: list[dict[str, Any]] = []
+        for cand in candidates:
+            lp = _to_numpy(cand.get("local_pos"), dtype=np.float32).reshape(-1)
+            lq = _to_numpy(cand.get("local_quat"), dtype=np.float32).reshape(-1)
+            if lp.size < 3 or lq.size < 4 or not np.all(np.isfinite(lp[:3])) or not np.all(np.isfinite(lq[:4])):
+                report["dropped_non_finite"] = int(report["dropped_non_finite"]) + 1
+                continue
+            pos = lp[:3] * scale
+            pos_norm = float(np.linalg.norm(pos))
+            if not np.isfinite(pos_norm):
+                report["dropped_non_finite"] = int(report["dropped_non_finite"]) + 1
+                continue
+            if pos_norm > max_norm:
+                report["dropped_too_far"] = int(report["dropped_too_far"]) + 1
+                continue
+            if np.any(pos < min_allowed) or np.any(pos > max_allowed):
+                report["dropped_outside_bbox"] = int(report["dropped_outside_bbox"]) + 1
+                continue
+            kept.append(cand)
+
+        report["kept"] = int(len(kept))
+        total = int(len(candidates))
+        keep_ratio = float(len(kept) / max(1, total))
+        report["keep_ratio"] = keep_ratio
+        report["mesh_radius"] = float(mesh_radius)
+        report["max_norm"] = float(max_norm)
+        if ANNOTATION_VALIDATE_STRICT and total >= 6 and keep_ratio < float(ANNOTATION_MIN_VALID_KEEP_RATIO):
+            report["rejected_file"] = True
+            return [], report
+        return kept, report
+    except Exception as exc:
+        LOG.warning("collect: annotation sanitize failed for %s: %s", object_prim_path, exc)
+        kept = list(candidates)
+        report["kept"] = int(len(kept))
+        report["sanitize_error"] = str(exc)
+        return kept, report
+
+
+def _annotation_failed_pose_cache_key(
+    object_prim_path: str,
+    annotation_path: Optional[Path],
+) -> str:
+    ann = str(annotation_path) if annotation_path is not None else ""
+    return f"{str(object_prim_path)}::{ann}"
+
+
+def _get_failed_annotation_pose_ids(cache_key: str) -> set[int]:
+    return set(_FAILED_ANNOTATION_POSE_CACHE.get(str(cache_key), set()))
+
+
+def _mark_failed_annotation_pose_id(cache_key: str, pose_id: int) -> None:
+    key = str(cache_key)
+    failed = _FAILED_ANNOTATION_POSE_CACHE.setdefault(key, set())
+    failed.add(int(pose_id))
+
+
+def _clear_failed_annotation_pose_ids(cache_key: str) -> None:
+    key = str(cache_key)
+    if key in _FAILED_ANNOTATION_POSE_CACHE:
+        del _FAILED_ANNOTATION_POSE_CACHE[key]
+
+
+def _record_failed_annotation_target(
+    cache_key: str,
+    target: Optional[dict[str, Any]],
+    reason: str,
+    attempt: int,
+) -> None:
+    if not target or target.get("source") != "annotation":
+        return
+    idx_raw = target.get("index", None)
+    try:
+        idx = int(idx_raw)
+    except Exception:
+        return
+    _mark_failed_annotation_pose_id(cache_key, idx)
+    failed_ids = sorted(list(_get_failed_annotation_pose_ids(cache_key)))
+    LOG.info(
+        "collect: mark failed annotation pose id=%d reason=%s attempt=%d failed_ids=%s",
+        idx,
+        str(reason),
+        int(attempt),
+        failed_ids,
+    )
 
 
 def _select_annotation_grasp_target(
@@ -484,28 +913,258 @@ def _select_annotation_grasp_target(
     usd_geom: Any,
     candidates: Sequence[dict[str, Any]],
     attempt_index: int,
+    ik_solver: Any | None = None,
+    table_x_range: Optional[tuple[float, float]] = None,
+    table_y_range: Optional[tuple[float, float]] = None,
+    table_top_z: Optional[float] = None,
+    failed_pose_ids: Optional[set[int]] = None,
+    tip_mid_offset_in_hand: np.ndarray | None = None,
+    annotation_pose_is_tip_mid_frame: bool = ANNOTATION_POSE_IS_TIP_MID_FRAME,
+    local_pos_scale: float = 1.0,
 ) -> Optional[dict[str, Any]]:
     if not candidates:
         return None
-    idx = int(max(0, attempt_index - 1)) % len(candidates)
-    cand = candidates[idx]
-    obj_pos, obj_quat = _get_prim_world_pose(stage, object_prim_path, usd, usd_geom)
-    target_pos, target_quat = _transform_local_pose_to_world(
-        object_pos=obj_pos,
-        object_quat=obj_quat,
-        local_pos=_to_numpy(cand.get("local_pos"), dtype=np.float32),
-        local_quat=_to_numpy(cand.get("local_quat"), dtype=np.float32),
+
+    def _build_target_from_candidate(index: int) -> dict[str, Any]:
+        cand = candidates[int(index)]
+        local_pos = _to_numpy(cand.get("local_pos"), dtype=np.float32)[:3].astype(np.float32)
+        if np.isfinite(float(local_pos_scale)) and abs(float(local_pos_scale) - 1.0) > 1e-6:
+            local_pos = (local_pos * float(local_pos_scale)).astype(np.float32, copy=False)
+        local_quat = _normalize_quat_wxyz(_to_numpy(cand.get("local_quat"), dtype=np.float32))
+        converted = False
+        if annotation_pose_is_tip_mid_frame and tip_mid_offset_in_hand is not None:
+            local_pos = _convert_tip_mid_local_pose_to_hand_local(
+                local_pos=local_pos,
+                local_quat=local_quat,
+                tip_mid_offset_in_hand=tip_mid_offset_in_hand,
+            )
+            converted = True
+        obj_pos, obj_quat = _get_prim_world_pose(stage, object_prim_path, usd, usd_geom)
+        target_pos, target_quat = _transform_local_pose_to_world(
+            object_pos=obj_pos,
+            object_quat=obj_quat,
+            local_pos=local_pos,
+            local_quat=local_quat,
+        )
+        return {
+            "target_pos": target_pos.astype(np.float32),
+            "target_quat": target_quat.astype(np.float32),
+            "local_pos": local_pos,
+            "local_quat": local_quat,
+            "label": str(cand.get("label", "body")),
+            "source": "annotation",
+            "source_id": GRASP_POSE_SOURCE_IDS["annotation"],
+            "index": int(index),
+            "annotation_tip_mid_to_hand_converted": bool(converted),
+            "ik_feasible": False,
+            "ik_orientation_relaxed": False,
+            "candidate_group": "body",
+        }
+
+    def _rotate(indices: list[int], shift_seed: int) -> list[int]:
+        if not indices:
+            return []
+        shift = int(max(0, shift_seed)) % len(indices)
+        if shift == 0:
+            return indices
+        return indices[shift:] + indices[:shift]
+
+    def _local_z_for_candidate(index: int) -> float | None:
+        arr = _to_numpy(candidates[int(index)].get("local_pos"), dtype=np.float32).reshape(-1)
+        if arr.size < 3 or not np.isfinite(arr[2]):
+            return None
+        return float(arr[2])
+
+    def _sort_indices(indices: list[int]) -> list[int]:
+        def _key(idx: int) -> tuple[float, float]:
+            cand = candidates[int(idx)]
+            score = float(cand.get("score", 0.0))
+            z = _local_z_for_candidate(int(idx))
+            return score, (-1e9 if z is None else z)
+
+        return sorted(indices, key=_key, reverse=True)
+
+    def _compute_low_z_exclusion(
+        indices: list[int],
+        percentile: float,
+    ) -> tuple[set[int], float | None]:
+        if not indices:
+            return set(), None
+        vals: list[tuple[int, float]] = []
+        for idx in indices:
+            z = _local_z_for_candidate(idx)
+            if z is None:
+                continue
+            vals.append((int(idx), float(z)))
+        min_candidates_for_filter = max(8, ANNOTATION_MIN_GROUP_KEEP + 3)
+        if len(vals) < min_candidates_for_filter:
+            return set(), None
+        z_values = np.array([z for _, z in vals], dtype=np.float32)
+        floor = float(np.percentile(z_values, float(percentile) * 100.0))
+        low = {idx for idx, z in vals if z < floor}
+        if len(indices) - len(low) < ANNOTATION_MIN_GROUP_KEEP:
+            keep_ids = {
+                idx for idx, _ in sorted(vals, key=lambda x: x[1], reverse=True)[:ANNOTATION_MIN_GROUP_KEEP]
+            }
+            low = {idx for idx, _ in vals if idx not in keep_ids}
+        return low, floor
+
+    failed_ids = {int(x) for x in (failed_pose_ids or set()) if int(x) >= 0}
+    handle_indices: list[int] = []
+    body_indices: list[int] = []
+    topdown_indices: list[int] = []
+    for i, cand in enumerate(candidates):
+        label = str(cand.get("label", "body")).lower()
+        src = str(cand.get("source", "")).lower()
+        if "handle" in label or src.endswith(".handle"):
+            handle_indices.append(i)
+        elif "topdown" in label or "top_down" in label or src.endswith(".topdown") or src.endswith(".topdown_side"):
+            topdown_indices.append(i)
+        else:
+            body_indices.append(i)
+
+    handle_indices = _sort_indices(handle_indices)
+    body_indices = _sort_indices(body_indices)
+    topdown_indices = _sort_indices(topdown_indices)
+    all_indices = handle_indices + body_indices + topdown_indices
+    global_low_z_ids, global_low_z_floor = _compute_low_z_exclusion(
+        all_indices,
+        ANNOTATION_MIN_LOCAL_Z_PERCENTILE,
     )
-    return {
-        "target_pos": target_pos.astype(np.float32),
-        "target_quat": target_quat.astype(np.float32),
-        "local_pos": _to_numpy(cand.get("local_pos"), dtype=np.float32)[:3].astype(np.float32),
-        "local_quat": _normalize_quat_wxyz(_to_numpy(cand.get("local_quat"), dtype=np.float32)),
-        "label": str(cand.get("label", "body")),
-        "source": "annotation",
-        "source_id": GRASP_POSE_SOURCE_IDS["annotation"],
-        "index": int(idx),
-    }
+    body_low_z_ids, body_low_z_floor = _compute_low_z_exclusion(
+        body_indices,
+        ANNOTATION_BODY_MIN_LOCAL_Z_PERCENTILE,
+    )
+
+    ordered_groups: list[tuple[str, list[int]]] = [
+        ("functional_handle", _rotate(handle_indices, attempt_index - 1)),
+        ("body", _rotate(body_indices, attempt_index - 1)),
+        ("topdown", _rotate(topdown_indices, attempt_index - 1)),
+    ]
+
+    filtered_groups: list[tuple[str, list[int]]] = []
+    low_z_removed_summary: dict[str, int] = {}
+    for group_name, indices in ordered_groups:
+        if not indices:
+            continue
+        kept = indices
+        if failed_ids and len(indices) > 1:
+            survived = [idx for idx in indices if idx not in failed_ids]
+            if survived:
+                kept = survived
+        low_z_ids = body_low_z_ids if group_name == "body" else global_low_z_ids
+        if low_z_ids and len(kept) > ANNOTATION_MIN_GROUP_KEEP:
+            survived = [idx for idx in kept if idx not in low_z_ids]
+            if len(survived) >= ANNOTATION_MIN_GROUP_KEEP:
+                removed = len(kept) - len(survived)
+                if removed > 0:
+                    low_z_removed_summary[group_name] = removed
+                kept = survived
+        filtered_groups.append((group_name, kept))
+
+    if low_z_removed_summary:
+        LOG.info(
+            "collect: annotation low-z pruning removed=%s floors(global=%.4f, body=%.4f)",
+            low_z_removed_summary,
+            float(global_low_z_floor if global_low_z_floor is not None else float("nan")),
+            float(body_low_z_floor if body_low_z_floor is not None else float("nan")),
+        )
+
+    if not filtered_groups:
+        # Fallback when all candidates have failed before: allow retry from raw list.
+        LOG.warning(
+            "collect: annotation selector all candidates filtered by failed_ids=%s and low-z pruning; retrying raw ordered list",
+            sorted(list(failed_ids)),
+        )
+        filtered_groups = ordered_groups
+
+    workspace_margin = 0.04
+
+    def _target_in_workspace(target: dict[str, Any]) -> bool:
+        pos = _to_numpy(target.get("target_pos"), dtype=np.float32).reshape(-1)
+        if pos.size < 3 or not np.all(np.isfinite(pos[:3])):
+            return False
+        x, y, z = float(pos[0]), float(pos[1]), float(pos[2])
+        if (
+            table_x_range is not None
+            and not (float(table_x_range[0]) - workspace_margin <= x <= float(table_x_range[1]) + workspace_margin)
+        ):
+            return False
+        if (
+            table_y_range is not None
+            and not (float(table_y_range[0]) - workspace_margin <= y <= float(table_y_range[1]) + workspace_margin)
+        ):
+            return False
+        if table_top_z is not None and np.isfinite(float(table_top_z)):
+            if z < float(table_top_z) - 0.03:
+                return False
+        return True
+
+    first_fallback: Optional[dict[str, Any]] = None
+    max_scan = int(ANNOTATION_IK_SCREEN_MAX_CANDIDATES)
+    scanned_count = 0
+    workspace_ok_count = 0
+
+    for group_name, indices in filtered_groups:
+        if not indices:
+            continue
+
+        strict_pass_targets: list[dict[str, Any]] = []
+        for idx in indices[:max_scan]:
+            scanned_count += 1
+            target = _build_target_from_candidate(idx)
+            target["candidate_group"] = group_name
+            if first_fallback is None:
+                first_fallback = target
+            if not _target_in_workspace(target):
+                continue
+            workspace_ok_count += 1
+            strict_pass_targets.append(target)
+
+        if not strict_pass_targets:
+            continue
+
+        if ik_solver is None:
+            return strict_pass_targets[0]
+
+        # Pass 1: strict orientation (MagicSim-like annotation orientation fidelity).
+        for target in strict_pass_targets:
+            q = _solve_ik_arm_target(
+                ik_solver=ik_solver,
+                target_position=_to_numpy(target.get("target_pos"), dtype=np.float32),
+                target_orientation=_to_numpy(target.get("target_quat"), dtype=np.float32),
+            )
+            if q is None:
+                continue
+            target["ik_feasible"] = True
+            target["ik_orientation_relaxed"] = False
+            target["ik_joint_positions"] = q.astype(np.float32, copy=False)
+            return target
+
+        # Pass 2: relax orientation only if strict pass had no solution.
+        for target in strict_pass_targets:
+            q = _solve_ik_arm_target(
+                ik_solver=ik_solver,
+                target_position=_to_numpy(target.get("target_pos"), dtype=np.float32),
+                target_orientation=None,
+            )
+            if q is None:
+                continue
+            target["ik_feasible"] = True
+            target["ik_orientation_relaxed"] = True
+            target["ik_joint_positions"] = q.astype(np.float32, copy=False)
+            return target
+
+    if first_fallback is not None:
+        LOG.warning(
+            "collect: annotation selector fallback target idx=%s group=%s (scanned=%d, workspace_ok=%d, failed_ids=%s)",
+            str(first_fallback.get("index", "na")),
+            str(first_fallback.get("candidate_group", "body")),
+            scanned_count,
+            workspace_ok_count,
+            sorted(list(failed_ids)),
+        )
+    return first_fallback
 
 
 def _build_frame_extras(
@@ -666,7 +1325,11 @@ def _solve_ik_arm_target(
         joints = _to_numpy(getattr(action, "joint_positions", None))
         if joints.size < 7:
             return None
-        return joints[:7].astype(np.float32, copy=False)
+        return np.clip(
+            joints[:7].astype(np.float32, copy=False),
+            FRANKA_ARM_LOWER,
+            FRANKA_ARM_UPPER,
+        )
     except Exception as exc:
         LOG.warning("IK solve failed for target %s: %s", np.asarray(target_position).tolist(), exc)
         return None
@@ -1022,9 +1685,12 @@ def _resolve_target_object_prim(
     stage: Any,
     usd_geom: Any,
     target_hints: Optional[Sequence[str]] = None,
+    table_x_range: Optional[tuple[float, float]] = None,
+    table_y_range: Optional[tuple[float, float]] = None,
+    table_top_z: Optional[float] = None,
 ) -> Optional[str]:
     roots = _iter_world_root_prims(stage)
-    candidates: list[Any] = []
+    candidates: list[tuple[Any, np.ndarray, np.ndarray]] = []
     for root in roots:
         if not _root_is_graspable_candidate(root, usd_geom):
             continue
@@ -1038,31 +1704,95 @@ def _resolve_target_object_prim(
         # Prefer handheld tabletop items, not large furniture.
         if max_dim > 0.45 or min_dim < 0.01:
             continue
-        candidates.append(root)
+        candidates.append((root, mn, mx))
     if not candidates:
         return None
 
+    def _score_candidate(prim: Any, mn: np.ndarray, mx: np.ndarray) -> float:
+        path = prim.GetPath().pathString
+        name = prim.GetName().lower()
+        center = 0.5 * (mn + mx)
+        size = mx - mn
+        max_dim = float(np.max(size))
+        min_dim = float(np.min(size))
+        score = 0.0
+
+        # Strongly prefer the explicitly requested object family when hints exist.
+        if target_hints and _prim_matches_target_hint_deep(prim, target_hints):
+            score += 8.0
+
+        # Prefer common tabletop manipulands when no explicit hint is supplied.
+        preferred_tokens = [
+            "mug",
+            "mustard",
+            "sugar",
+            "cracker",
+            "tomato",
+            "pickobject",
+            "object",
+        ]
+        for rank, token in enumerate(preferred_tokens):
+            if token in name:
+                score += max(0.5, 4.0 - 0.35 * float(rank))
+                break
+
+        if (
+            table_x_range is not None
+            and table_y_range is not None
+            and np.all(np.isfinite(center[:2]))
+        ):
+            margin = 0.05
+            in_xy = (
+                (float(table_x_range[0]) - margin)
+                <= float(center[0])
+                <= (float(table_x_range[1]) + margin)
+                and (float(table_y_range[0]) - margin)
+                <= float(center[1])
+                <= (float(table_y_range[1]) + margin)
+            )
+            score += 3.0 if in_xy else -2.0
+
+        if table_top_z is not None and np.isfinite(float(table_top_z)):
+            bottom_z = float(mn[2])
+            top_z = float(mx[2])
+            z_gap = abs(bottom_z - float(table_top_z))
+            if z_gap <= 0.08:
+                score += 4.0
+            elif z_gap <= 0.20:
+                score += 2.0
+            else:
+                score -= min(8.0, (z_gap - 0.20) * 20.0)
+            if top_z < float(table_top_z) - 0.02:
+                score -= 8.0
+
+        # Bias toward realistic handheld dimensions.
+        score -= abs(max_dim - 0.09) * 3.0
+        if min_dim < 0.012:
+            score -= 1.5
+
+        # Prefer assets that already have grasp annotations.
+        ann_path = _resolve_grasp_annotation_path(stage=stage, object_prim_path=path)
+        if ann_path is not None:
+            score += 1.5
+        return score
+
+    filtered = candidates
     if target_hints:
-        for prim in candidates:
+        hinted: list[tuple[Any, np.ndarray, np.ndarray]] = []
+        for prim, mn, mx in candidates:
             if _prim_matches_target_hint_deep(prim, target_hints):
-                return prim.GetPath().pathString
+                hinted.append((prim, mn, mx))
+        if hinted:
+            filtered = hinted
 
-    # Prefer common tabletop manipulands.
-    preferred_tokens = [
-        "mug",
-        "mustard",
-        "sugar",
-        "cracker",
-        "tomato",
-        "pickobject",
-        "object",
-    ]
-    for token in preferred_tokens:
-        for prim in candidates:
-            if token in prim.GetName().lower():
-                return prim.GetPath().pathString
-
-    return candidates[0].GetPath().pathString
+    best_path: Optional[str] = None
+    best_score = -1e9
+    for prim, mn, mx in filtered:
+        score = _score_candidate(prim, mn, mx)
+        if score > best_score:
+            best_score = score
+            best_path = prim.GetPath().pathString
+    return best_path
 
 
 def _compute_prim_bbox(stage: Any, prim_path: str, usd_geom: Any) -> Optional[tuple[np.ndarray, np.ndarray]]:
@@ -1079,6 +1809,29 @@ def _compute_prim_bbox(stage: Any, prim_path: str, usd_geom: Any) -> Optional[tu
         return mn, mx
     except Exception:
         return None
+
+
+def _bbox_center_if_reasonable(
+    mn: np.ndarray,
+    mx: np.ndarray,
+    root_pos: np.ndarray,
+) -> Optional[np.ndarray]:
+    if not (np.all(np.isfinite(mn)) and np.all(np.isfinite(mx))):
+        return None
+    ext = (mx - mn).astype(np.float32, copy=False)
+    if np.any(ext <= 1e-5):
+        return None
+    if float(np.max(ext)) > float(TRACKING_BBOX_MAX_EXTENT_M):
+        return None
+    center = (0.5 * (mn + mx)).astype(np.float32, copy=False)
+    if not np.all(np.isfinite(center)):
+        return None
+    root = _to_numpy(root_pos, dtype=np.float32).reshape(-1)
+    if root.size < 3 or not np.all(np.isfinite(root[:3])):
+        return center
+    if float(np.linalg.norm(center[:3] - root[:3])) > float(TRACKING_BBOX_MAX_ROOT_DELTA_M):
+        return None
+    return center
 
 
 def _infer_table_workspace(
@@ -1216,9 +1969,9 @@ def _get_object_tracking_pose(
     bbox = _compute_prim_bbox(stage, object_prim_path, usd_geom)
     if bbox:
         mn, mx = bbox
-        center = 0.5 * (mn + mx)
-        if np.all(np.isfinite(center)):
-            pos = center.astype(np.float32)
+        center = _bbox_center_if_reasonable(mn=mn, mx=mx, root_pos=pos)
+        if center is not None:
+            pos = center
     return pos, quat
 
 
@@ -1237,6 +1990,67 @@ def _set_prim_world_position(stage: Any, prim_path: str, position: np.ndarray, u
     tx.Set(gf.Vec3d(float(position[0]), float(position[1]), float(position[2])))
 
 
+def _set_prim_upright_yaw_deg(stage: Any, prim_path: str, yaw_deg: float, usd_geom: Any, gf: Any) -> None:
+    prim = stage.GetPrimAtPath(prim_path)
+    if not prim or not prim.IsValid():
+        raise RuntimeError(f"Target prim not found: {prim_path}")
+    xf = usd_geom.Xformable(prim)
+    rotate_xyz = None
+    rotate_z = None
+    for op in xf.GetOrderedXformOps():
+        name = op.GetOpName()
+        if name == "xformOp:rotateXYZ":
+            rotate_xyz = op
+        elif name == "xformOp:rotateZ":
+            rotate_z = op
+        elif name in {"xformOp:rotateX", "xformOp:rotateY"}:
+            try:
+                op.Set(0.0)
+            except Exception:
+                pass
+
+    if rotate_xyz is not None:
+        rotate_xyz.Set(gf.Vec3f(0.0, 0.0, float(yaw_deg)))
+        return
+    if rotate_z is None:
+        rotate_z = xf.AddRotateZOp()
+    rotate_z.Set(float(yaw_deg))
+
+
+def _align_robot_base_for_collect(
+    stage: Any,
+    robot_prim_path: str,
+    usd_geom: Any,
+    gf: Any,
+    table_x_range: tuple[float, float],
+    table_y_range: tuple[float, float],
+    table_top_z: float,
+    work_center: tuple[float, float],
+) -> tuple[float, float, float, float]:
+    """Move robot base to a stable tabletop edge pose and face table center."""
+    span_x = float(table_x_range[1] - table_x_range[0])
+    margin_x = min(0.10, max(0.04, span_x * 0.10))
+    target_x = float(np.clip(work_center[0] + span_x * 0.42, table_x_range[0] + margin_x, table_x_range[1] - margin_x))
+    target_y = float(np.clip(work_center[1], table_y_range[0] + 0.05, table_y_range[1] - 0.05))
+    target_z = float(table_top_z)
+    _set_prim_world_position(
+        stage=stage,
+        prim_path=robot_prim_path,
+        position=np.array([target_x, target_y, target_z], dtype=np.float32),
+        usd_geom=usd_geom,
+        gf=gf,
+    )
+    yaw = float(math.degrees(math.atan2(float(work_center[1]) - target_y, float(work_center[0]) - target_x)))
+    _set_prim_upright_yaw_deg(
+        stage=stage,
+        prim_path=robot_prim_path,
+        yaw_deg=yaw,
+        usd_geom=usd_geom,
+        gf=gf,
+    )
+    return target_x, target_y, target_z, yaw
+
+
 def _estimate_object_height(stage: Any, object_prim_path: str, usd_geom: Any, fallback: float = OBJECT_SIZE) -> float:
     bbox = _compute_prim_bbox(stage, object_prim_path, usd_geom)
     if not bbox:
@@ -1245,6 +2059,8 @@ def _estimate_object_height(stage: Any, object_prim_path: str, usd_geom: Any, fa
     h = float(mx[2] - mn[2])
     if not np.isfinite(h) or h <= 0.0:
         return fallback
+    if h > float(TRACKING_OBJECT_HEIGHT_MAX_M):
+        return float(max(0.01, fallback))
     return max(h, 0.01)
 
 
@@ -1254,19 +2070,79 @@ def _query_object_pick_xy(
     usd: Any,
     usd_geom: Any,
 ) -> tuple[float, float, str]:
-    """Pick target XY from live object geometry (bbox center), fallback to root pose."""
+    """Pick target XY from live object pose, with bbox center only when reasonable."""
+    obj_pos, _ = _get_prim_world_pose(stage, object_prim_path, usd, usd_geom)
     bbox = _compute_prim_bbox(stage, object_prim_path, usd_geom)
     if bbox:
         mn, mx = bbox
-        cx = float((mn[0] + mx[0]) * 0.5)
-        cy = float((mn[1] + mx[1]) * 0.5)
-        if np.isfinite(cx) and np.isfinite(cy):
-            return cx, cy, "bbox_center"
+        center = _bbox_center_if_reasonable(mn=mn, mx=mx, root_pos=obj_pos)
+        if center is not None and center.size >= 3:
+            cx = float(center[0])
+            cy = float(center[1])
+            if np.isfinite(cx) and np.isfinite(cy):
+                return cx, cy, "bbox_center"
 
-    obj_pos, _ = _get_prim_world_pose(stage, object_prim_path, usd, usd_geom)
     rx = float(obj_pos[0]) if obj_pos.size >= 1 and np.isfinite(obj_pos[0]) else 0.0
     ry = float(obj_pos[1]) if obj_pos.size >= 2 and np.isfinite(obj_pos[1]) else 0.0
     return rx, ry, "root_pose"
+
+
+def _ensure_object_within_workspace(
+    stage: Any,
+    object_prim_path: str,
+    usd: Any,
+    usd_geom: Any,
+    gf: Any,
+    table_x_range: tuple[float, float],
+    table_y_range: tuple[float, float],
+    table_top_z: float,
+    work_center: tuple[float, float],
+) -> Optional[dict[str, float]]:
+    """If object is clearly out-of-bounds, recenter it on the tabletop."""
+    raw_x, raw_y, _ = _query_object_pick_xy(stage, object_prim_path, usd, usd_geom)
+    bbox = _compute_prim_bbox(stage, object_prim_path, usd_geom)
+    raw_bottom_z = float(bbox[0][2]) if bbox else float("nan")
+    raw_top_z = float(bbox[1][2]) if bbox else float("nan")
+    margin = 0.15
+    in_xy = (
+        np.isfinite(raw_x)
+        and np.isfinite(raw_y)
+        and (table_x_range[0] - margin) <= raw_x <= (table_x_range[1] + margin)
+        and (table_y_range[0] - margin) <= raw_y <= (table_y_range[1] + margin)
+    )
+    # Z guard: objects can fall below/inside table while keeping XY inside table footprint.
+    # When that happens collect appears as "arm flailing with no mug in view".
+    z_ok = (
+        np.isfinite(raw_bottom_z)
+        and np.isfinite(raw_top_z)
+        and (raw_bottom_z >= float(table_top_z) - 0.02)
+        and (raw_bottom_z <= float(table_top_z) + 0.30)
+    )
+    if in_xy and z_ok:
+        return None
+
+    obj_height = _estimate_object_height(stage, object_prim_path, usd_geom, fallback=OBJECT_SIZE)
+    target_x = float(work_center[0])
+    target_y = float(work_center[1])
+    target_z = float(table_top_z) + max(float(obj_height) * 0.5, 0.02) + 0.003
+    _set_prim_world_position(
+        stage=stage,
+        prim_path=object_prim_path,
+        position=np.array([target_x, target_y, target_z], dtype=np.float32),
+        usd_geom=usd_geom,
+        gf=gf,
+    )
+    return {
+        "raw_x": float(raw_x),
+        "raw_y": float(raw_y),
+        "raw_bottom_z": float(raw_bottom_z) if np.isfinite(raw_bottom_z) else float("nan"),
+        "raw_top_z": float(raw_top_z) if np.isfinite(raw_top_z) else float("nan"),
+        "target_x": target_x,
+        "target_y": target_y,
+        "target_z": target_z,
+        "reason_xy": 0.0 if in_xy else 1.0,
+        "reason_z": 0.0 if z_ok else 1.0,
+    }
 
 
 def _resolve_eef_prim(stage: Any, robot_prim_path: str, get_prim_at_path: Any) -> str | None:
@@ -1335,6 +2211,39 @@ def _resolve_finger_prim_paths(
         if left and right:
             break
     return left, right
+
+
+def _compute_tip_mid_offset_in_hand(
+    stage: Any,
+    eef_prim_path: str,
+    finger_left_prim_path: str | None,
+    finger_right_prim_path: str | None,
+    get_prim_at_path: Any,
+    usd: Any,
+    usd_geom: Any,
+) -> np.ndarray | None:
+    """Measure fingertip-midpoint offset expressed in the current hand frame."""
+    if not eef_prim_path or not finger_left_prim_path or not finger_right_prim_path:
+        return None
+    hand_pos, hand_quat = _get_eef_pose(stage, eef_prim_path, get_prim_at_path, usd, usd_geom)
+    left_pos, _ = _get_prim_world_pose(stage, finger_left_prim_path, usd, usd_geom)
+    right_pos, _ = _get_prim_world_pose(stage, finger_right_prim_path, usd, usd_geom)
+    if not (
+        np.all(np.isfinite(hand_pos[:3]))
+        and np.all(np.isfinite(hand_quat[:4]))
+        and np.all(np.isfinite(left_pos[:3]))
+        and np.all(np.isfinite(right_pos[:3]))
+    ):
+        return None
+    tip_mid = 0.5 * (left_pos[:3] + right_pos[:3])
+    offset_world = (tip_mid - hand_pos[:3]).astype(np.float32)
+    rot_hand = _quat_to_rot_wxyz(hand_quat)
+    offset_hand = rot_hand.T @ offset_world
+    if not np.all(np.isfinite(offset_hand)):
+        return None
+    if float(np.linalg.norm(offset_hand)) < 1e-6:
+        return None
+    return offset_hand.astype(np.float32)
 
 
 def _get_eef_pose(
@@ -1422,14 +2331,22 @@ def _step_toward_joint_targets(
     max_gripper_step: float = MAX_GRIPPER_STEP,
 ) -> tuple[np.ndarray, float]:
     """Rate-limit joint command updates to avoid teleport-like oscillation."""
+    def _shortest_angular_delta(target: np.ndarray, current: np.ndarray) -> np.ndarray:
+        # Keep revolute motion on shortest path to avoid large wraps / knotting.
+        return ((target - current + np.pi) % (2.0 * np.pi)) - np.pi
+
     current = _to_numpy(franka.get_joint_positions())
     if current.size < 7:
-        return arm_target.astype(np.float32), float(gripper_target)
+        return (
+            np.clip(arm_target.astype(np.float32), FRANKA_ARM_LOWER, FRANKA_ARM_UPPER),
+            float(gripper_target),
+        )
 
     arm_current = current[:7].astype(np.float32, copy=False)
-    arm_delta = arm_target[:7] - arm_current
+    target = np.clip(arm_target[:7].astype(np.float32, copy=False), FRANKA_ARM_LOWER, FRANKA_ARM_UPPER)
+    arm_delta = _shortest_angular_delta(target, arm_current)
     arm_delta = np.clip(arm_delta, -float(max_arm_step), float(max_arm_step))
-    arm_cmd = (arm_current + arm_delta).astype(np.float32)
+    arm_cmd = np.clip(arm_current + arm_delta, FRANKA_ARM_LOWER, FRANKA_ARM_UPPER).astype(np.float32)
 
     if current.size >= 9:
         gr_cur = float(0.5 * (current[7] + current[8]))
@@ -1543,6 +2460,7 @@ def _make_pick_place_waypoints_ik(
     pick_approach_z: float,
     place_grasp_z: float,
     place_approach_z: float,
+    table_top_z: float,
     rng: np.random.Generator,
     target_orientation: np.ndarray | None = None,
     home_arm: np.ndarray | None = None,
@@ -1550,15 +2468,36 @@ def _make_pick_place_waypoints_ik(
     if ik_solver is None:
         return None
 
+    def _shortest_angular_delta(target: np.ndarray, current: np.ndarray) -> np.ndarray:
+        return ((target - current + np.pi) % (2.0 * np.pi)) - np.pi
+
+    pick_grasp_xyz = np.array([pick_pos[0], pick_pos[1], float(pick_grasp_z)], dtype=np.float32)
+    pick_pregrasp_xyz = np.array([pick_pos[0], pick_pos[1], float(pick_approach_z)], dtype=np.float32)
+    if target_orientation is not None:
+        try:
+            q = _normalize_quat_wxyz(target_orientation)
+            rot = _quat_to_rot_wxyz(q)
+            grasp_dir = rot[:, 2].astype(np.float32, copy=False)
+            norm = float(np.linalg.norm(grasp_dir))
+            if np.isfinite(norm) and norm > 1e-6:
+                grasp_dir = grasp_dir / norm
+                pick_pregrasp_xyz = pick_grasp_xyz - float(IK_PRE_GRASP_OFFSET) * grasp_dir
+                min_z = float(table_top_z) + float(IK_PRE_GRASP_MIN_ABOVE_TABLE)
+                pick_pregrasp_xyz[2] = float(max(float(pick_pregrasp_xyz[2]), min_z))
+        except Exception:
+            pass
+
     pose_targets = {
         "APPROACH_PICK": np.array([pick_pos[0], pick_pos[1], float(pick_approach_z)], dtype=np.float32),
+        "PRE_GRASP": pick_pregrasp_xyz.astype(np.float32, copy=False),
         "DOWN_PICK": np.array([pick_pos[0], pick_pos[1], float(pick_grasp_z)], dtype=np.float32),
         "MOVE_TO_PLACE": np.array([place_pos[0], place_pos[1], float(place_approach_z)], dtype=np.float32),
         "DOWN_PLACE": np.array([place_pos[0], place_pos[1], float(place_grasp_z)], dtype=np.float32),
     }
 
     solved: dict[str, np.ndarray] = {}
-    for name in ("APPROACH_PICK", "DOWN_PICK", "MOVE_TO_PLACE", "DOWN_PLACE"):
+    prev_q: np.ndarray | None = None
+    for name in ("APPROACH_PICK", "PRE_GRASP", "DOWN_PICK", "MOVE_TO_PLACE", "DOWN_PLACE"):
         q = _solve_ik_arm_target(ik_solver, pose_targets[name], target_orientation=target_orientation)
         if q is None and target_orientation is not None:
             # Orientation constraints improve top-down behavior but can fail near singularities.
@@ -1568,14 +2507,27 @@ def _make_pick_place_waypoints_ik(
         if q is None:
             LOG.warning("IK waypoint '%s' failed, falling back to joint-offset planner", name)
             return None
+        if prev_q is not None:
+            jump = _shortest_angular_delta(q, prev_q)
+            max_jump = float(np.max(np.abs(jump)))
+            if max_jump > MAX_IK_WAYPOINT_JUMP_RAD:
+                LOG.warning(
+                    "IK waypoint '%s' jump %.3f rad too large; clamping for continuity",
+                    name,
+                    max_jump,
+                )
+                q = prev_q + np.clip(jump, -MAX_IK_WAYPOINT_JUMP_RAD, MAX_IK_WAYPOINT_JUMP_RAD)
+                q = np.clip(q, FRANKA_ARM_LOWER, FRANKA_ARM_UPPER).astype(np.float32, copy=False)
         noise = rng.uniform(-0.01, 0.01, size=q.shape).astype(np.float32)
-        solved[name] = (q + noise).astype(np.float32)
+        solved[name] = np.clip(q + noise, FRANKA_ARM_LOWER, FRANKA_ARM_UPPER).astype(np.float32)
+        prev_q = solved[name]
 
     home = _pad_or_trim(_to_numpy(home_arm), 7) if home_arm is not None else HOME.copy()
 
     return [
         ("HOME", home.copy(), GRIPPER_OPEN),
         ("APPROACH_PICK", solved["APPROACH_PICK"], GRIPPER_OPEN),
+        ("PRE_GRASP", solved["PRE_GRASP"], GRIPPER_OPEN),
         ("DOWN_PICK", solved["DOWN_PICK"], GRIPPER_OPEN),
         ("CLOSE", solved["DOWN_PICK"], GRIPPER_CLOSED),
         ("LIFT", solved["APPROACH_PICK"], GRIPPER_CLOSED),
@@ -1833,17 +2785,108 @@ def _run_pick_place_episode(
 
     annotation_path = _resolve_grasp_annotation_path(stage=stage, object_prim_path=object_prim_path)
     annotation_candidates: list[dict[str, Any]] = []
+    annotation_meta: dict[str, Any] = {}
+    annotation_local_pos_scale = 1.0
     if annotation_path is not None:
-        annotation_candidates = _load_grasp_pose_candidates(annotation_path)
+        annotation_candidates, annotation_meta = _load_grasp_pose_candidates(annotation_path)
         if annotation_candidates:
-            LOG.info(
-                "collect: loaded %d grasp annotations for %s from %s",
-                len(annotation_candidates),
-                object_prim_path,
-                annotation_path,
+            hint_scale = float(annotation_meta.get("position_scale_hint", 1.0))
+            infer_scale = _infer_annotation_position_scale(
+                stage=stage,
+                object_prim_path=object_prim_path,
+                candidates=annotation_candidates,
+                usd=usd,
+                usd_geom=usd_geom,
+                preset_pos_scale=hint_scale,
             )
+            annotation_local_pos_scale = float(hint_scale * infer_scale)
+            annotation_candidates, sanitize_report = _sanitize_annotation_candidates(
+                stage=stage,
+                object_prim_path=object_prim_path,
+                candidates=annotation_candidates,
+                usd=usd,
+                usd_geom=usd_geom,
+                local_pos_scale=annotation_local_pos_scale,
+            )
+            if sanitize_report.get("rejected_file", False):
+                LOG.warning(
+                    "collect: reject grasp annotation %s for %s by strict validation report=%s",
+                    annotation_path,
+                    object_prim_path,
+                    sanitize_report,
+                )
+            elif int(sanitize_report.get("kept", 0)) != int(sanitize_report.get("total", 0)):
+                LOG.info(
+                    "collect: sanitize grasp annotation %s for %s report=%s",
+                    annotation_path,
+                    object_prim_path,
+                    sanitize_report,
+                )
+            if annotation_candidates:
+                LOG.info(
+                    "collect: loaded %d grasp annotations for %s from %s "
+                    "(quat_order=%s, hint_scale=%.5f, infer_scale=%.5f, local_pos_scale=%.5f)",
+                    len(annotation_candidates),
+                    object_prim_path,
+                    annotation_path,
+                    str(annotation_meta.get("quat_order", "wxyz")),
+                    float(hint_scale),
+                    float(infer_scale),
+                    float(annotation_local_pos_scale),
+                )
+            else:
+                LOG.warning(
+                    "collect: grasp annotation disabled after validation: %s for %s",
+                    annotation_path,
+                    object_prim_path,
+                )
         else:
             LOG.warning("collect: grasp annotation file had no usable poses: %s", annotation_path)
+    if annotation_path is not None and annotation_meta:
+        if str(annotation_meta.get("quat_order", "wxyz")) == "xyzw":
+            LOG.warning(
+                "collect: converted annotation quat order xyzw->wxyz for %s",
+                annotation_path,
+            )
+    annotation_failed_pose_cache_key = _annotation_failed_pose_cache_key(
+        object_prim_path=object_prim_path,
+        annotation_path=annotation_path,
+    )
+    existing_failed_ids = sorted(list(_get_failed_annotation_pose_ids(annotation_failed_pose_cache_key)))
+    if existing_failed_ids:
+        LOG.info(
+            "collect: carry failed annotation pose cache for %s -> %s",
+            object_prim_path,
+            existing_failed_ids,
+        )
+    no_annotation_available = len(annotation_candidates) == 0
+    force_topdown_grasp = _read_bool_env("COLLECT_FORCE_TOPDOWN_GRASP", False)
+    if force_topdown_grasp:
+        LOG.warning(
+            "collect: COLLECT_FORCE_TOPDOWN_GRASP enabled; bypassing annotation orientation and using top-down grasp"
+        )
+    annotation_tip_mid_offset_hand = _compute_tip_mid_offset_in_hand(
+        stage=stage,
+        eef_prim_path=eef_prim_path,
+        finger_left_prim_path=finger_left_prim_path,
+        finger_right_prim_path=finger_right_prim_path,
+        get_prim_at_path=get_prim_at_path,
+        usd=usd,
+        usd_geom=usd_geom,
+    )
+    if ANNOTATION_POSE_IS_TIP_MID_FRAME:
+        if annotation_tip_mid_offset_hand is not None:
+            LOG.info(
+                "collect: annotation tip-mid->hand enabled, offset_hand=(%.4f, %.4f, %.4f), norm=%.4f",
+                float(annotation_tip_mid_offset_hand[0]),
+                float(annotation_tip_mid_offset_hand[1]),
+                float(annotation_tip_mid_offset_hand[2]),
+                float(np.linalg.norm(annotation_tip_mid_offset_hand)),
+            )
+        else:
+            LOG.warning(
+                "collect: annotation tip-mid->hand enabled but finger offset unavailable; using raw annotation poses"
+            )
 
     def _timeout_triggered() -> bool:
         nonlocal stopped
@@ -1909,6 +2952,12 @@ def _run_pick_place_episode(
         for start_wp, end_wp in transitions:
             _, start_arm, start_gripper = start_wp
             end_name, end_arm, end_gripper = end_wp
+            early_reach_halt = False
+            resolved_end_arm = (
+                _resolve_live_arm_target(end_name, end_arm)
+                if live_target_z_by_waypoint and end_name in live_target_z_by_waypoint
+                else end_arm
+            )
 
             for step in range(steps_per_segment):
                 if _timeout_triggered():
@@ -1918,12 +2967,8 @@ def _run_pick_place_episode(
                     return
 
                 alpha = float(step + 1) / float(steps_per_segment)
-                live_end_arm = _resolve_live_arm_target(end_name, end_arm)
-                if live_target_z_by_waypoint and end_name in live_target_z_by_waypoint:
-                    # In live-tracking mode, command directly toward refreshed IK target.
-                    arm_target = live_end_arm.astype(np.float32, copy=False)
-                else:
-                    arm_target = ((1.0 - alpha) * start_arm + alpha * live_end_arm).astype(np.float32)
+                # Lock to a single planned pose for this transition (no per-frame mesh chasing).
+                arm_target = ((1.0 - alpha) * start_arm + alpha * resolved_end_arm).astype(np.float32)
                 gripper_target = float((1.0 - alpha) * start_gripper + alpha * end_gripper)
 
                 arm_cmd, gr_cmd = _step_toward_joint_targets(franka, arm_target, gripper_target)
@@ -1931,8 +2976,39 @@ def _run_pick_place_episode(
                 world.step(render=True)
                 _record_frame(arm_target=arm_target, gripper_target=gripper_target)
 
+                # Borrowed from MagicSim grasp phase behavior:
+                # if reach gate is already satisfied while descending, halt early and close.
+                if end_name in {"DOWN_PICK", "CLOSE"} and step >= 4:
+                    reach_metrics = _compute_grasp_metrics(
+                        franka=franka,
+                        stage=stage,
+                        eef_prim_path=eef_prim_path,
+                        get_prim_at_path=get_prim_at_path,
+                        usd=usd,
+                        usd_geom=usd_geom,
+                        object_prim_path=object_prim_path,
+                        table_top_z=table_top_z,
+                        object_height=max(float(object_height), 0.01),
+                        finger_left_prim_path=finger_left_prim_path,
+                        finger_right_prim_path=finger_right_prim_path,
+                    )
+                    if _verify_reach_before_close(reach_metrics):
+                        LOG.info(
+                            "collect: attempt %d early halt before close at %s step=%d/%d metrics=%s",
+                            attempt,
+                            end_name,
+                            step + 1,
+                            steps_per_segment,
+                            reach_metrics,
+                        )
+                        early_reach_halt = True
+                        break
+
             if stopped:
                 return
+            if early_reach_halt:
+                # Stop descending/chasing once we already reached the close gate.
+                continue
 
             if end_name == "CLOSE":
                 close_arm = _resolve_live_arm_target(end_name, end_arm)
@@ -1980,6 +3056,36 @@ def _run_pick_place_episode(
         if stop_event is not None and stop_event.is_set():
             stopped = True
             break
+        if _read_bool_env("COLLECT_RECENTER_OBJECT_EACH_ATTEMPT", True):
+            fix = _ensure_object_within_workspace(
+                stage=stage,
+                object_prim_path=object_prim_path,
+                usd=usd,
+                usd_geom=usd_geom,
+                gf=gf,
+                table_x_range=table_x_range,
+                table_y_range=table_y_range,
+                table_top_z=table_top_z,
+                work_center=work_center,
+            )
+            if fix:
+                LOG.warning(
+                    "collect: attempt %d recentered object raw=(%.3f, %.3f, z:[%.3f, %.3f]) -> "
+                    "(%.3f, %.3f, %.3f) reason_xy=%s reason_z=%s",
+                    attempt,
+                    float(fix["raw_x"]),
+                    float(fix["raw_y"]),
+                    float(fix.get("raw_bottom_z", float("nan"))),
+                    float(fix.get("raw_top_z", float("nan"))),
+                    float(fix["target_x"]),
+                    float(fix["target_y"]),
+                    float(fix["target_z"]),
+                    bool(fix.get("reason_xy", 0.0)),
+                    bool(fix.get("reason_z", 0.0)),
+                )
+                for _ in range(6):
+                    world.step(render=True)
+                    _record_frame()
 
         annotation_target = _select_annotation_grasp_target(
             stage=stage,
@@ -1988,12 +3094,46 @@ def _run_pick_place_episode(
             usd_geom=usd_geom,
             candidates=annotation_candidates,
             attempt_index=attempt,
+            ik_solver=ik_solver,
+            table_x_range=table_x_range,
+            table_y_range=table_y_range,
+            table_top_z=table_top_z,
+            failed_pose_ids=_get_failed_annotation_pose_ids(annotation_failed_pose_cache_key),
+            tip_mid_offset_in_hand=annotation_tip_mid_offset_hand,
+            annotation_pose_is_tip_mid_frame=ANNOTATION_POSE_IS_TIP_MID_FRAME,
+            local_pos_scale=annotation_local_pos_scale,
         )
+        if force_topdown_grasp and annotation_target is not None:
+            annotation_target = None
         if annotation_target is not None:
             raw_pick_x = float(annotation_target["target_pos"][0])
             raw_pick_y = float(annotation_target["target_pos"][1])
             pick_source = "annotation"
             current_grasp_target = annotation_target
+            try:
+                obj_pos_dbg, _ = _get_object_tracking_pose(stage, object_prim_path, usd, usd_geom)
+                tgt_pos_dbg = _to_numpy(annotation_target.get("target_pos"), dtype=np.float32).reshape(-1)
+                d = tgt_pos_dbg[:3] - obj_pos_dbg[:3]
+                LOG.info(
+                    "collect: attempt %d annotation_pick idx=%s group=%s label=%s "
+                    "converted=%s ik_feasible=%s relaxed=%s target=(%.4f, %.4f, %.4f) "
+                    "obj_delta=(%.4f, %.4f, %.4f)",
+                    attempt,
+                    str(annotation_target.get("index", "na")),
+                    str(annotation_target.get("candidate_group", "body")),
+                    str(annotation_target.get("label", "body")),
+                    bool(annotation_target.get("annotation_tip_mid_to_hand_converted", False)),
+                    bool(annotation_target.get("ik_feasible", False)),
+                    bool(annotation_target.get("ik_orientation_relaxed", False)),
+                    float(tgt_pos_dbg[0]),
+                    float(tgt_pos_dbg[1]),
+                    float(tgt_pos_dbg[2]),
+                    float(d[0]),
+                    float(d[1]),
+                    float(d[2]),
+                )
+            except Exception:
+                pass
         else:
             raw_pick_x, raw_pick_y, pick_source = _query_object_pick_xy(
                 stage=stage,
@@ -2074,6 +3214,15 @@ def _run_pick_place_episode(
                 float(z_targets["pick_grasp_z"]) + 0.08,
             )
             ik_target_orientation = _normalize_quat_wxyz(annotation_target["target_quat"])
+        elif force_topdown_grasp:
+            ik_target_orientation = TOP_DOWN_FALLBACK_QUAT.copy()
+            if current_grasp_target is not None:
+                current_grasp_target["target_quat"] = ik_target_orientation.copy()
+        elif no_annotation_available:
+            ik_target_orientation = TOP_DOWN_FALLBACK_QUAT.copy()
+            if current_grasp_target is not None:
+                current_grasp_target["target_quat"] = ik_target_orientation.copy()
+            LOG.info("collect: attempt %d using top-down fallback orientation (no annotation)", attempt)
         elif ik_target_orientation is None:
             _, cand_quat = _get_eef_pose(stage, eef_prim_path, get_prim_at_path, usd, usd_geom)
             cand_quat = np.asarray(cand_quat, dtype=np.float32).reshape(-1)
@@ -2093,7 +3242,8 @@ def _run_pick_place_episode(
             world.step(render=True)
             _record_frame()
 
-        attempt_home_arm = _current_arm_target()
+        # First attempt replans from current arm; later retries bias back to canonical HOME to unwind knots.
+        attempt_home_arm = _current_arm_target() if attempt == 1 else HOME.copy()
         waypoints = _make_pick_place_waypoints_ik(
             ik_solver=ik_solver,
             pick_pos=last_pick_pos,
@@ -2102,6 +3252,7 @@ def _run_pick_place_episode(
             pick_approach_z=float(z_targets["pick_approach_z"]),
             place_grasp_z=float(z_targets["place_grasp_z"]),
             place_approach_z=float(z_targets["place_approach_z"]),
+            table_top_z=float(table_top_z),
             rng=rng,
             target_orientation=ik_target_orientation,
             home_arm=attempt_home_arm,
@@ -2146,11 +3297,8 @@ def _run_pick_place_episode(
 
         _execute_transitions(
             pick_transitions,
-            live_target_z_by_waypoint={
-                "APPROACH_PICK": float(z_targets["pick_approach_z"]),
-                "DOWN_PICK": float(z_targets["pick_grasp_z"]),
-                "CLOSE": float(z_targets["pick_grasp_z"]),
-            },
+            # Lock to per-attempt planned pose to avoid chasing disturbed mesh during descent.
+            live_target_z_by_waypoint=None,
         )
         if stopped:
             break
@@ -2175,6 +3323,12 @@ def _run_pick_place_episode(
                 attempt,
                 GRASP_MAX_ATTEMPTS,
                 reach_metrics,
+            )
+            _record_failed_annotation_target(
+                cache_key=annotation_failed_pose_cache_key,
+                target=current_grasp_target,
+                reason="reach_verify_failed",
+                attempt=attempt,
             )
             lift_arm = waypoints[lift_idx][1]
             _prepare_replan_from_current(lift_arm=lift_arm)
@@ -2215,6 +3369,12 @@ def _run_pick_place_episode(
                 GRASP_MAX_ATTEMPTS,
                 close_metrics,
             )
+            _record_failed_annotation_target(
+                cache_key=annotation_failed_pose_cache_key,
+                target=current_grasp_target,
+                reason="close_verify_failed",
+                attempt=attempt,
+            )
             lift_arm = waypoints[lift_idx][1]
             _prepare_replan_from_current(lift_arm=lift_arm)
             if stopped:
@@ -2242,6 +3402,7 @@ def _run_pick_place_episode(
 
         if retrieval_ok:
             grasp_succeeded = True
+            _clear_failed_annotation_pose_ids(annotation_failed_pose_cache_key)
             _execute_transitions(place_transitions)
             break
 
@@ -2250,6 +3411,12 @@ def _run_pick_place_episode(
             attempt,
             GRASP_MAX_ATTEMPTS,
             retrieval_metrics,
+        )
+        _record_failed_annotation_target(
+            cache_key=annotation_failed_pose_cache_key,
+            target=current_grasp_target,
+            reason="retrieval_verify_failed",
+            attempt=attempt,
         )
 
         lift_arm = waypoints[lift_idx][1]
@@ -2345,7 +3512,7 @@ def _setup_pick_place_scene_template(
 ) -> dict[str, Any]:
     import omni.usd
     from omni.isaac.core.articulations import Articulation
-    from omni.isaac.core.objects import FixedCuboid
+    from omni.isaac.core.objects import DynamicCuboid, FixedCuboid
     from omni.isaac.core.utils.prims import get_prim_at_path
     from omni.isaac.sensor import Camera
     from isaacsim.core.utils.stage import add_reference_to_stage
@@ -2474,8 +3641,6 @@ def _setup_pick_place_scene_template(
     )
     world.scene.add(camera_high)
     world.scene.add(camera_wrist)
-    world.scene.add(table)
-    world.scene.add(target_object)
 
     world.reset()
     for _ in range(30):
@@ -2524,7 +3689,11 @@ def _setup_pick_place_scene_template(
         usd_geom=UsdGeom,
     )
 
-    table_x_range, table_y_range, table_top_z, work_center = _infer_table_workspace(stage, UsdGeom)
+    table_x_range, table_y_range, table_top_z, work_center = _infer_table_workspace(
+        stage,
+        UsdGeom,
+        table_prim_path=TABLE_PRIM_PATH,
+    )
     table_x_range, table_y_range, table_top_z, work_center = _adjust_workspace_for_robot_reach(
         stage=stage,
         usd_geom=UsdGeom,
@@ -2641,22 +3810,30 @@ def _setup_pick_place_scene_reuse_or_patch(
     if not articulation_prim_path:
         raise RuntimeError(f"collect cannot find articulation root under {robot_prim_path}")
 
-    object_prim_path = _resolve_target_object_prim(stage, UsdGeom, target_hints=target_objects)
+    table_x_range, table_y_range, table_top_z, work_center = _infer_table_workspace(
+        stage,
+        UsdGeom,
+        table_prim_path=table_root,
+    )
+    table_x_range, table_y_range, table_top_z, work_center = _adjust_workspace_for_robot_reach(
+        stage=stage,
+        usd_geom=UsdGeom,
+        robot_prim_path=robot_prim_path,
+        table_x_range=table_x_range,
+        table_y_range=table_y_range,
+        table_top_z=table_top_z,
+        work_center=work_center,
+    )
+
+    object_prim_path = _resolve_target_object_prim(
+        stage,
+        UsdGeom,
+        target_hints=target_objects,
+        table_x_range=table_x_range,
+        table_y_range=table_y_range,
+        table_top_z=table_top_z,
+    )
     if object_prim_path is None:
-        table_x_range, table_y_range, table_top_z, work_center = _infer_table_workspace(
-            stage,
-            UsdGeom,
-            table_prim_path=table_root,
-        )
-        table_x_range, table_y_range, table_top_z, work_center = _adjust_workspace_for_robot_reach(
-            stage=stage,
-            usd_geom=UsdGeom,
-            robot_prim_path=robot_prim_path,
-            table_x_range=table_x_range,
-            table_y_range=table_y_range,
-            table_top_z=table_top_z,
-            work_center=work_center,
-        )
         obj_x = float((table_x_range[0] + table_x_range[1]) * 0.5)
         obj_y = float((table_y_range[0] + table_y_range[1]) * 0.5)
         object_prim_path = "/World/PickObject"
@@ -2678,6 +3855,25 @@ def _setup_pick_place_scene_reuse_or_patch(
         except Exception:
             pass
         LOG.info("collect: missing grasp object -> added %s", object_prim_path)
+    else:
+        try:
+            bbox = _compute_prim_bbox(stage, object_prim_path, UsdGeom)
+            if bbox:
+                mn, mx = bbox
+                LOG.info(
+                    "collect: target object=%s bbox_min=(%.3f, %.3f, %.3f) bbox_max=(%.3f, %.3f, %.3f)",
+                    object_prim_path,
+                    float(mn[0]),
+                    float(mn[1]),
+                    float(mn[2]),
+                    float(mx[0]),
+                    float(mx[1]),
+                    float(mx[2]),
+                )
+            else:
+                LOG.info("collect: target object=%s (bbox unavailable)", object_prim_path)
+        except Exception:
+            LOG.info("collect: target object=%s", object_prim_path)
 
     # Ensure chosen object has basic rigid/collision physics for pure physical grasp.
     obj_root = stage.GetPrimAtPath(object_prim_path)
@@ -2712,6 +3908,56 @@ def _setup_pick_place_scene_reuse_or_patch(
         table_top_z=table_top_z,
         work_center=work_center,
     )
+    if _read_bool_env("COLLECT_ALIGN_ROBOT_BASE", True):
+        try:
+            bx, by, bz, byaw = _align_robot_base_for_collect(
+                stage=stage,
+                robot_prim_path=robot_prim_path,
+                usd_geom=UsdGeom,
+                gf=Gf,
+                table_x_range=table_x_range,
+                table_y_range=table_y_range,
+                table_top_z=table_top_z,
+                work_center=work_center,
+            )
+            LOG.info(
+                "collect: aligned robot base for collect at (%.3f, %.3f, %.3f), yaw=%.1fdeg",
+                bx,
+                by,
+                bz,
+                byaw,
+            )
+        except Exception as exc:
+            LOG.warning("collect: failed to align robot base (%s), keep current pose", exc)
+    if _read_bool_env("COLLECT_RECENTER_OBJECT_IF_OUTSIDE_WORKSPACE", True):
+        try:
+            fix = _ensure_object_within_workspace(
+                stage=stage,
+                object_prim_path=object_prim_path,
+                usd=Usd,
+                usd_geom=UsdGeom,
+                gf=Gf,
+                table_x_range=table_x_range,
+                table_y_range=table_y_range,
+                table_top_z=table_top_z,
+                work_center=work_center,
+            )
+            if fix:
+                LOG.warning(
+                    "collect: object out of workspace raw=(%.3f, %.3f, z:[%.3f, %.3f]) recentered to "
+                    "(%.3f, %.3f, %.3f) reason_xy=%s reason_z=%s",
+                    float(fix["raw_x"]),
+                    float(fix["raw_y"]),
+                    float(fix.get("raw_bottom_z", float("nan"))),
+                    float(fix.get("raw_top_z", float("nan"))),
+                    float(fix["target_x"]),
+                    float(fix["target_y"]),
+                    float(fix["target_z"]),
+                    bool(fix.get("reason_xy", 0.0)),
+                    bool(fix.get("reason_z", 0.0)),
+                )
+        except Exception as exc:
+            LOG.warning("collect: object workspace recenter failed (%s), keep current pose", exc)
 
     overhead_cam_path = "/World/OverheadCam"
     overhead_prim = stage.GetPrimAtPath(overhead_cam_path)
@@ -2980,11 +4226,7 @@ def run_collection_in_process(
 
 def main() -> int:
     args = _parse_args()
-
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s [%(name)s] %(levelname)s %(message)s",
-    )
+    _configure_collector_logging(output_dir=args.output)
 
     if args.num_episodes <= 0:
         LOG.error("--num-episodes must be > 0")

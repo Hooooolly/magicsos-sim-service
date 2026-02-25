@@ -16,12 +16,14 @@ Ports (env vars):
 """
 import argparse
 import json
+import logging
 import os
 import sys
 import time
 import threading
 import re
 import uuid
+from pathlib import Path
 
 # ── Env defaults ──────────────────────────────────────────────
 os.environ.setdefault("ACCEPT_EULA", "Y")
@@ -39,6 +41,117 @@ SIM_SESSION_NAME = (
     or os.environ.get("HOSTNAME")
     or "interactive"
 )
+
+
+def _safe_token(value: str) -> str:
+    token = re.sub(r"[^a-zA-Z0-9._-]+", "_", str(value or "").strip())
+    token = token.strip("._-")
+    return token or "session"
+
+
+class _TeeTextStream:
+    """Mirror text writes to multiple streams."""
+
+    def __init__(self, *streams):
+        self._streams = [s for s in streams if s is not None]
+        self.encoding = getattr(self._streams[0], "encoding", "utf-8") if self._streams else "utf-8"
+
+    def write(self, data):
+        for s in self._streams:
+            try:
+                s.write(data)
+            except Exception:
+                pass
+        return len(data)
+
+    def flush(self):
+        for s in self._streams:
+            try:
+                s.flush()
+            except Exception:
+                pass
+
+    def isatty(self):
+        try:
+            return bool(self._streams and self._streams[0].isatty())
+        except Exception:
+            return False
+
+
+def _resolve_persistent_log_dir() -> Path | None:
+    candidates: list[Path] = []
+    env_path = os.environ.get("SIM_LOG_DIR", "").strip()
+    if env_path:
+        candidates.append(Path(env_path))
+    candidates.extend(
+        [
+            Path("/data/embodied/logs/sim-service"),
+            Path("/data/datasets/embodied/logs/sim-service"),
+            Path("/data/logs/sim-service"),
+            Path("/tmp/sim-service-logs"),
+        ]
+    )
+    for candidate in candidates:
+        try:
+            candidate.mkdir(parents=True, exist_ok=True)
+            return candidate
+        except Exception:
+            continue
+    return None
+
+
+_RUNTIME_LOG_PATH: str | None = None
+_RUNTIME_LOG_DIR: str | None = None
+_runtime_log_file_handle = None
+
+
+def _setup_persistent_stdio_log() -> str | None:
+    global _RUNTIME_LOG_PATH, _RUNTIME_LOG_DIR, _runtime_log_file_handle
+    enabled = os.environ.get("SIM_STDIO_LOG_TEE", "1").strip().lower() not in {"0", "false", "no", "off"}
+    if not enabled:
+        return None
+    log_dir = _resolve_persistent_log_dir()
+    if log_dir is None:
+        return None
+    _RUNTIME_LOG_DIR = str(log_dir)
+    ts = time.strftime("%Y%m%d_%H%M%S", time.localtime())
+    session = _safe_token(SIM_SESSION_NAME)
+    fname = f"run_interactive_{session}_{ts}_{os.getpid()}.log"
+    log_path = log_dir / fname
+    try:
+        fh = log_path.open("a", encoding="utf-8", buffering=1)
+    except Exception:
+        return None
+
+    _runtime_log_file_handle = fh
+    _RUNTIME_LOG_PATH = str(log_path)
+    sys.stdout = _TeeTextStream(sys.__stdout__, fh)
+    sys.stderr = _TeeTextStream(sys.__stderr__, fh)
+
+    try:
+        latest = log_dir / f"run_interactive_{session}_latest.log"
+        if latest.exists() or latest.is_symlink():
+            latest.unlink()
+        latest.symlink_to(log_path.name)
+    except Exception:
+        pass
+    return _RUNTIME_LOG_PATH
+
+
+_setup_persistent_stdio_log()
+logging.basicConfig(
+    level=getattr(logging, os.environ.get("SIM_LOG_LEVEL", "INFO").upper(), logging.INFO),
+    format="%(asctime)s [%(name)s] %(levelname)s %(message)s",
+    stream=sys.stdout,
+    force=True,
+)
+LOG = logging.getLogger("interactive-bridge")
+if _RUNTIME_LOG_PATH:
+    LOG.info("Persistent runtime log enabled: %s", _RUNTIME_LOG_PATH)
+elif _RUNTIME_LOG_DIR:
+    LOG.warning("Persistent runtime log directory resolved but file unavailable: %s", _RUNTIME_LOG_DIR)
+else:
+    LOG.warning("Persistent runtime log disabled: no writable log directory")
 # Default off: stale autosave restores were causing invalid world/camera states.
 AUTOSAVE_ENABLED = os.environ.get("SIM_AUTOSAVE_ENABLED", "0").strip() != "0"
 AUTOSAVE_DIR = os.path.join("/data", "sim_sessions", SIM_SESSION_NAME)
@@ -231,6 +344,8 @@ _state = {
     "autosave_stage_path": AUTOSAVE_STAGE_PATH if AUTOSAVE_ENABLED else None,
     "restored_from_autosave": False,
     "last_autosave_reason": None,
+    "log_file": _RUNTIME_LOG_PATH,
+    "log_dir": _RUNTIME_LOG_DIR,
 }
 
 # ── Thread-safe command queue for main-thread execution ──────
@@ -530,7 +645,10 @@ def _runtime_create_mug(
     variant: str = "C1",
     usd_path: str | None = None,
 ):
-    """Runtime scene helper exposed to scene-chat code as create_mug(...)."""
+    """Runtime scene helper exposed to scene-chat code as create_mug(...).
+
+    Current policy: lock to SM_Mug_C1 only, so grasp annotations stay consistent.
+    """
     from pxr import UsdGeom, UsdPhysics, Gf
     from omni.isaac.core.utils.stage import add_reference_to_stage
 
@@ -538,34 +656,30 @@ def _runtime_create_mug(
     if stage is None:
         raise RuntimeError("No USD stage available")
 
-    variant_clean = str(variant or "C1").strip().upper()
-    if variant_clean not in {"A2", "B1", "C1", "D1"}:
-        variant_clean = "C1"
+    requested_variant = str(variant or "C1").strip().upper()
+    if requested_variant and requested_variant != "C1":
+        print(f"[scene] create_mug variant '{requested_variant}' ignored; forcing C1")
+    if usd_path:
+        print(f"[scene] create_mug usd_path override ignored; forcing C1 asset: {usd_path}")
+
+    c1_rel = "Isaac/Props/Mugs/SM_Mug_C1.usd"
+    c1_http = (
+        "https://omniverse-content-production.s3-us-west-2.amazonaws.com/"
+        "Assets/Isaac/5.1/Isaac/Props/Mugs/SM_Mug_C1.usd"
+    )
 
     candidates = []
-    if usd_path:
-        candidates.append(str(usd_path))
 
     try:
         from omni.isaac.core.utils.nucleus import get_assets_root_path
 
         assets_root = get_assets_root_path()
         if assets_root:
-            candidates.append(f"{assets_root}/Isaac/Props/Mugs/SM_Mug_{variant_clean}.usd")
-            for v in ("C1", "A2", "B1", "D1"):
-                candidates.append(f"{assets_root}/Isaac/Props/Mugs/SM_Mug_{v}.usd")
+            candidates.append(f"{assets_root}/{c1_rel}")
     except Exception:
         pass
 
-    candidates.extend(
-        [
-            f"https://omniverse-content-production.s3-us-west-2.amazonaws.com/Assets/Isaac/5.1/Isaac/Props/Mugs/SM_Mug_{variant_clean}.usd",
-            "https://omniverse-content-production.s3-us-west-2.amazonaws.com/Assets/Isaac/5.1/Isaac/Props/Mugs/SM_Mug_C1.usd",
-            "https://omniverse-content-production.s3-us-west-2.amazonaws.com/Assets/Isaac/5.1/Isaac/Props/Mugs/SM_Mug_A2.usd",
-            "https://omniverse-content-production.s3-us-west-2.amazonaws.com/Assets/Isaac/5.1/Isaac/Props/Mugs/SM_Mug_B1.usd",
-            "https://omniverse-content-production.s3-us-west-2.amazonaws.com/Assets/Isaac/5.1/Isaac/Props/Mugs/SM_Mug_D1.usd",
-        ]
-    )
+    candidates.append(c1_http)
     candidates = _unique_preserve_order(candidates)
 
     existing = stage.GetPrimAtPath(prim_path)
@@ -836,6 +950,8 @@ def bridge_health():
         "autosave_enabled": _state["autosave_enabled"],
         "autosave_stage_path": _state["autosave_stage_path"],
         "restored_from_autosave": _state["restored_from_autosave"],
+        "log_file": _state.get("log_file"),
+        "log_dir": _state.get("log_dir"),
     })
 
 
