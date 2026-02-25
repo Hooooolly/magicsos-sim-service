@@ -49,3 +49,8 @@ If required scene elements are missing, collect fails with a direct reason inste
 ## Update (articulation init)
 - In strict mode, collector now also runs `world.reset()` before `initialize()` to ensure valid articulation views and avoid "Franka articulation not ready" errors.
 - This reset is for sim-view initialization on current stage; template scene creation is still disabled.
+
+## Update (articulation-ready hotfix)
+- `run_interactive.py`: collect start no longer recreates `World` by default.
+  - New env gate: `COLLECT_RECREATE_WORLD_BEFORE_START` (default `0`).
+- `isaac_pick_place_collector.py`: after `world.reset()`, collector now calls `world.play()` and steps a few frames before `franka.initialize()` to ensure articulation view is available.

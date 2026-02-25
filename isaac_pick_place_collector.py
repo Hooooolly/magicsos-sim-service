@@ -4050,6 +4050,16 @@ def _setup_pick_place_scene_reuse_or_patch(
     world.reset()
     for _ in range(20):
         world.step(render=True)
+    # Ensure simulation view exists before articulation initialize().
+    try:
+        world.play()
+    except Exception:
+        pass
+    for _ in range(3):
+        try:
+            world.step(render=False)
+        except Exception:
+            break
 
     if hasattr(franka, "initialize"):
         try:

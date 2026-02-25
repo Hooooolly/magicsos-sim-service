@@ -1465,11 +1465,13 @@ def _run_pending_collection():
     target_objects = req.get("target_objects")
 
     try:
-        # Collect can run after many scene-chat mutations. Recreate World to
-        # clear stale scene registry wrappers (e.g. expired /World/Table
-        # FixedCuboid handles) while preserving the currently opened USD stage.
-        if not _recreate_world_for_open_stage("collect_start"):
-            raise RuntimeError("Failed to recreate world before collection")
+        # Strict scene reuse: do not recreate world by default, so we preserve
+        # current articulation/sim context for the user-arranged scene.
+        # Opt-in fallback is available via env when stale-wrapper regressions need it.
+        recreate_before_collect = os.environ.get("COLLECT_RECREATE_WORLD_BEFORE_START", "0").strip() not in {"0", "false", "False", ""}
+        if recreate_before_collect:
+            if not _recreate_world_for_open_stage("collect_start"):
+                raise RuntimeError("Failed to recreate world before collection")
         if world is None:
             raise RuntimeError("World is unavailable before collection")
 
