@@ -3986,14 +3986,14 @@ def _setup_pick_place_scene_reuse_or_patch(
             LOG.warning("collect: object workspace recenter failed (%s), keep current pose", exc)
 
     overhead_cam_path = "/World/OverheadCam"
+    overhead_added = False
     overhead_prim = stage.GetPrimAtPath(overhead_cam_path)
     if not overhead_prim or not overhead_prim.IsValid() or not overhead_prim.IsA(UsdGeom.Camera):
-        if not allow_patch:
-            raise RuntimeError(f"collect(strict): missing overhead camera at {overhead_cam_path}")
         over_usd = UsdGeom.Camera.Define(stage, overhead_cam_path)
+        overhead_added = True
         LOG.info("collect: missing overhead camera -> added %s", overhead_cam_path)
     over_prim = stage.GetPrimAtPath(overhead_cam_path)
-    if over_prim and over_prim.IsValid() and allow_patch:
+    if over_prim and over_prim.IsValid() and (allow_patch or overhead_added):
         over_usd = UsdGeom.Camera(over_prim)
         over_xf = UsdGeom.Xformable(over_prim)
         over_xf.ClearXformOpOrder()
@@ -4006,14 +4006,14 @@ def _setup_pick_place_scene_reuse_or_patch(
             pass
 
     wrist_cam_path = f"{robot_prim_path}/panda_hand/wrist_cam"
+    wrist_added = False
     wrist_prim = stage.GetPrimAtPath(wrist_cam_path)
     if not wrist_prim or not wrist_prim.IsValid() or not wrist_prim.IsA(UsdGeom.Camera):
-        if not allow_patch:
-            raise RuntimeError(f"collect(strict): missing wrist camera at {wrist_cam_path}")
         wrist_usd = UsdGeom.Camera.Define(stage, wrist_cam_path)
+        wrist_added = True
         LOG.info("collect: missing wrist camera -> added %s", wrist_cam_path)
     wrist_prim = stage.GetPrimAtPath(wrist_cam_path)
-    if wrist_prim and wrist_prim.IsValid() and allow_patch:
+    if wrist_prim and wrist_prim.IsValid() and (allow_patch or wrist_added):
         wrist_usd = UsdGeom.Camera(wrist_prim)
         wrist_xf = UsdGeom.Xformable(wrist_prim)
         wrist_xf.ClearXformOpOrder()
@@ -4066,6 +4066,14 @@ def _setup_pick_place_scene_reuse_or_patch(
             except Exception as exc:
                 LOG.warning("Camera initialize() failed: %s", exc)
     if allow_patch:
+        _apply_wrist_camera_pose(
+            camera_wrist=camera_wrist,
+            stage=stage,
+            usd_geom=UsdGeom,
+            gf=Gf,
+            wrist_cam_path=wrist_cam_path,
+        )
+    elif wrist_added:
         _apply_wrist_camera_pose(
             camera_wrist=camera_wrist,
             stage=stage,

@@ -35,3 +35,9 @@ Files changed:
 ## Expected behavior
 Collect uses the user’s current scene only and never auto-builds a fallback scene.
 If required scene elements are missing, collect fails with a direct reason instead of silently modifying the scene.
+
+## Update (camera exception)
+- In strict scene mode, only cameras are allowed to be auto-added when missing:
+  - /World/OverheadCam
+  - <robot>/panda_hand/wrist_cam
+- Table/Franka/target object remain strict-required and are never auto-created.
