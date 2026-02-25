@@ -1,0 +1,18 @@
+{
+  "overall_score": 8,
+  "reject_regions": [],
+  "needs_more": [
+    "handle",
+    "rim"
+  ],
+  "issues": [
+    "Grasps on the handle (green) are clustered near the attachment point and lack coverage of the handle's full length; some may be unstable due to thinness.",
+    "Rim grasps (cyan) are mostly concentrated on one side; coverage is uneven, and some may be difficult to reach without collision from certain angles.",
+    "Only one grasp on the body (orange) is insufficient for robust picking from various orientations."
+  ],
+  "suggestions": [
+    "Add grasps along the full length of the handle, especially near the middle and far end, to improve stability and coverage.",
+    "Distribute rim grasps more evenly around the circumference to support picking from any orientation.",
+    "Add at least one more grasp on the body to provide alternative, stable options for picking."
+  ]
+}

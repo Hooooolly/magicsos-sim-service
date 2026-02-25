@@ -1,0 +1,1865 @@
+#!/usr/bin/env python3
+"""Standalone Isaac Sim pick-and-place data collector.
+
+Run with Isaac Sim Python:
+    /isaac-sim/python.sh /sim-service/isaac_pick_place_collector.py \
+        --num-episodes 5 --output /tmp/pick_place
+
+This module also exposes `run_collection_in_process(...)` for `run_interactive.py`.
+"""
+from __future__ import annotations
+
+import argparse
+import logging
+import os
+import re
+import sys
+import threading
+import time
+from pathlib import Path
+from typing import Any, Callable, Optional, Sequence
+
+import numpy as np
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+if str(SCRIPT_DIR) not in sys.path:
+    sys.path.insert(0, str(SCRIPT_DIR))
+
+from lerobot_writer import SimLeRobotWriter
+
+LOG = logging.getLogger("isaac-pick-place-collector")
+
+STATE_DIM = 23
+ACTION_DIM = 8
+FPS = 30
+CAMERA_NAMES = ["cam_high", "cam_wrist"]
+CAMERA_RESOLUTION = (512, 512)
+ROBOT_TYPE = "franka"
+STATE_NAMES = [
+    "joint_pos_0",
+    "joint_pos_1",
+    "joint_pos_2",
+    "joint_pos_3",
+    "joint_pos_4",
+    "joint_pos_5",
+    "joint_pos_6",
+    "joint_vel_0",
+    "joint_vel_1",
+    "joint_vel_2",
+    "joint_vel_3",
+    "joint_vel_4",
+    "joint_vel_5",
+    "joint_vel_6",
+    "gripper_pos_0",
+    "gripper_pos_1",
+    "eef_pos_x",
+    "eef_pos_y",
+    "eef_pos_z",
+    "eef_quat_w",
+    "eef_quat_x",
+    "eef_quat_y",
+    "eef_quat_z",
+]
+ACTION_NAMES = [
+    "action_joint_0",
+    "action_joint_1",
+    "action_joint_2",
+    "action_joint_3",
+    "action_joint_4",
+    "action_joint_5",
+    "action_joint_6",
+    "action_gripper",
+]
+
+HOME = np.array([0.0, -0.785, 0.0, -2.356, 0.0, 1.571, 0.785], dtype=np.float32)
+APPROACH_BASE = np.array([0.0, -0.3, 0.0, -1.5, 0.0, 1.8, 0.785], dtype=np.float32)
+DOWN_BASE = np.array([0.0, 0.1, 0.0, -1.2, 0.0, 2.0, 0.785], dtype=np.float32)
+
+GRIPPER_OPEN = 0.04
+GRIPPER_CLOSED = 0.0
+WAYPOINT_NOISE_RAD = 0.05
+
+OBJECT_SIZE = 0.04
+OBJECT_MASS = 0.1
+MIN_PICK_PLACE_DIST = 0.1
+STEPS_PER_SEGMENT = 70
+TABLE_MARGIN = 0.08
+MAX_ARM_STEP_RAD = 0.03
+MAX_GRIPPER_STEP = 0.004
+
+TABLE_X_RANGE = (0.3, 0.7)
+TABLE_Y_RANGE = (-0.3, 0.3)
+TABLE_Z = 0.41
+IK_APPROACH_Z_OFFSET = 0.18
+IK_GRASP_Z_OFFSET = 0.07
+
+COLLECTOR_ROOT = "/World/PickPlaceCollector"
+TABLE_PRIM_PATH = f"{COLLECTOR_ROOT}/Table"
+ROBOT_PRIM_PATH = f"{COLLECTOR_ROOT}/Franka"
+OVERHEAD_CAM_PATH = f"{COLLECTOR_ROOT}/OverheadCam"
+WRIST_CAM_PATH = f"{ROBOT_PRIM_PATH}/panda_hand/wrist_cam"
+OBJECT_PRIM_PATH = f"{COLLECTOR_ROOT}/PickObject"
+MATERIAL_PRIM_PATH = f"{COLLECTOR_ROOT}/GripMaterial"
+
+
+def _parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Collect Franka pick-place data in Isaac Sim.")
+    parser.add_argument("--num-episodes", type=int, default=50, help="Number of episodes to collect.")
+    parser.add_argument(
+        "--output",
+        type=str,
+        default="/sim-service/datasets/pick_place",
+        help="Output LeRobot dataset directory.",
+    )
+    parser.add_argument(
+        "--headless",
+        action="store_true",
+        default=False,
+        help="Run Isaac Sim headless.",
+    )
+    parser.add_argument("--fps", type=int, default=FPS, help="Dataset FPS.")
+    parser.add_argument(
+        "--steps-per-segment",
+        type=int,
+        default=STEPS_PER_SEGMENT,
+        help="Interpolation steps for each waypoint transition.",
+    )
+    parser.add_argument("--seed", type=int, default=12345, help="Random seed.")
+    parser.add_argument(
+        "--streaming",
+        action="store_true",
+        default=False,
+        help="Enable WebRTC streaming for monitoring.",
+    )
+    parser.add_argument("--streaming-port", type=int, default=49102, help="WebRTC signaling port.")
+    parser.add_argument(
+        "--use-ycb",
+        action="store_true",
+        default=False,
+        help="Use YCB assets instead of a cube object.",
+    )
+    parser.add_argument(
+        "--task-name",
+        type=str,
+        default="pick_place",
+        help="Task label recorded in dataset episode metadata.",
+    )
+    return parser.parse_args()
+
+
+def _to_numpy(value: Any, dtype: Any = np.float32) -> np.ndarray:
+    if value is None:
+        return np.zeros(0, dtype=dtype)
+    if isinstance(value, np.ndarray):
+        return value.astype(dtype, copy=False)
+    if hasattr(value, "detach"):
+        value = value.detach()
+    if hasattr(value, "cpu"):
+        value = value.cpu()
+    return np.asarray(value, dtype=dtype)
+
+
+def _pad_or_trim(vec: np.ndarray, size: int, fill: float = 0.0) -> np.ndarray:
+    out = np.full((size,), fill, dtype=np.float32)
+    if vec.size:
+        flat = vec.reshape(-1).astype(np.float32, copy=False)
+        out[: min(size, flat.size)] = flat[:size]
+    return out
+
+
+def _default_dataset_repo_id(output_dir: str) -> str:
+    dataset_id = re.sub(r"[^a-zA-Z0-9._-]+", "_", Path(output_dir).name.strip()).strip("._-")
+    dataset_id = dataset_id or "sim_collect"
+    return f"local/{dataset_id}"
+
+
+def _select_ik_frame_name(frame_names: Sequence[str], eef_prim_path: str) -> Optional[str]:
+    if not frame_names:
+        return None
+    available = set(frame_names)
+    leaf = str(eef_prim_path or "").split("/")[-1]
+    preferred = [leaf, "right_gripper", "panda_hand", "panda_link8", "panda_link7"]
+    for name in preferred:
+        if name and name in available:
+            return name
+    for name in frame_names:
+        low = str(name).lower()
+        if "gripper" in low or "hand" in low:
+            return name
+    return frame_names[0]
+
+
+def _create_franka_ik_solver(
+    franka: Any,
+    stage: Any,
+    robot_prim_path: str,
+    eef_prim_path: str,
+    usd: Any,
+    usd_geom: Any,
+) -> Any | None:
+    try:
+        from omni.isaac.motion_generation import (
+            ArticulationKinematicsSolver,
+            LulaKinematicsSolver,
+            interface_config_loader,
+        )
+
+        cfg = interface_config_loader.load_supported_lula_kinematics_solver_config("Franka")
+        lula = LulaKinematicsSolver(**cfg)
+        base_pos, base_quat = _get_prim_world_pose(stage, robot_prim_path, usd, usd_geom)
+        lula.set_robot_base_pose(base_pos, base_quat)
+        frame_name = _select_ik_frame_name(lula.get_all_frame_names(), eef_prim_path)
+        if not frame_name:
+            LOG.warning("IK init skipped: no valid end-effector frame")
+            return None
+        solver = ArticulationKinematicsSolver(franka, lula, frame_name)
+        LOG.info("IK solver ready: frame=%s robot=%s", frame_name, robot_prim_path)
+        return solver
+    except Exception as exc:
+        LOG.warning("IK solver init failed: %s", exc)
+        return None
+
+
+def _solve_ik_arm_target(ik_solver: Any, target_position: np.ndarray) -> np.ndarray | None:
+    if ik_solver is None:
+        return None
+    try:
+        action, success = ik_solver.compute_inverse_kinematics(
+            target_position=np.asarray(target_position, dtype=np.float32),
+            target_orientation=None,
+            position_tolerance=0.01,
+        )
+        if not success or action is None:
+            return None
+        joints = _to_numpy(getattr(action, "joint_positions", None))
+        if joints.size < 7:
+            return None
+        return joints[:7].astype(np.float32, copy=False)
+    except Exception as exc:
+        LOG.warning("IK solve failed for target %s: %s", np.asarray(target_position).tolist(), exc)
+        return None
+
+
+def _prim_is_valid(stage: Any, prim_path: str) -> bool:
+    prim = stage.GetPrimAtPath(prim_path)
+    return prim is not None and prim.IsValid()
+
+
+def _looks_like_franka_root(stage: Any, prim_path: str) -> bool:
+    prim = stage.GetPrimAtPath(prim_path)
+    if not prim or not prim.IsValid():
+        return False
+    has_hand = False
+    has_link0 = False
+    for sub in _iter_descendants(prim):
+        name = sub.GetName().lower()
+        if "panda_hand" in name:
+            has_hand = True
+        if "panda_link0" in name:
+            has_link0 = True
+        if has_hand and has_link0:
+            return True
+    return False
+
+
+def _has_articulation_root(stage: Any, prim_path: str, usd_physics: Any) -> bool:
+    prim = stage.GetPrimAtPath(prim_path)
+    if not prim or not prim.IsValid():
+        return False
+    try:
+        if prim.HasAPI(usd_physics.ArticulationRootAPI):
+            return True
+    except Exception:
+        pass
+    for sub in _iter_descendants(prim):
+        if not sub or not sub.IsValid():
+            continue
+        try:
+            if sub.HasAPI(usd_physics.ArticulationRootAPI):
+                return True
+        except Exception:
+            continue
+    return False
+
+
+def _resolve_articulation_root_prim_path(stage: Any, prim_path: str, usd_physics: Any) -> Optional[str]:
+    """Return concrete articulation root prim path for a Franka hierarchy."""
+    prim = stage.GetPrimAtPath(prim_path)
+    if not prim or not prim.IsValid():
+        return None
+    try:
+        if prim.HasAPI(usd_physics.ArticulationRootAPI):
+            return prim.GetPath().pathString
+    except Exception:
+        pass
+    for sub in _iter_descendants(prim):
+        if not sub or not sub.IsValid():
+            continue
+        try:
+            if sub.HasAPI(usd_physics.ArticulationRootAPI):
+                return sub.GetPath().pathString
+        except Exception:
+            continue
+    return None
+
+
+def _resolve_robot_prim(stage: Any) -> Optional[str]:
+    candidates = [
+        "/World/FrankaRobot",
+        "/World/Franka",
+        "/World/franka",
+        f"{COLLECTOR_ROOT}/Franka",
+    ]
+    for path in candidates:
+        if _prim_is_valid(stage, path) and _looks_like_franka_root(stage, path):
+            return path
+
+    discovered: list[str] = []
+    for prim in stage.Traverse():
+        if not prim.IsValid():
+            continue
+        path = prim.GetPath().pathString
+        if not path.startswith("/World/") or path.count("/") != 2:
+            continue
+        if "franka" in path.lower() and _looks_like_franka_root(stage, path):
+            discovered.append(path)
+    return discovered[0] if discovered else None
+
+
+def _franka_usd_candidates(assets_root: str) -> list[str]:
+    root = str(assets_root or "").rstrip("/")
+    candidates = [
+        # Prefer known-good public Isaac asset URLs first (used by scene-chat path).
+        "https://omniverse-content-production.s3-us-west-2.amazonaws.com/Assets/Isaac/5.1/Isaac/Robots/FrankaRobotics/FrankaPanda/franka.usd",
+        "https://omniverse-content-production.s3-us-west-2.amazonaws.com/Assets/Isaac/4.5/Isaac/Robots/FrankaRobotics/FrankaPanda/franka.usd",
+    ]
+    if root:
+        candidates.extend(
+            [
+                root + "/Isaac/Robots/FrankaRobotics/FrankaPanda/franka.usd",
+                root + "/Isaac/Robots/Franka/franka.usd",
+            ]
+        )
+    # Keep order but remove duplicates.
+    out: list[str] = []
+    seen = set()
+    for item in candidates:
+        if item in seen:
+            continue
+        seen.add(item)
+        out.append(item)
+    return out
+
+
+def _add_franka_reference(
+    stage: Any,
+    simulation_app: Any,
+    add_reference_to_stage: Any,
+    assets_root: str,
+    usd_geom: Any,
+    gf: Any,
+    usd_physics: Any,
+    prim_path: str = "/World/FrankaRobot",
+) -> str:
+    added = False
+    for franka_usd in _franka_usd_candidates(assets_root):
+        add_reference_to_stage(usd_path=franka_usd, prim_path=prim_path)
+        for _ in range(8):
+            simulation_app.update()
+        if _looks_like_franka_root(stage, prim_path) and _has_articulation_root(stage, prim_path, usd_physics):
+            added = True
+            break
+        _remove_prim_if_exists(stage, prim_path)
+    if not added:
+        raise RuntimeError("collect cannot add Franka: no valid Franka asset path available")
+
+    franka_prim = stage.GetPrimAtPath(prim_path)
+    if franka_prim and franka_prim.IsValid():
+        xf = usd_geom.Xformable(franka_prim)
+        tx = None
+        for op in xf.GetOrderedXformOps():
+            if op.GetOpName() == "xformOp:translate":
+                tx = op
+                break
+        if tx is None:
+            tx = xf.AddTranslateOp()
+        tx.Set(gf.Vec3d(0.40, 0.00, 0.77))
+    return prim_path
+
+
+def _wait_articulation_ready(franka: Any, world: Any, steps: int = 30) -> None:
+    """Block until articulation exposes joint state, else raise clear error."""
+    last_exc: Optional[Exception] = None
+    for _ in range(max(1, int(steps))):
+        try:
+            joints = _to_numpy(franka.get_joint_positions())
+            if joints.size > 0:
+                return
+        except Exception as exc:
+            last_exc = exc
+        try:
+            world.step(render=False)
+        except Exception:
+            pass
+    if last_exc is not None:
+        raise RuntimeError(f"Franka articulation not ready: {last_exc}")
+    raise RuntimeError("Franka articulation not ready: no joint states available")
+
+
+def _iter_world_root_prims(stage: Any) -> list[Any]:
+    roots = []
+    world = stage.GetPrimAtPath("/World")
+    if not world or not world.IsValid():
+        return roots
+    for child in world.GetChildren():
+        if child and child.IsValid():
+            roots.append(child)
+    return roots
+
+
+def _iter_descendants(prim: Any):
+    stack = list(prim.GetChildren()) if prim and prim.IsValid() else []
+    while stack:
+        node = stack.pop()
+        yield node
+        children = list(node.GetChildren()) if node and node.IsValid() else []
+        if children:
+            stack.extend(children)
+
+
+def _is_geom_prim(prim: Any, usd_geom: Any) -> bool:
+    if not prim or not prim.IsValid():
+        return False
+    try:
+        if prim.IsA(usd_geom.Gprim):
+            return True
+    except Exception:
+        pass
+    try:
+        if prim.IsA(usd_geom.Mesh):
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def _root_has_mesh_descendant(prim: Any, usd_geom: Any) -> bool:
+    if not prim or not prim.IsValid():
+        return False
+    if _is_geom_prim(prim, usd_geom):
+        return True
+    for sub in _iter_descendants(prim):
+        if sub and sub.IsValid() and _is_geom_prim(sub, usd_geom):
+            return True
+    return False
+
+
+def _resolve_table_prim(stage: Any, usd_geom: Any) -> Optional[str]:
+    explicit_candidates = [
+        "/World/Table",
+        "/World/table",
+        f"{TABLE_PRIM_PATH}",
+    ]
+    for path in explicit_candidates:
+        prim = stage.GetPrimAtPath(path)
+        if prim and prim.IsValid() and _root_has_mesh_descendant(prim, usd_geom):
+            return path
+
+    skip_tokens = {
+        "defaultgroundplane",
+        "ground",
+        "physicsscene",
+        "light",
+        "camera",
+        "franka",
+        "looks",
+        "render",
+    }
+    name_tokens = ("table", "desk", "counter", "workbench")
+
+    best_path: Optional[str] = None
+    best_score = -1.0
+    for root in _iter_world_root_prims(stage):
+        if not root or not root.IsValid():
+            continue
+        name = root.GetName().lower()
+        if any(tok in name for tok in skip_tokens):
+            continue
+        if not _root_has_mesh_descendant(root, usd_geom):
+            continue
+        bbox = _compute_prim_bbox(stage, root.GetPath().pathString, usd_geom)
+        if not bbox:
+            continue
+        mn, mx = bbox
+        sx = float(mx[0] - mn[0])
+        sy = float(mx[1] - mn[1])
+        sz = float(mx[2] - mn[2])
+        top_z = float(mx[2])
+        if not np.isfinite(sx) or not np.isfinite(sy) or not np.isfinite(sz):
+            continue
+        # Keep candidates near typical tabletop geometry.
+        if sx < 0.35 or sy < 0.35:
+            continue
+        if top_z < 0.45 or top_z > 1.35:
+            continue
+
+        area = sx * sy
+        flat_ratio = min(sx, sy) / max(sz, 0.02)
+        score = area
+        if any(tok in name for tok in name_tokens):
+            score += 5.0
+        score += min(flat_ratio, 30.0) * 0.05
+        if score > best_score:
+            best_score = score
+            best_path = root.GetPath().pathString
+
+    return best_path
+
+
+def _root_is_graspable_candidate(prim: Any, usd_geom: Any) -> bool:
+    if not prim or not prim.IsValid():
+        return False
+    name = prim.GetName().lower()
+    if name in {"defaultgroundplane", "ground", "physicsscene"}:
+        return False
+    if "table" in name or "franka" in name or "camera" in name:
+        return False
+    if "light" in name or "looks" in name or "render" in name:
+        return False
+    if name.startswith("omniversekit_"):
+        return False
+
+    if prim.IsA(usd_geom.Camera):
+        return False
+    if _is_geom_prim(prim, usd_geom):
+        return True
+    # Require at least one mesh descendant.
+    for sub in _iter_descendants(prim):
+        if sub and sub.IsValid() and _is_geom_prim(sub, usd_geom):
+            return True
+    return False
+
+
+def _normalize_name_token(value: str) -> str:
+    return "".join(ch for ch in (value or "").lower() if ch.isalnum())
+
+
+def _match_target_hint(name: str, hints: Sequence[str]) -> bool:
+    if not hints:
+        return False
+    n = _normalize_name_token(name)
+    for hint in hints:
+        h = _normalize_name_token(str(hint))
+        if not h:
+            continue
+        if h in n or n in h:
+            return True
+    return False
+
+
+def _resolve_target_object_prim(
+    stage: Any,
+    usd_geom: Any,
+    target_hints: Optional[Sequence[str]] = None,
+) -> Optional[str]:
+    roots = _iter_world_root_prims(stage)
+    candidates: list[Any] = []
+    for root in roots:
+        if not _root_is_graspable_candidate(root, usd_geom):
+            continue
+        bbox = _compute_prim_bbox(stage, root.GetPath().pathString, usd_geom)
+        if not bbox:
+            continue
+        mn, mx = bbox
+        size = mx - mn
+        max_dim = float(np.max(size))
+        min_dim = float(np.min(size))
+        # Prefer handheld tabletop items, not large furniture.
+        if max_dim > 0.45 or min_dim < 0.01:
+            continue
+        candidates.append(root)
+    if not candidates:
+        return None
+
+    if target_hints:
+        for prim in candidates:
+            if _match_target_hint(prim.GetName(), target_hints):
+                return prim.GetPath().pathString
+
+    # Prefer common tabletop manipulands.
+    preferred_tokens = [
+        "mug",
+        "mustard",
+        "sugar",
+        "cracker",
+        "tomato",
+        "pickobject",
+        "object",
+    ]
+    for token in preferred_tokens:
+        for prim in candidates:
+            if token in prim.GetName().lower():
+                return prim.GetPath().pathString
+
+    return candidates[0].GetPath().pathString
+
+
+def _compute_prim_bbox(stage: Any, prim_path: str, usd_geom: Any) -> Optional[tuple[np.ndarray, np.ndarray]]:
+    prim = stage.GetPrimAtPath(prim_path)
+    if not prim or not prim.IsValid():
+        return None
+    try:
+        cache = usd_geom.BBoxCache(0, ["default", "render"])
+        rng = cache.ComputeWorldBound(prim).GetRange()
+        mn = np.array([float(rng.GetMin()[0]), float(rng.GetMin()[1]), float(rng.GetMin()[2])], dtype=np.float32)
+        mx = np.array([float(rng.GetMax()[0]), float(rng.GetMax()[1]), float(rng.GetMax()[2])], dtype=np.float32)
+        if not np.all(np.isfinite(mn)) or not np.all(np.isfinite(mx)):
+            return None
+        return mn, mx
+    except Exception:
+        return None
+
+
+def _infer_table_workspace(
+    stage: Any,
+    usd_geom: Any,
+    table_prim_path: Optional[str] = None,
+) -> tuple[tuple[float, float], tuple[float, float], float, tuple[float, float]]:
+    table_candidates: list[str] = []
+    if table_prim_path:
+        table_candidates.extend([f"{table_prim_path}/Top", table_prim_path])
+    table_candidates.extend(
+        [
+            "/World/Table/Top",
+            "/World/Table",
+            f"{TABLE_PRIM_PATH}/Top",
+            TABLE_PRIM_PATH,
+        ]
+    )
+
+    seen = set()
+    for p in table_candidates:
+        if p in seen:
+            continue
+        seen.add(p)
+        bbox = _compute_prim_bbox(stage, p, usd_geom)
+        if not bbox:
+            continue
+        mn, mx = bbox
+        size_x = float(mx[0] - mn[0])
+        size_y = float(mx[1] - mn[1])
+        top_z = float(mx[2])
+        # Reject tiny / malformed table candidates (common in imported scenes
+        # where an empty Xform or decorative mesh sits at /World/Table).
+        if size_x < 0.30 or size_y < 0.30:
+            continue
+        if (not np.isfinite(top_z)) or top_z < 0.25 or top_z > 1.60:
+            continue
+        x_min = float(mn[0] + TABLE_MARGIN)
+        x_max = float(mx[0] - TABLE_MARGIN)
+        y_min = float(mn[1] + TABLE_MARGIN)
+        y_max = float(mx[1] - TABLE_MARGIN)
+        if x_max <= x_min or y_max <= y_min:
+            continue
+        center = ((x_min + x_max) * 0.5, (y_min + y_max) * 0.5)
+        return (x_min, x_max), (y_min, y_max), top_z, center
+
+    # Fallback for generated scene defaults.
+    center = ((TABLE_X_RANGE[0] + TABLE_X_RANGE[1]) * 0.5, (TABLE_Y_RANGE[0] + TABLE_Y_RANGE[1]) * 0.5)
+    return TABLE_X_RANGE, TABLE_Y_RANGE, TABLE_Z, center
+
+
+def _adjust_workspace_for_robot_reach(
+    stage: Any,
+    usd_geom: Any,
+    robot_prim_path: str,
+    table_x_range: tuple[float, float],
+    table_y_range: tuple[float, float],
+    table_top_z: float,
+    work_center: tuple[float, float],
+) -> tuple[tuple[float, float], tuple[float, float], float, tuple[float, float]]:
+    robot_bbox = _compute_prim_bbox(stage, robot_prim_path, usd_geom)
+    if robot_bbox:
+        rmn, rmx = robot_bbox
+        robot_xy = (float((rmn[0] + rmx[0]) * 0.5), float((rmn[1] + rmx[1]) * 0.5))
+    else:
+        robot_xy = (float(work_center[0]), float(work_center[1]))
+
+    top_z = float(table_top_z)
+    if (not np.isfinite(top_z)) or top_z < 0.30 or top_z > 1.35:
+        LOG.warning("collect: abnormal table_top_z=%.3f, fallback to 0.770", top_z)
+        top_z = 0.77
+
+    # Keep sampled pick/place points in a conservative reachable zone for the
+    # current Franka base, intersected with inferred table bounds.
+    rx, ry = robot_xy
+    reach_x = (rx - 0.05, rx + 0.15)
+    reach_y = (ry - 0.12, ry + 0.12)
+
+    x_min = max(float(table_x_range[0]), float(reach_x[0]))
+    x_max = min(float(table_x_range[1]), float(reach_x[1]))
+    y_min = max(float(table_y_range[0]), float(reach_y[0]))
+    y_max = min(float(table_y_range[1]), float(reach_y[1]))
+
+    if (x_max - x_min) < 0.08:
+        x_min, x_max = reach_x
+    if (y_max - y_min) < 0.08:
+        y_min, y_max = reach_y
+
+    x_range = (float(x_min), float(x_max))
+    y_range = (float(y_min), float(y_max))
+    center = (float((x_range[0] + x_range[1]) * 0.5), float((y_range[0] + y_range[1]) * 0.5))
+    return x_range, y_range, top_z, center
+
+
+def _get_prim_world_pose(stage: Any, prim_path: str, usd: Any, usd_geom: Any) -> tuple[np.ndarray, np.ndarray]:
+    pos = np.zeros(3, dtype=np.float32)
+    quat = np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32)
+    prim = stage.GetPrimAtPath(prim_path)
+    if not prim or not prim.IsValid():
+        return pos, quat
+    try:
+        xf = usd_geom.Xformable(prim)
+        tf = xf.ComputeLocalToWorldTransform(usd.TimeCode.Default())
+        t = tf.ExtractTranslation()
+        q = tf.ExtractRotationQuat()
+        imag = q.GetImaginary()
+        pos = np.array([float(t[0]), float(t[1]), float(t[2])], dtype=np.float32)
+        quat = np.array([float(q.GetReal()), float(imag[0]), float(imag[1]), float(imag[2])], dtype=np.float32)
+    except Exception:
+        pass
+    return pos, quat
+
+
+def _set_prim_world_position(stage: Any, prim_path: str, position: np.ndarray, usd_geom: Any, gf: Any) -> None:
+    prim = stage.GetPrimAtPath(prim_path)
+    if not prim or not prim.IsValid():
+        raise RuntimeError(f"Target prim not found: {prim_path}")
+    xf = usd_geom.Xformable(prim)
+    tx = None
+    for op in xf.GetOrderedXformOps():
+        if op.GetOpName() == "xformOp:translate":
+            tx = op
+            break
+    if tx is None:
+        tx = xf.AddTranslateOp()
+    tx.Set(gf.Vec3d(float(position[0]), float(position[1]), float(position[2])))
+
+
+def _estimate_object_height(stage: Any, object_prim_path: str, usd_geom: Any, fallback: float = OBJECT_SIZE) -> float:
+    bbox = _compute_prim_bbox(stage, object_prim_path, usd_geom)
+    if not bbox:
+        return fallback
+    mn, mx = bbox
+    h = float(mx[2] - mn[2])
+    if not np.isfinite(h) or h <= 0.0:
+        return fallback
+    return max(h, 0.01)
+
+
+def _resolve_eef_prim(stage: Any, robot_prim_path: str, get_prim_at_path: Any) -> str | None:
+    candidates = [
+        f"{robot_prim_path}/panda_hand",
+        f"{robot_prim_path}/panda_hand_tcp",
+        f"{robot_prim_path}/panda_link8",
+    ]
+    for path in candidates:
+        prim = get_prim_at_path(path)
+        if prim and prim.IsValid():
+            return path
+
+    for prim in stage.Traverse():
+        if not prim.IsValid():
+            continue
+        path = prim.GetPath().pathString
+        if not path.startswith(robot_prim_path):
+            continue
+        lower = path.lower()
+        if "hand" in lower or "gripper" in lower or "tcp" in lower:
+            return path
+    return None
+
+
+def _get_eef_pose(
+    stage: Any,
+    eef_prim_path: str,
+    get_prim_at_path: Any,
+    usd: Any,
+    usd_geom: Any,
+) -> tuple[np.ndarray, np.ndarray]:
+    eef_pos = np.zeros(3, dtype=np.float32)
+    eef_quat = np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32)
+
+    prim = get_prim_at_path(eef_prim_path)
+    if not prim or not prim.IsValid():
+        prim = stage.GetPrimAtPath(eef_prim_path)
+    if not prim or not prim.IsValid():
+        return eef_pos, eef_quat
+
+    xformable = usd_geom.Xformable(prim)
+    tf = xformable.ComputeLocalToWorldTransform(usd.TimeCode.Default())
+    translation = tf.ExtractTranslation()
+    rotation = tf.ExtractRotationQuat()
+    imaginary = rotation.GetImaginary()
+
+    eef_pos = np.array([translation[0], translation[1], translation[2]], dtype=np.float32)
+    eef_quat = np.array(
+        [rotation.GetReal(), imaginary[0], imaginary[1], imaginary[2]],
+        dtype=np.float32,
+    )
+    return eef_pos, eef_quat
+
+
+def _extract_state_vector(
+    franka: Any,
+    stage: Any,
+    eef_prim_path: str,
+    get_prim_at_path: Any,
+    usd: Any,
+    usd_geom: Any,
+) -> np.ndarray:
+    joint_positions_all = _to_numpy(franka.get_joint_positions())
+    joint_velocities_all = _to_numpy(franka.get_joint_velocities())
+
+    joint_pos_padded = _pad_or_trim(joint_positions_all, 9)
+    joint_vel_padded = _pad_or_trim(joint_velocities_all, 7)
+
+    joint_pos = joint_pos_padded[:7]
+    joint_vel = joint_vel_padded[:7]
+    gripper_pos = joint_pos_padded[7:9]
+    eef_pos, eef_quat = _get_eef_pose(stage, eef_prim_path, get_prim_at_path, usd, usd_geom)
+
+    state = np.concatenate([joint_pos, joint_vel, gripper_pos, eef_pos, eef_quat], axis=0)
+    return _pad_or_trim(state, STATE_DIM)
+
+
+def _set_joint_targets(
+    franka: Any, arm_target: np.ndarray, gripper_target: float, physics_control: bool = True
+) -> np.ndarray:
+    current = _to_numpy(franka.get_joint_positions())
+    dof = int(current.size) if current.size > 0 else 9
+    if dof < 7:
+        raise RuntimeError(f"Robot DOF is {dof}, expected at least 7.")
+
+    targets = current.copy() if current.size > 0 else np.zeros((dof,), dtype=np.float32)
+    targets[:7] = arm_target[:7]
+    if dof > 7:
+        targets[7] = float(gripper_target)
+    if dof > 8:
+        targets[8] = float(gripper_target)
+
+    if physics_control:
+        from omni.isaac.core.utils.types import ArticulationAction
+        franka.apply_action(ArticulationAction(joint_positions=targets))
+    else:
+        franka.set_joint_positions(targets)
+    return targets
+
+
+def _step_toward_joint_targets(
+    franka: Any,
+    arm_target: np.ndarray,
+    gripper_target: float,
+    max_arm_step: float = MAX_ARM_STEP_RAD,
+    max_gripper_step: float = MAX_GRIPPER_STEP,
+) -> tuple[np.ndarray, float]:
+    """Rate-limit joint command updates to avoid teleport-like oscillation."""
+    current = _to_numpy(franka.get_joint_positions())
+    if current.size < 7:
+        return arm_target.astype(np.float32), float(gripper_target)
+
+    arm_current = current[:7].astype(np.float32, copy=False)
+    arm_delta = arm_target[:7] - arm_current
+    arm_delta = np.clip(arm_delta, -float(max_arm_step), float(max_arm_step))
+    arm_cmd = (arm_current + arm_delta).astype(np.float32)
+
+    if current.size >= 9:
+        gr_cur = float(0.5 * (current[7] + current[8]))
+    elif current.size == 8:
+        gr_cur = float(current[7])
+    else:
+        gr_cur = float(gripper_target)
+    gr_delta = float(np.clip(float(gripper_target) - gr_cur, -float(max_gripper_step), float(max_gripper_step)))
+    gr_cmd = float(gr_cur + gr_delta)
+
+    return arm_cmd, gr_cmd
+
+
+def _capture_rgb(camera: Any, resolution: tuple[int, int]) -> np.ndarray:
+    height, width = resolution
+    black = np.zeros((height, width, 3), dtype=np.uint8)
+
+    try:
+        rgba = camera.get_rgba()
+    except Exception as exc:
+        LOG.warning("Camera capture failed: %s", exc)
+        return black
+
+    if rgba is None:
+        return black
+
+    image = np.asarray(rgba)
+    if image.ndim == 4:
+        image = image[0]
+    if image.ndim != 3:
+        return black
+
+    if image.shape[-1] >= 4:
+        image = image[..., :3]
+    elif image.shape[-1] != 3:
+        return black
+
+    if image.dtype != np.uint8:
+        if np.issubdtype(image.dtype, np.floating) and float(np.max(image)) <= 1.0:
+            image = image * 255.0
+        image = np.clip(image, 0, 255).astype(np.uint8)
+
+    if image.shape[0] != height or image.shape[1] != width:
+        resized = np.zeros((height, width, 3), dtype=np.uint8)
+        h = min(height, image.shape[0])
+        w = min(width, image.shape[1])
+        resized[:h, :w] = image[:h, :w]
+        image = resized
+
+    return image
+
+
+def _remove_prim_if_exists(stage: Any, prim_path: str) -> None:
+    prim = stage.GetPrimAtPath(prim_path)
+    if prim and prim.IsValid():
+        stage.RemovePrim(prim_path)
+
+def _pos_to_joint_offset(
+    target_x: float,
+    target_y: float,
+    center_x: float = 0.5,
+    center_y: float = 0.0,
+) -> np.ndarray:
+    dx = target_x - center_x
+    dy = target_y - center_y
+    j0_offset = float(np.clip(np.arctan2(dy, 0.5) * 0.8, -0.35, 0.35))
+    j1_offset = float(np.clip(-dx * 0.5, -0.25, 0.25))
+    return np.array([j0_offset, j1_offset, 0.0, 0.0, 0.0, 0.0, 0.0], dtype=np.float32)
+
+
+def _make_pick_place_waypoints(
+    pick_pos: tuple[float, float],
+    place_pos: tuple[float, float],
+    rng: np.random.Generator,
+    work_center: tuple[float, float],
+) -> list[tuple[str, np.ndarray, float]]:
+    def add_noise(base: np.ndarray) -> np.ndarray:
+        noise = rng.uniform(-WAYPOINT_NOISE_RAD, WAYPOINT_NOISE_RAD, size=base.shape).astype(np.float32)
+        return (base + noise).astype(np.float32)
+
+    pick_offset = _pos_to_joint_offset(pick_pos[0], pick_pos[1], center_x=work_center[0], center_y=work_center[1])
+    place_offset = _pos_to_joint_offset(place_pos[0], place_pos[1], center_x=work_center[0], center_y=work_center[1])
+
+    approach_pick = add_noise(APPROACH_BASE + pick_offset)
+    down_pick = add_noise(DOWN_BASE + pick_offset)
+    move_place = add_noise(APPROACH_BASE + place_offset)
+    down_place = add_noise(DOWN_BASE + place_offset)
+
+    return [
+        ("HOME", HOME.copy(), GRIPPER_OPEN),
+        ("APPROACH_PICK", approach_pick, GRIPPER_OPEN),
+        ("DOWN_PICK", down_pick, GRIPPER_OPEN),
+        ("CLOSE", down_pick, GRIPPER_CLOSED),
+        ("LIFT", approach_pick, GRIPPER_CLOSED),
+        ("MOVE_TO_PLACE", move_place, GRIPPER_CLOSED),
+        ("DOWN_PLACE", down_place, GRIPPER_CLOSED),
+        ("OPEN", down_place, GRIPPER_OPEN),
+        ("RETRACT", move_place, GRIPPER_OPEN),
+        ("HOME_END", HOME.copy(), GRIPPER_OPEN),
+    ]
+
+
+def _make_pick_place_waypoints_ik(
+    ik_solver: Any,
+    pick_pos: tuple[float, float],
+    place_pos: tuple[float, float],
+    table_top_z: float,
+    object_height: float,
+    rng: np.random.Generator,
+) -> list[tuple[str, np.ndarray, float]] | None:
+    if ik_solver is None:
+        return None
+
+    grasp_z = float(table_top_z + max(IK_GRASP_Z_OFFSET, object_height + 0.02))
+    approach_z = float(grasp_z + IK_APPROACH_Z_OFFSET)
+    pose_targets = {
+        "APPROACH_PICK": np.array([pick_pos[0], pick_pos[1], approach_z], dtype=np.float32),
+        "DOWN_PICK": np.array([pick_pos[0], pick_pos[1], grasp_z], dtype=np.float32),
+        "MOVE_TO_PLACE": np.array([place_pos[0], place_pos[1], approach_z], dtype=np.float32),
+        "DOWN_PLACE": np.array([place_pos[0], place_pos[1], grasp_z], dtype=np.float32),
+    }
+
+    solved: dict[str, np.ndarray] = {}
+    for name in ("APPROACH_PICK", "DOWN_PICK", "MOVE_TO_PLACE", "DOWN_PLACE"):
+        q = _solve_ik_arm_target(ik_solver, pose_targets[name])
+        if q is None:
+            LOG.warning("IK waypoint '%s' failed, falling back to joint-offset planner", name)
+            return None
+        noise = rng.uniform(-0.01, 0.01, size=q.shape).astype(np.float32)
+        solved[name] = (q + noise).astype(np.float32)
+
+    return [
+        ("HOME", HOME.copy(), GRIPPER_OPEN),
+        ("APPROACH_PICK", solved["APPROACH_PICK"], GRIPPER_OPEN),
+        ("DOWN_PICK", solved["DOWN_PICK"], GRIPPER_OPEN),
+        ("CLOSE", solved["DOWN_PICK"], GRIPPER_CLOSED),
+        ("LIFT", solved["APPROACH_PICK"], GRIPPER_CLOSED),
+        ("MOVE_TO_PLACE", solved["MOVE_TO_PLACE"], GRIPPER_CLOSED),
+        ("DOWN_PLACE", solved["DOWN_PLACE"], GRIPPER_CLOSED),
+        ("OPEN", solved["DOWN_PLACE"], GRIPPER_OPEN),
+        ("RETRACT", solved["MOVE_TO_PLACE"], GRIPPER_OPEN),
+        ("HOME_END", HOME.copy(), GRIPPER_OPEN),
+    ]
+
+
+def _sample_place_from_pick(
+    rng: np.random.Generator,
+    x_range: tuple[float, float],
+    y_range: tuple[float, float],
+    pick_pos: tuple[float, float],
+) -> tuple[float, float]:
+    place_x = float(pick_pos[0])
+    place_y = float(pick_pos[1])
+    for _ in range(100):
+        place_x = float(rng.uniform(*x_range))
+        place_y = float(rng.uniform(*y_range))
+        dist = float(np.linalg.norm(np.array([place_x - pick_pos[0], place_y - pick_pos[1]], dtype=np.float32)))
+        if dist >= MIN_PICK_PLACE_DIST:
+            break
+
+    return place_x, place_y
+
+
+def _run_pick_place_episode(
+    episode_index: int,
+    world: Any,
+    franka: Any,
+    cameras: dict[str, Any],
+    stage: Any,
+    eef_prim_path: str,
+    get_prim_at_path: Any,
+    usd: Any,
+    usd_geom: Any,
+    writer: SimLeRobotWriter,
+    rng: np.random.Generator,
+    fps: int,
+    steps_per_segment: int,
+    object_prim_path: str,
+    ik_solver: Any,
+    table_x_range: tuple[float, float],
+    table_y_range: tuple[float, float],
+    table_top_z: float,
+    work_center: tuple[float, float],
+    gf: Any,
+    stop_event: threading.Event | None = None,
+) -> tuple[int, bool]:
+    world.reset()
+    for _ in range(10):
+        world.step(render=True)
+
+    for cam_obj in cameras.values():
+        if hasattr(cam_obj, "initialize"):
+            try:
+                cam_obj.initialize()
+            except Exception as exc:
+                LOG.warning("Camera initialize() failed after reset: %s", exc)
+
+    obj_pos, _ = _get_prim_world_pose(stage, object_prim_path, usd, usd_geom)
+    pick_x = float(np.clip(obj_pos[0], table_x_range[0], table_x_range[1]))
+    pick_y = float(np.clip(obj_pos[1], table_y_range[0], table_y_range[1]))
+    pick_pos = (pick_x, pick_y)
+    if abs(pick_x - float(obj_pos[0])) > 1e-3 or abs(pick_y - float(obj_pos[1])) > 1e-3:
+        LOG.warning(
+            "collect: object pick pose clamped into workspace: raw=(%.3f, %.3f), clamped=(%.3f, %.3f)",
+            float(obj_pos[0]),
+            float(obj_pos[1]),
+            pick_x,
+            pick_y,
+        )
+    place_pos = _sample_place_from_pick(rng, table_x_range, table_y_range, pick_pos)
+    object_height = _estimate_object_height(stage, object_prim_path, usd_geom, fallback=OBJECT_SIZE)
+
+    for _ in range(10):
+        world.step(render=True)
+
+    waypoints = _make_pick_place_waypoints_ik(
+        ik_solver=ik_solver,
+        pick_pos=pick_pos,
+        place_pos=place_pos,
+        table_top_z=table_top_z,
+        object_height=object_height,
+        rng=rng,
+    )
+    if waypoints is None:
+        waypoints = _make_pick_place_waypoints(pick_pos, place_pos, rng, work_center=work_center)
+    _, home_arm, home_gripper = waypoints[0]
+    for _ in range(30):
+        arm_cmd, gr_cmd = _step_toward_joint_targets(franka, home_arm, home_gripper)
+        _set_joint_targets(franka, arm_cmd, gr_cmd, physics_control=True)
+        world.step(render=True)
+
+    frame_index = 0
+    stopped = False
+    transitions = list(zip(waypoints[:-1], waypoints[1:]))
+
+    for transition_idx, (start_wp, end_wp) in enumerate(transitions):
+        start_name, start_arm, start_gripper = start_wp
+        end_name, end_arm, end_gripper = end_wp
+
+        for step in range(steps_per_segment):
+            if stop_event is not None and stop_event.is_set():
+                stopped = True
+                break
+
+            alpha = float(step + 1) / float(steps_per_segment)
+            arm_target = ((1.0 - alpha) * start_arm + alpha * end_arm).astype(np.float32)
+            gripper_target = float((1.0 - alpha) * start_gripper + alpha * end_gripper)
+
+            arm_cmd, gr_cmd = _step_toward_joint_targets(franka, arm_target, gripper_target)
+            _set_joint_targets(franka, arm_cmd, gr_cmd, physics_control=True)
+            world.step(render=True)
+
+            state = _extract_state_vector(franka, stage, eef_prim_path, get_prim_at_path, usd, usd_geom)
+            action = np.concatenate([arm_target, np.array([gripper_target], dtype=np.float32)], axis=0)
+            action = _pad_or_trim(action, ACTION_DIM)
+            is_last = transition_idx == (len(transitions) - 1) and step == (steps_per_segment - 1)
+            writer.add_frame(
+                episode_index=episode_index,
+                frame_index=frame_index,
+                observation_state=state,
+                action=action,
+                timestamp=frame_index / float(fps),
+                next_done=is_last,
+            )
+            for cam_name, cam_obj in cameras.items():
+                rgb = _capture_rgb(cam_obj, CAMERA_RESOLUTION)
+                writer.add_video_frame(cam_name, rgb)
+
+            frame_index += 1
+
+        if stopped:
+            break
+
+        if end_name == "CLOSE":
+            for _ in range(8):
+                arm_cmd, gr_cmd = _step_toward_joint_targets(franka, end_arm, end_gripper)
+                _set_joint_targets(franka, arm_cmd, gr_cmd, physics_control=True)
+                world.step(render=True)
+            # Pure physics grasp: no fixed-joint attach.
+            # Hold close for extra frames so contact/friction can settle.
+            for _ in range(12):
+                arm_cmd, gr_cmd = _step_toward_joint_targets(franka, end_arm, end_gripper)
+                _set_joint_targets(franka, arm_cmd, gr_cmd, physics_control=True)
+                world.step(render=True)
+
+        if end_name == "OPEN":
+            for _ in range(8):
+                arm_cmd, gr_cmd = _step_toward_joint_targets(franka, end_arm, end_gripper)
+                _set_joint_targets(franka, arm_cmd, gr_cmd, physics_control=True)
+                world.step(render=True)
+
+    if stopped and writer.all_frames:
+        last = writer.all_frames[-1]
+        if int(last.get("episode_index", -1)) == episode_index:
+            last["next.done"] = True
+
+    if not stopped:
+        obj_pos, _ = _get_prim_world_pose(stage, object_prim_path, usd, usd_geom)
+        place_dist = float(np.linalg.norm(obj_pos[:2] - np.array(place_pos, dtype=np.float32)))
+        LOG.info(
+            "Episode %d done: pick=(%.3f, %.3f) place=(%.3f, %.3f) final_obj=(%.3f, %.3f, %.3f) dist=%.3f",
+            episode_index + 1,
+            pick_pos[0],
+            pick_pos[1],
+            place_pos[0],
+            place_pos[1],
+            obj_pos[0],
+            obj_pos[1],
+            obj_pos[2],
+            place_dist,
+        )
+    else:
+        LOG.info("Episode %d interrupted by stop event", episode_index + 1)
+
+    return frame_index, stopped
+
+
+def _setup_pick_place_scene_template(
+    world: Any,
+    simulation_app: Any,
+    fps: int,
+    rng: np.random.Generator,
+) -> dict[str, Any]:
+    import omni.usd
+    from omni.isaac.core.articulations import Articulation
+    from omni.isaac.core.objects import FixedCuboid
+    from omni.isaac.core.utils.prims import get_prim_at_path
+    from omni.isaac.sensor import Camera
+    from isaacsim.core.utils.stage import add_reference_to_stage
+    from isaacsim.storage.native import get_assets_root_path
+    from pxr import Gf, Usd, UsdGeom, UsdLux, UsdPhysics, UsdShade
+
+    stage = omni.usd.get_context().get_stage()
+    if stage is None:
+        raise RuntimeError("USD stage is not available")
+
+    _remove_prim_if_exists(stage, COLLECTOR_ROOT)
+    UsdGeom.Xform.Define(stage, COLLECTOR_ROOT)
+
+    table = FixedCuboid(
+        prim_path=TABLE_PRIM_PATH,
+        name=f"table_{int(time.time() * 1000) % 100000}",
+        position=np.array([0.5, 0.0, 0.4], dtype=np.float32),
+        size=1.0,
+        scale=np.array([0.6, 0.8, 0.02], dtype=np.float32),
+        color=np.array([0.6, 0.4, 0.2], dtype=np.float32),
+    )
+
+    assets_root = get_assets_root_path()
+    if not assets_root:
+        raise RuntimeError("Cannot resolve Isaac Sim assets root path")
+    added = False
+    for franka_usd in _franka_usd_candidates(assets_root):
+        add_reference_to_stage(usd_path=franka_usd, prim_path=ROBOT_PRIM_PATH)
+        simulation_app.update()
+        if _looks_like_franka_root(stage, ROBOT_PRIM_PATH):
+            added = True
+            break
+        _remove_prim_if_exists(stage, ROBOT_PRIM_PATH)
+    if not added:
+        raise RuntimeError("Failed to add Franka robot from available asset paths")
+
+    franka_prim = stage.GetPrimAtPath(ROBOT_PRIM_PATH)
+    if not franka_prim or not franka_prim.IsValid():
+        raise RuntimeError(f"Franka prim missing at {ROBOT_PRIM_PATH}")
+
+    try:
+        translate_attr = franka_prim.GetAttribute("xformOp:translate")
+        if translate_attr and translate_attr.IsValid():
+            translate_attr.Set(Gf.Vec3d(0.0, 0.0, 0.0))
+        else:
+            xformable = UsdGeom.Xformable(franka_prim)
+            xformable.AddTranslateOp().Set(Gf.Vec3d(0.0, 0.0, 0.0))
+    except Exception as exc:
+        LOG.warning("Ignoring Franka translate warning: %s", exc)
+
+    wrist_cam_usd = UsdGeom.Camera.Define(stage, WRIST_CAM_PATH)
+    wrist_prim = wrist_cam_usd.GetPrim()
+    wrist_xform = UsdGeom.Xformable(wrist_prim)
+    wrist_xform.ClearXformOpOrder()
+    # Place wrist camera slightly in front of the hand and pitch downward
+    # so fingers + grasp target remain in view.
+    wrist_xform.AddTranslateOp().Set(Gf.Vec3d(0.03, 0.0, 0.06))
+    wrist_xform.AddRotateXYZOp().Set(Gf.Vec3f(70.0, 0.0, 0.0))
+    wrist_cam_usd.GetFocalLengthAttr().Set(14.0)
+    wrist_cam_usd.GetClippingRangeAttr().Set(Gf.Vec2f(0.01, 1000.0))
+
+    overhead_cam_usd = UsdGeom.Camera.Define(stage, OVERHEAD_CAM_PATH)
+    overhead_prim = overhead_cam_usd.GetPrim()
+    overhead_xform = UsdGeom.Xformable(overhead_prim)
+    overhead_xform.ClearXformOpOrder()
+    overhead_xform.AddTranslateOp().Set(Gf.Vec3d(0.5, 0.0, 1.6))
+    overhead_xform.AddRotateXYZOp().Set(Gf.Vec3f(0.0, 0.0, 0.0))
+    overhead_cam_usd.GetFocalLengthAttr().Set(14.0)
+    overhead_cam_usd.GetClippingRangeAttr().Set(Gf.Vec2f(0.01, 1000.0))
+
+    dome = UsdLux.DomeLight.Define(stage, f"{COLLECTOR_ROOT}/DomeLight")
+    dome.GetIntensityAttr().Set(3000.0)
+
+    key = UsdLux.DistantLight.Define(stage, f"{COLLECTOR_ROOT}/KeyLight")
+    key.GetIntensityAttr().Set(5000.0)
+    key_xf = UsdGeom.Xformable(key.GetPrim())
+    key_xf.AddRotateXYZOp().Set(Gf.Vec3f(-45.0, 30.0, 0.0))
+
+    work = UsdLux.SphereLight.Define(stage, f"{COLLECTOR_ROOT}/WorkLight")
+    work.GetIntensityAttr().Set(15000.0)
+    work.GetRadiusAttr().Set(0.15)
+    work_xf = UsdGeom.Xformable(work.GetPrim())
+    work_xf.AddTranslateOp().Set(Gf.Vec3d(0.5, 0.0, 1.2))
+
+    target_object = DynamicCuboid(
+        prim_path=OBJECT_PRIM_PATH,
+        name=f"pick_object_{int(time.time() * 1000) % 100000}",
+        position=np.array([0.5, 0.0, TABLE_Z + OBJECT_SIZE / 2.0], dtype=np.float32),
+        size=OBJECT_SIZE,
+        color=rng.uniform(0.2, 0.9, size=3).astype(np.float32),
+        mass=OBJECT_MASS,
+    )
+
+    grip_mat = UsdShade.Material.Define(stage, MATERIAL_PRIM_PATH)
+    physics_api = UsdPhysics.MaterialAPI.Apply(grip_mat.GetPrim())
+    physics_api.CreateStaticFrictionAttr(1.5)
+    physics_api.CreateDynamicFrictionAttr(1.0)
+    physics_api.CreateRestitutionAttr(0.0)
+
+    obj_prim = stage.GetPrimAtPath(OBJECT_PRIM_PATH)
+    if obj_prim and obj_prim.IsValid():
+        UsdShade.MaterialBindingAPI.Apply(obj_prim).Bind(
+            grip_mat,
+            UsdShade.Tokens.weakerThanDescendants,
+            "physics",
+        )
+
+    for _ in range(80):
+        simulation_app.update()
+
+    articulation_prim_path = _resolve_articulation_root_prim_path(stage, ROBOT_PRIM_PATH, UsdPhysics) or ROBOT_PRIM_PATH
+    franka = Articulation(prim_path=articulation_prim_path, name=f"franka_pick_place_{int(time.time())}")
+    world.scene.add(franka)
+
+    camera_high = Camera(
+        prim_path=OVERHEAD_CAM_PATH,
+        name=f"cam_high_{int(time.time() * 1000) % 100000}",
+        frequency=fps,
+        resolution=CAMERA_RESOLUTION,
+    )
+    camera_wrist = Camera(
+        prim_path=WRIST_CAM_PATH,
+        name=f"cam_wrist_{int(time.time() * 1000) % 100000}",
+        frequency=fps,
+        resolution=CAMERA_RESOLUTION,
+    )
+    world.scene.add(camera_high)
+    world.scene.add(camera_wrist)
+    world.scene.add(table)
+    world.scene.add(target_object)
+
+    world.reset()
+    for _ in range(30):
+        world.step(render=True)
+
+    if hasattr(franka, "initialize"):
+        try:
+            franka.initialize()
+        except Exception as exc:
+            LOG.warning("Franka initialize() failed: %s", exc)
+    _wait_articulation_ready(franka, world, steps=40)
+
+    for cam in (camera_high, camera_wrist):
+        if hasattr(cam, "initialize"):
+            try:
+                cam.initialize()
+            except Exception as exc:
+                LOG.warning("Camera initialize() failed: %s", exc)
+
+    eef_prim_path = _resolve_eef_prim(stage, ROBOT_PRIM_PATH, get_prim_at_path)
+    if eef_prim_path is None:
+        eef_prim_path = f"{ROBOT_PRIM_PATH}/panda_hand"
+    ik_solver = _create_franka_ik_solver(
+        franka=franka,
+        stage=stage,
+        robot_prim_path=ROBOT_PRIM_PATH,
+        eef_prim_path=eef_prim_path,
+        usd=Usd,
+        usd_geom=UsdGeom,
+    )
+
+    table_x_range, table_y_range, table_top_z, work_center = _infer_table_workspace(stage, UsdGeom)
+    table_x_range, table_y_range, table_top_z, work_center = _adjust_workspace_for_robot_reach(
+        stage=stage,
+        usd_geom=UsdGeom,
+        robot_prim_path=ROBOT_PRIM_PATH,
+        table_x_range=table_x_range,
+        table_y_range=table_y_range,
+        table_top_z=table_top_z,
+        work_center=work_center,
+    )
+
+    return {
+        "stage": stage,
+        "franka": franka,
+        "articulation_prim_path": articulation_prim_path,
+        "cameras": {"cam_high": camera_high, "cam_wrist": camera_wrist},
+        "ik_solver": ik_solver,
+        "object_prim_path": OBJECT_PRIM_PATH,
+        "robot_prim_path": ROBOT_PRIM_PATH,
+        "eef_prim_path": eef_prim_path,
+        "get_prim_at_path": get_prim_at_path,
+        "usd": Usd,
+        "usd_geom": UsdGeom,
+        "gf": Gf,
+        "table_x_range": table_x_range,
+        "table_y_range": table_y_range,
+        "table_top_z": table_top_z,
+        "work_center": work_center,
+    }
+
+
+def _setup_pick_place_scene_reuse_or_patch(
+    world: Any,
+    simulation_app: Any,
+    fps: int,
+    rng: np.random.Generator,
+    target_objects: Optional[Sequence[str]] = None,
+) -> dict[str, Any]:
+    import omni.usd
+    from omni.isaac.core.articulations import Articulation
+    from omni.isaac.core.objects import DynamicCuboid, FixedCuboid
+    from omni.isaac.sensor import Camera
+    from isaacsim.core.utils.stage import add_reference_to_stage
+    from isaacsim.storage.native import get_assets_root_path
+    from pxr import Gf, Usd, UsdGeom, UsdPhysics
+
+    stage = omni.usd.get_context().get_stage()
+    if stage is None:
+        raise RuntimeError("USD stage is not available")
+
+    table_added = False
+    table_root = _resolve_table_prim(stage, UsdGeom)
+    if table_root is None:
+        if _prim_is_valid(stage, "/World/Table"):
+            table_root = "/World/Table"
+            LOG.info("collect: fallback reusing existing /World/Table")
+        else:
+            table_root = "/World/Table"
+            table = FixedCuboid(
+                prim_path=table_root,
+                name=f"table_collect_{int(time.time() * 1000) % 100000}",
+                position=np.array([0.0, 0.0, 0.75], dtype=np.float32),
+                size=1.0,
+                scale=np.array([1.2, 0.8, 0.04], dtype=np.float32),
+                color=np.array([0.6, 0.4, 0.2], dtype=np.float32),
+            )
+            world.scene.add(table)
+            table_added = True
+            LOG.info("collect: missing table -> added %s", table_root)
+    else:
+        LOG.info("collect: reusing table at %s", table_root)
+
+    robot_prim_path = _resolve_robot_prim(stage)
+    if robot_prim_path is None:
+        assets_root = get_assets_root_path()
+        if not assets_root:
+            raise RuntimeError("Cannot resolve Isaac Sim assets root path for Franka")
+        robot_prim_path = _add_franka_reference(
+            stage=stage,
+            simulation_app=simulation_app,
+            add_reference_to_stage=add_reference_to_stage,
+            assets_root=assets_root,
+            usd_geom=UsdGeom,
+            gf=Gf,
+            usd_physics=UsdPhysics,
+            prim_path="/World/FrankaRobot",
+        )
+        LOG.info("collect: missing Franka -> added %s", robot_prim_path)
+    else:
+        # Existing Franka prim can be an unloaded/incomplete reference in interactive scenes.
+        # If articulation root is not ready, re-add a known-good Franka reference once.
+        for _ in range(6):
+            simulation_app.update()
+        if not _has_articulation_root(stage, robot_prim_path, UsdPhysics):
+            LOG.warning("collect: existing Franka not articulation-ready at %s, reloading", robot_prim_path)
+            _remove_prim_if_exists(stage, robot_prim_path)
+            assets_root = get_assets_root_path()
+            if not assets_root:
+                raise RuntimeError("Cannot resolve Isaac Sim assets root path for Franka reload")
+            robot_prim_path = _add_franka_reference(
+                stage=stage,
+                simulation_app=simulation_app,
+                add_reference_to_stage=add_reference_to_stage,
+                assets_root=assets_root,
+                usd_geom=UsdGeom,
+                gf=Gf,
+                usd_physics=UsdPhysics,
+                prim_path="/World/FrankaRobot",
+            )
+            LOG.info("collect: reloaded Franka at %s", robot_prim_path)
+
+    articulation_prim_path = _resolve_articulation_root_prim_path(stage, robot_prim_path, UsdPhysics)
+    if not articulation_prim_path:
+        raise RuntimeError(f"collect cannot find articulation root under {robot_prim_path}")
+
+    object_prim_path = _resolve_target_object_prim(stage, UsdGeom, target_hints=target_objects)
+    if object_prim_path is None:
+        table_x_range, table_y_range, table_top_z, work_center = _infer_table_workspace(
+            stage,
+            UsdGeom,
+            table_prim_path=table_root,
+        )
+        table_x_range, table_y_range, table_top_z, work_center = _adjust_workspace_for_robot_reach(
+            stage=stage,
+            usd_geom=UsdGeom,
+            robot_prim_path=robot_prim_path,
+            table_x_range=table_x_range,
+            table_y_range=table_y_range,
+            table_top_z=table_top_z,
+            work_center=work_center,
+        )
+        obj_x = float((table_x_range[0] + table_x_range[1]) * 0.5)
+        obj_y = float((table_y_range[0] + table_y_range[1]) * 0.5)
+        object_prim_path = "/World/PickObject"
+        _remove_prim_if_exists(stage, object_prim_path)
+        UsdGeom.Xform.Define(stage, object_prim_path)
+        cube = UsdGeom.Cube.Define(stage, f"{object_prim_path}/Body")
+        cube.GetSizeAttr().Set(1.0)
+        bx = UsdGeom.Xformable(cube.GetPrim())
+        bx.ClearXformOpOrder()
+        bx.AddScaleOp().Set(Gf.Vec3d(OBJECT_SIZE, OBJECT_SIZE, OBJECT_SIZE))
+        root = stage.GetPrimAtPath(object_prim_path)
+        rx = UsdGeom.Xformable(root)
+        rx.ClearXformOpOrder()
+        rx.AddTranslateOp().Set(Gf.Vec3d(obj_x, obj_y, table_top_z + OBJECT_SIZE / 2.0 + 0.003))
+        UsdPhysics.RigidBodyAPI.Apply(root)
+        UsdPhysics.CollisionAPI.Apply(cube.GetPrim())
+        try:
+            UsdPhysics.MeshCollisionAPI.Apply(cube.GetPrim())
+        except Exception:
+            pass
+        LOG.info("collect: missing grasp object -> added %s", object_prim_path)
+
+    # Ensure chosen object has basic rigid/collision physics for pure physical grasp.
+    obj_root = stage.GetPrimAtPath(object_prim_path)
+    if obj_root and obj_root.IsValid() and not obj_root.HasAPI(UsdPhysics.RigidBodyAPI):
+        try:
+            UsdPhysics.RigidBodyAPI.Apply(obj_root)
+        except Exception:
+            pass
+    if obj_root and obj_root.IsValid():
+        for p in _iter_descendants(obj_root):
+            if not p or not p.IsValid() or not p.IsA(UsdGeom.Mesh):
+                continue
+            try:
+                if not p.HasAPI(UsdPhysics.CollisionAPI):
+                    UsdPhysics.CollisionAPI.Apply(p)
+                if not p.HasAPI(UsdPhysics.MeshCollisionAPI):
+                    UsdPhysics.MeshCollisionAPI.Apply(p)
+            except Exception:
+                pass
+
+    table_x_range, table_y_range, table_top_z, work_center = _infer_table_workspace(
+        stage,
+        UsdGeom,
+        table_prim_path=table_root,
+    )
+    table_x_range, table_y_range, table_top_z, work_center = _adjust_workspace_for_robot_reach(
+        stage=stage,
+        usd_geom=UsdGeom,
+        robot_prim_path=robot_prim_path,
+        table_x_range=table_x_range,
+        table_y_range=table_y_range,
+        table_top_z=table_top_z,
+        work_center=work_center,
+    )
+
+    overhead_cam_path = "/World/OverheadCam"
+    overhead_prim = stage.GetPrimAtPath(overhead_cam_path)
+    if not overhead_prim or not overhead_prim.IsValid() or not overhead_prim.IsA(UsdGeom.Camera):
+        over_usd = UsdGeom.Camera.Define(stage, overhead_cam_path)
+        LOG.info("collect: missing overhead camera -> added %s", overhead_cam_path)
+    over_prim = stage.GetPrimAtPath(overhead_cam_path)
+    if over_prim and over_prim.IsValid():
+        over_usd = UsdGeom.Camera(over_prim)
+        over_xf = UsdGeom.Xformable(over_prim)
+        over_xf.ClearXformOpOrder()
+        over_xf.AddTranslateOp().Set(Gf.Vec3d(float(work_center[0]), float(work_center[1]), 1.6))
+        over_xf.AddRotateXYZOp().Set(Gf.Vec3f(0.0, 0.0, 0.0))
+        try:
+            over_usd.GetFocalLengthAttr().Set(14.0)
+            over_usd.GetClippingRangeAttr().Set(Gf.Vec2f(0.01, 1000.0))
+        except Exception:
+            pass
+
+    wrist_cam_path = f"{robot_prim_path}/panda_hand/wrist_cam"
+    wrist_prim = stage.GetPrimAtPath(wrist_cam_path)
+    if not wrist_prim or not wrist_prim.IsValid() or not wrist_prim.IsA(UsdGeom.Camera):
+        wrist_usd = UsdGeom.Camera.Define(stage, wrist_cam_path)
+        LOG.info("collect: missing wrist camera -> added %s", wrist_cam_path)
+    wrist_prim = stage.GetPrimAtPath(wrist_cam_path)
+    if wrist_prim and wrist_prim.IsValid():
+        wrist_usd = UsdGeom.Camera(wrist_prim)
+        wrist_xf = UsdGeom.Xformable(wrist_prim)
+        wrist_xf.ClearXformOpOrder()
+        wrist_xf.AddTranslateOp().Set(Gf.Vec3d(0.03, 0.0, 0.06))
+        wrist_xf.AddRotateXYZOp().Set(Gf.Vec3f(70.0, 0.0, 0.0))
+        try:
+            wrist_usd.GetFocalLengthAttr().Set(14.0)
+            wrist_usd.GetClippingRangeAttr().Set(Gf.Vec2f(0.01, 1000.0))
+        except Exception:
+            pass
+
+    for _ in range(40 if table_added else 20):
+        simulation_app.update()
+
+    franka = Articulation(prim_path=articulation_prim_path, name=f"franka_collect_{int(time.time())}")
+    world.scene.add(franka)
+    camera_high = Camera(
+        prim_path=overhead_cam_path,
+        name=f"cam_high_{int(time.time() * 1000) % 100000}",
+        frequency=fps,
+        resolution=CAMERA_RESOLUTION,
+    )
+    camera_wrist = Camera(
+        prim_path=wrist_cam_path,
+        name=f"cam_wrist_{int(time.time() * 1000) % 100000}",
+        frequency=fps,
+        resolution=CAMERA_RESOLUTION,
+    )
+    world.scene.add(camera_high)
+    world.scene.add(camera_wrist)
+
+    world.reset()
+    for _ in range(20):
+        world.step(render=True)
+
+    if hasattr(franka, "initialize"):
+        try:
+            franka.initialize()
+        except Exception as exc:
+            LOG.warning("Franka initialize() failed: %s", exc)
+    _wait_articulation_ready(franka, world, steps=40)
+    for cam in (camera_high, camera_wrist):
+        if hasattr(cam, "initialize"):
+            try:
+                cam.initialize()
+            except Exception as exc:
+                LOG.warning("Camera initialize() failed: %s", exc)
+
+    from omni.isaac.core.utils.prims import get_prim_at_path
+
+    eef_prim_path = _resolve_eef_prim(stage, robot_prim_path, get_prim_at_path) or f"{robot_prim_path}/panda_hand"
+    ik_solver = _create_franka_ik_solver(
+        franka=franka,
+        stage=stage,
+        robot_prim_path=robot_prim_path,
+        eef_prim_path=eef_prim_path,
+        usd=Usd,
+        usd_geom=UsdGeom,
+    )
+
+    return {
+        "stage": stage,
+        "franka": franka,
+        "articulation_prim_path": articulation_prim_path,
+        "cameras": {"cam_high": camera_high, "cam_wrist": camera_wrist},
+        "ik_solver": ik_solver,
+        "object_prim_path": object_prim_path,
+        "robot_prim_path": robot_prim_path,
+        "eef_prim_path": eef_prim_path,
+        "get_prim_at_path": get_prim_at_path,
+        "usd": Usd,
+        "usd_geom": UsdGeom,
+        "gf": Gf,
+        "table_x_range": table_x_range,
+        "table_y_range": table_y_range,
+        "table_top_z": table_top_z,
+        "work_center": work_center,
+        "table_prim_path": table_root,
+    }
+
+
+def run_collection_in_process(
+    world: Any,
+    simulation_app: Any,
+    num_episodes: int,
+    output_dir: str,
+    stop_event: threading.Event,
+    progress_callback: Callable[[int], None] | None = None,
+    fps: int = FPS,
+    steps_per_segment: int = STEPS_PER_SEGMENT,
+    seed: int = 12345,
+    task_name: str = "pick_place",
+    scene_mode: str = "auto",
+    target_objects: Optional[Sequence[str]] = None,
+    dataset_repo_id: Optional[str] = None,
+) -> dict[str, Any]:
+    if num_episodes <= 0:
+        raise ValueError("num_episodes must be > 0")
+    if fps <= 0:
+        raise ValueError("fps must be > 0")
+    if steps_per_segment <= 0:
+        raise ValueError("steps_per_segment must be > 0")
+    task_name = str(task_name or "pick_place")
+    scene_mode = str(scene_mode or "auto").lower()
+
+    os.makedirs(output_dir, exist_ok=True)
+
+    rng = np.random.default_rng(seed)
+    if scene_mode in {"auto", "reuse", "existing", "patch"}:
+        ctx = _setup_pick_place_scene_reuse_or_patch(
+            world=world,
+            simulation_app=simulation_app,
+            fps=fps,
+            rng=rng,
+            target_objects=target_objects,
+        )
+        actual_scene_mode = "reuse_or_patch"
+    elif scene_mode in {"template", "generated"}:
+        ctx = _setup_pick_place_scene_template(world=world, simulation_app=simulation_app, fps=fps, rng=rng)
+        actual_scene_mode = "template"
+    else:
+        raise ValueError(f"Unsupported scene_mode: {scene_mode}")
+
+    writer = SimLeRobotWriter(
+        output_dir=output_dir,
+        repo_id=(str(dataset_repo_id).strip() if dataset_repo_id else _default_dataset_repo_id(output_dir)),
+        fps=fps,
+        robot_type=ROBOT_TYPE,
+        state_dim=STATE_DIM,
+        action_dim=ACTION_DIM,
+        camera_names=CAMERA_NAMES,
+        camera_resolution=CAMERA_RESOLUTION,
+        state_names=STATE_NAMES,
+        action_names=ACTION_NAMES,
+    )
+
+    completed = 0
+    try:
+        for episode in range(num_episodes):
+            if stop_event.is_set():
+                LOG.info("Stop requested before episode %d", episode + 1)
+                break
+
+            LOG.info("Episode %d/%d", episode + 1, num_episodes)
+            episode_start = time.time()
+            episode_frames = 0
+            stopped = False
+            try:
+                episode_frames, stopped = _run_pick_place_episode(
+                    episode_index=episode,
+                    world=world,
+                    franka=ctx["franka"],
+                    cameras=ctx["cameras"],
+                    stage=ctx["stage"],
+                    eef_prim_path=ctx["eef_prim_path"],
+                    get_prim_at_path=ctx["get_prim_at_path"],
+                    usd=ctx["usd"],
+                    usd_geom=ctx["usd_geom"],
+                    writer=writer,
+                    rng=rng,
+                    fps=fps,
+                    steps_per_segment=steps_per_segment,
+                    object_prim_path=ctx["object_prim_path"],
+                    ik_solver=ctx.get("ik_solver"),
+                    table_x_range=ctx["table_x_range"],
+                    table_y_range=ctx["table_y_range"],
+                    table_top_z=ctx["table_top_z"],
+                    work_center=ctx["work_center"],
+                    gf=ctx["gf"],
+                    stop_event=stop_event,
+                )
+            finally:
+                writer.finish_episode(
+                    episode_index=episode,
+                    length=episode_frames,
+                    task=task_name,
+                )
+                LOG.info(
+                    "Episode %d finished with %d frames in %.2fs",
+                    episode + 1,
+                    episode_frames,
+                    time.time() - episode_start,
+                )
+
+            completed += 1
+            if progress_callback is not None:
+                progress_callback(completed)
+
+            if stopped:
+                break
+
+        writer.finalize()
+    except Exception:
+        writer.finalize()
+        raise
+
+    return {
+        "completed": completed,
+        "requested": num_episodes,
+        "output_dir": output_dir,
+        "stopped": bool(stop_event.is_set()),
+        "scene_mode": actual_scene_mode,
+        "target_object": ctx["object_prim_path"],
+    }
+
+
+def main() -> int:
+    args = _parse_args()
+
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(name)s] %(levelname)s %(message)s",
+    )
+
+    if args.num_episodes <= 0:
+        LOG.error("--num-episodes must be > 0")
+        return 1
+    if args.fps <= 0:
+        LOG.error("--fps must be > 0")
+        return 1
+    if args.steps_per_segment <= 0:
+        LOG.error("--steps-per-segment must be > 0")
+        return 1
+
+    LOG.info("Starting pick-place collector. headless=%s episodes=%d", args.headless, args.num_episodes)
+    LOG.info("Expected launcher: /isaac-sim/python.sh (current python: %s)", sys.executable)
+
+    simulation_app = None
+    try:
+        from isaacsim import SimulationApp
+
+        app_config = {
+            "headless": bool(args.headless),
+            "width": 640,
+            "height": 480,
+            "extra_args": [
+                "--/rtx/sceneDb/maxTLASBuildSize=536870912",
+                "--/renderer/multiGpu/enabled=False",
+            ],
+        }
+        if args.streaming:
+            app_config["livestream_port"] = args.streaming_port
+
+        simulation_app = SimulationApp(app_config)
+
+        if args.streaming:
+            try:
+                import omni.kit.app
+                import carb
+
+                ext_manager = omni.kit.app.get_app().get_extension_manager()
+                ext_manager.set_extension_enabled_immediate("omni.services.livestream.nvcf", True)
+                settings = carb.settings.get_settings()
+                settings.set("/app/livestream/port", args.streaming_port)
+                LOG.info("WebRTC streaming enabled on port %d", args.streaming_port)
+            except Exception as exc:
+                LOG.warning("Failed to enable streaming (continuing): %s", exc)
+
+        from omni.isaac.core import World
+
+        world = World(physics_dt=1.0 / 120.0, rendering_dt=1.0 / 30.0)
+        world.scene.add_default_ground_plane()
+
+        stop_event = threading.Event()
+        result = run_collection_in_process(
+            world=world,
+            simulation_app=simulation_app,
+            num_episodes=args.num_episodes,
+            output_dir=args.output,
+            stop_event=stop_event,
+            progress_callback=lambda ep: LOG.info("Progress: %d/%d", ep, args.num_episodes),
+            fps=args.fps,
+            steps_per_segment=args.steps_per_segment,
+            seed=args.seed,
+            task_name=args.task_name,
+        )
+
+        LOG.info("Collection complete: %s", result)
+        return 0
+    except Exception as exc:
+        LOG.exception("Collector failed: %s", exc)
+        return 1
+    finally:
+        if simulation_app is not None:
+            try:
+                simulation_app.close()
+            except Exception as exc:
+                LOG.warning("Failed to close SimulationApp cleanly: %s", exc)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -1,0 +1,17 @@
+{
+  "overall_score": 8,
+  "reject_regions": [],
+  "needs_more": [
+    "handle"
+  ],
+  "issues": [
+    "Handle grasps are concentrated on the outer curve and lack coverage on the inner side and top surface of the handle.",
+    "Some handle grasps have approach vectors that may collide with the cup body or are too shallow for stable grip.",
+    "Rim grasps are mostly on the top edge but lack diversity in approach angles, especially from the side views."
+  ],
+  "suggestions": [
+    "Add grasps on the inner surface and top of the handle to improve coverage and stability.",
+    "Distribute rim grasps more evenly around the circumference with varied approach directions.",
+    "Consider adding a few grasps on the cup body near the base for alternative picking orientations."
+  ]
+}

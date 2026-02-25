@@ -1,0 +1,271 @@
+[
+  [
+    {
+      "label": "handle",
+      "bbox": [
+        0.58,
+        0.34,
+        0.78,
+        0.58
+      ],
+      "quality": "good",
+      "reason": "curved handle, fits parallel-jaw gripper well, stable grasp"
+    },
+    {
+      "label": "rim",
+      "bbox": [
+        0.23,
+        0.24,
+        0.62,
+        0.41
+      ],
+      "quality": "ok",
+      "reason": "circular rim, sufficient width for gripper, but may slip if not aligned"
+    },
+    {
+      "label": "body",
+      "bbox": [
+        0.23,
+        0.35,
+        0.62,
+        0.68
+      ],
+      "quality": "ok",
+      "reason": "cylindrical body, provides friction, but less stable than handle"
+    }
+  ],
+  [
+    {
+      "label": "handle",
+      "bbox": [
+        0.53,
+        390,
+        720,
+        620
+      ],
+      "quality": "good",
+      "reason": "curved handle, ideal for parallel-jaw gripper with 8cm opening"
+    },
+    {
+      "label": "rim",
+      "bbox": [
+        250,
+        210,
+        640,
+        380
+      ],
+      "quality": "ok",
+      "reason": "wide rim, may require precise alignment but provides stable grasp"
+    },
+    {
+      "label": "body",
+      "bbox": [
+        250,
+        380,
+        640,
+        660
+      ],
+      "quality": "ok",
+      "reason": "cylindrical body, sufficient friction for stable grasp if gripper aligned properly"
+    }
+  ],
+  [
+    {
+      "label": "handle",
+      "bbox": [
+        0.45,
+        0.4,
+        0.55,
+        0.65
+      ],
+      "quality": "good",
+      "reason": "vertical handle with suitable width for parallel-jaw gripper, provides stable grasp"
+    },
+    {
+      "label": "rim",
+      "bbox": [
+        0.32,
+        0.21,
+        0.68,
+        0.35
+      ],
+      "quality": "ok",
+      "reason": "circular rim, may allow stable grasp if gripper aligns properly"
+    },
+    {
+      "label": "body",
+      "bbox": [
+        0.32,
+        0.35,
+        0.68,
+        0.65
+      ],
+      "quality": "ok",
+      "reason": "cylindrical body with sufficient surface area for friction-based grasp"
+    }
+  ],
+  [
+    {
+      "label": "handle",
+      "bbox": [
+        0.28,
+        0.39,
+        0.51,
+        0.62
+      ],
+      "quality": "good",
+      "reason": "curved handle, ideal for parallel-jaw gripper with 8cm opening"
+    },
+    {
+      "label": "rim",
+      "bbox": [
+        0.37,
+        0.22,
+        0.75,
+        0.41
+      ],
+      "quality": "ok",
+      "reason": "wide rim, may require careful alignment but provides stable grasp"
+    },
+    {
+      "label": "body",
+      "bbox": [
+        0.37,
+        0.38,
+        0.75,
+        0.67
+      ],
+      "quality": "ok",
+      "reason": "cylindrical body, sufficient surface area for friction-based grip"
+    }
+  ],
+  [
+    {
+      "label": "handle",
+      "bbox": [
+        0.22,
+        340,
+        0.43,
+        580
+      ],
+      "quality": "good",
+      "reason": "curved handle, ideal for parallel-jaw gripper with 8cm opening"
+    },
+    {
+      "label": "rim",
+      "bbox": [
+        0.39,
+        240,
+        0.78,
+        400
+      ],
+      "quality": "ok",
+      "reason": "circular rim, stable grasp but requires precise alignment"
+    },
+    {
+      "label": "body",
+      "bbox": [
+        0.4,
+        380,
+        0.78,
+        680
+      ],
+      "quality": "ok",
+      "reason": "cylindrical body, sufficient friction for stable grasp"
+    }
+  ],
+  [
+    {
+      "label": "handle",
+      "bbox": [
+        0.29,
+        0.28,
+        0.45,
+        0.51
+      ],
+      "quality": "good",
+      "reason": "curved handle, fits parallel-jaw gripper well"
+    },
+    {
+      "label": "rim",
+      "bbox": [
+        0.37,
+        0.27,
+        0.76,
+        0.41
+      ],
+      "quality": "ok",
+      "reason": "wide rim, may require careful alignment for stable grasp"
+    },
+    {
+      "label": "body",
+      "bbox": [
+        0.37,
+        0.38,
+        0.76,
+        0.73
+      ],
+      "quality": "poor",
+      "reason": "smooth cylindrical surface, low friction, not ideal for parallel-jaw grip"
+    }
+  ],
+  [
+    {
+      "label": "rim",
+      "bbox": [
+        0.31,
+        0.28,
+        0.69,
+        0.42
+      ],
+      "quality": "good",
+      "reason": "wide, flat rim allows stable parallel-jaw grasp with 8cm opening"
+    },
+    {
+      "label": "body",
+      "bbox": [
+        0.31,
+        0.42,
+        0.69,
+        0.74
+      ],
+      "quality": "ok",
+      "reason": "curved body section, may require careful alignment but fits within gripper span"
+    }
+  ],
+  [
+    {
+      "label": "handle",
+      "bbox": [
+        0.58,
+        0.28,
+        0.72,
+        0.51
+      ],
+      "quality": "good",
+      "reason": "curved handle, fits parallel-jaw gripper well"
+    },
+    {
+      "label": "rim",
+      "bbox": [
+        0.25,
+        0.27,
+        0.65,
+        0.45
+      ],
+      "quality": "ok",
+      "reason": "wide rim, stable but may require precise alignment"
+    },
+    {
+      "label": "body",
+      "bbox": [
+        0.25,
+        0.45,
+        0.65,
+        0.73
+      ],
+      "quality": "poor",
+      "reason": "smooth cylindrical surface, low friction, not ideal for stable grasp"
+    }
+  ]
+]

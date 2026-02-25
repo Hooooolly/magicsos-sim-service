@@ -1,0 +1,8 @@
+{
+  "counts": {
+    "handle_only": 8,
+    "body_symmetric_only": 8,
+    "topdown_wall_only": 4
+  },
+  "root": "/data/models/mug_manual_20260225_121546_v1"
+}

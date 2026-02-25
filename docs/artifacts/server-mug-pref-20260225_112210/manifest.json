@@ -1,0 +1,14 @@
+{
+  "variants": [
+    "handle_only",
+    "body_symmetric_only",
+    "topdown_wall_only"
+  ],
+  "counts": {
+    "handle_only": 16,
+    "body_symmetric_only": 12,
+    "topdown_wall_only": 4
+  },
+  "base_dir": "/data/models/grasp_pref_mug_20260225_112210/base",
+  "sym_dir": "/data/models/grasp_pref_mug_20260225_112210/sym"
+}
