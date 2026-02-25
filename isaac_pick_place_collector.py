@@ -115,6 +115,11 @@ REACH_BEFORE_CLOSE_MAX_OBJECT_TIP_MID_XY_DISTANCE = 0.022
 REACH_BEFORE_CLOSE_MAX_ABS_TIP_MID_Z_DELTA = 0.03
 REACH_REQUIRE_TIP_MID = True
 CLOSE_HOLD_STEPS = 8
+try:
+    PRE_CLOSE_SETTLE_STEPS = int(os.environ.get("COLLECT_PRE_CLOSE_SETTLE_STEPS", "18"))
+except Exception:
+    PRE_CLOSE_SETTLE_STEPS = 18
+PRE_CLOSE_SETTLE_STEPS = int(np.clip(PRE_CLOSE_SETTLE_STEPS, 0, 120))
 VERIFY_CLOSE_MIN_GRIPPER_WIDTH = 0.0025
 VERIFY_CLOSE_MAX_OBJECT_EEF_DISTANCE = 0.25
 VERIFY_CLOSE_MAX_OBJECT_EEF_XY_DISTANCE = 0.08
@@ -2995,6 +3000,7 @@ def _run_pick_place_episode(
     def _execute_transitions(
         transitions: list[tuple[Any, Any]],
         live_target_z_by_waypoint: Optional[dict[str, float]] = None,
+        enable_close_hold: bool = True,
     ) -> None:
         nonlocal frame_index, stopped, current_grasp_target
         close_anchor_arm: np.ndarray | None = None
@@ -3113,7 +3119,7 @@ def _run_pick_place_episode(
                 # Stop descending/chasing once we already reached the close gate.
                 continue
 
-            if end_name == "CLOSE":
+            if end_name == "CLOSE" and enable_close_hold:
                 close_arm = (
                     close_anchor_arm.astype(np.float32, copy=False)
                     if close_anchor_arm is not None
@@ -3384,7 +3390,22 @@ def _run_pick_place_episode(
             pick_transitions,
             # Lock to per-attempt planned pose to avoid chasing disturbed mesh during descent.
             live_target_z_by_waypoint=None,
+            # Reach-before-close gate should be evaluated before physically closing gripper.
+            enable_close_hold=False,
         )
+        if stopped:
+            break
+
+        # Settle near close pose with gripper open before reach gate (MagicSim-style).
+        if PRE_CLOSE_SETTLE_STEPS > 0:
+            close_arm_pre = waypoints[close_idx][1]
+            for _ in range(PRE_CLOSE_SETTLE_STEPS):
+                if _timeout_triggered():
+                    break
+                arm_cmd, gr_cmd = _step_toward_joint_targets(franka, close_arm_pre, GRIPPER_OPEN)
+                _set_joint_targets(franka, arm_cmd, gr_cmd, physics_control=True)
+                world.step(render=True)
+                _record_frame(arm_target=close_arm_pre, gripper_target=GRIPPER_OPEN)
         if stopped:
             break
 
