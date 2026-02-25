@@ -1253,7 +1253,9 @@ def _select_ik_frame_name(frame_names: Sequence[str], eef_prim_path: str) -> Opt
         return None
     available = set(frame_names)
     leaf = str(eef_prim_path or "").split("/")[-1]
-    preferred = [leaf, "right_gripper", "panda_hand", "panda_link8", "panda_link7"]
+    # Keep IK target frame aligned with collector pose/metric frame.
+    # Prefer hand-link style frames before custom "right_gripper" aliases.
+    preferred = [leaf, "panda_hand", "panda_hand_tcp", "right_gripper", "panda_link8", "panda_link7"]
     for name in preferred:
         if name and name in available:
             return name
@@ -1288,6 +1290,14 @@ def _create_franka_ik_solver(
             LOG.warning("IK init skipped: no valid end-effector frame")
             return None
         solver = ArticulationKinematicsSolver(franka, lula, frame_name)
+        leaf = str(eef_prim_path or "").split("/")[-1]
+        if leaf and frame_name != leaf:
+            LOG.warning(
+                "IK frame differs from eef prim leaf: eef_prim=%s leaf=%s ik_frame=%s",
+                eef_prim_path,
+                leaf,
+                frame_name,
+            )
         LOG.info("IK solver ready: frame=%s robot=%s", frame_name, robot_prim_path)
         return solver
     except Exception as exc:
@@ -2929,6 +2939,7 @@ def _run_pick_place_episode(
         live_target_z_by_waypoint: Optional[dict[str, float]] = None,
     ) -> None:
         nonlocal frame_index, stopped, current_grasp_target
+        close_anchor_arm: np.ndarray | None = None
 
         def _resolve_live_arm_target(waypoint_name: str, fallback_arm: np.ndarray) -> np.ndarray:
             if not live_target_z_by_waypoint or waypoint_name not in live_target_z_by_waypoint:
@@ -2978,18 +2989,30 @@ def _run_pick_place_episode(
                 if live_target_z_by_waypoint and end_name in live_target_z_by_waypoint
                 else end_arm
             )
+            if end_name == "CLOSE" and close_anchor_arm is not None:
+                resolved_end_arm = close_anchor_arm.copy()
+            segment_steps = 1 if end_name in {"CLOSE", "OPEN"} else steps_per_segment
 
-            for step in range(steps_per_segment):
+            for step in range(segment_steps):
                 if _timeout_triggered():
                     return
                 if stop_event is not None and stop_event.is_set():
                     stopped = True
                     return
 
-                alpha = float(step + 1) / float(steps_per_segment)
+                alpha = float(step + 1) / float(segment_steps)
                 # Lock to a single planned pose for this transition (no per-frame mesh chasing).
-                arm_target = ((1.0 - alpha) * start_arm + alpha * resolved_end_arm).astype(np.float32)
-                gripper_target = float((1.0 - alpha) * start_gripper + alpha * end_gripper)
+                if end_name == "CLOSE" and close_anchor_arm is not None:
+                    # If DOWN_PICK halted early, close at the current stabilized arm pose.
+                    arm_target = resolved_end_arm.astype(np.float32, copy=False)
+                else:
+                    arm_target = ((1.0 - alpha) * start_arm + alpha * resolved_end_arm).astype(np.float32)
+
+                # Keep arm/gripper phases decoupled (MagicSim-style): only close/open in explicit hold loops.
+                if end_name in {"CLOSE", "OPEN"}:
+                    gripper_target = float(start_gripper)
+                else:
+                    gripper_target = float((1.0 - alpha) * start_gripper + alpha * end_gripper)
 
                 arm_cmd, gr_cmd = _step_toward_joint_targets(franka, arm_target, gripper_target)
                 _set_joint_targets(franka, arm_cmd, gr_cmd, physics_control=True)
@@ -2998,7 +3021,7 @@ def _run_pick_place_episode(
 
                 # Borrowed from MagicSim grasp phase behavior:
                 # if reach gate is already satisfied while descending, halt early and close.
-                if end_name in {"DOWN_PICK", "CLOSE"} and step >= 4:
+                if end_name == "DOWN_PICK" and step >= 4:
                     reach_metrics = _compute_grasp_metrics(
                         franka=franka,
                         stage=stage,
@@ -3013,13 +3036,15 @@ def _run_pick_place_episode(
                         finger_right_prim_path=finger_right_prim_path,
                     )
                     if _verify_reach_before_close(reach_metrics):
+                        close_anchor_arm = _current_arm_target().astype(np.float32, copy=False)
                         LOG.info(
-                            "collect: attempt %d early halt before close at %s step=%d/%d metrics=%s",
+                            "collect: attempt %d early halt before close at %s step=%d/%d metrics=%s close_anchor=%s",
                             attempt,
                             end_name,
                             step + 1,
-                            steps_per_segment,
+                            segment_steps,
                             reach_metrics,
+                            np.round(close_anchor_arm, 4).tolist(),
                         )
                         early_reach_halt = True
                         break
@@ -3031,7 +3056,11 @@ def _run_pick_place_episode(
                 continue
 
             if end_name == "CLOSE":
-                close_arm = _resolve_live_arm_target(end_name, end_arm)
+                close_arm = (
+                    close_anchor_arm.astype(np.float32, copy=False)
+                    if close_anchor_arm is not None
+                    else _resolve_live_arm_target(end_name, end_arm)
+                )
                 for _ in range(20):
                     if _timeout_triggered():
                         return
@@ -3039,6 +3068,7 @@ def _run_pick_place_episode(
                     _set_joint_targets(franka, arm_cmd, gr_cmd, physics_control=True)
                     world.step(render=True)
                     _record_frame(arm_target=close_arm, gripper_target=end_gripper)
+                close_anchor_arm = None
 
             if end_name == "OPEN":
                 for _ in range(10):
