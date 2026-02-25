@@ -10,6 +10,7 @@ This module also exposes `run_collection_in_process(...)` for `run_interactive.p
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import os
 import re
@@ -120,6 +121,20 @@ WRIST_CAM_PATH = f"{ROBOT_PRIM_PATH}/panda_hand/wrist_cam"
 OBJECT_PRIM_PATH = f"{COLLECTOR_ROOT}/PickObject"
 MATERIAL_PRIM_PATH = f"{COLLECTOR_ROOT}/GripMaterial"
 
+DEFAULT_GRASP_POSE_DIR = str(SCRIPT_DIR / "grasp_poses")
+GRASP_POSE_SOURCE_IDS = {
+    "none": 0.0,
+    "annotation": 1.0,
+    "bbox_center": 2.0,
+    "root_pose": 3.0,
+}
+FRAME_EXTRA_FEATURES: dict[str, dict[str, Any]] = {
+    "observation.object_pose_world": {"dtype": "float32", "shape": [7]},
+    "observation.grasp_target_pose_world": {"dtype": "float32", "shape": [7]},
+    "observation.grasp_target_valid": {"dtype": "bool", "shape": [1]},
+    "observation.grasp_target_source_id": {"dtype": "float32", "shape": [1]},
+}
+
 
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Collect Franka pick-place data in Isaac Sim.")
@@ -207,6 +222,274 @@ def _read_float_env(name: str, default: float) -> float:
     except Exception:
         LOG.warning("Invalid float env %s=%r, fallback %.3f", name, raw, float(default))
         return float(default)
+
+
+def _normalize_quat_wxyz(quat: np.ndarray) -> np.ndarray:
+    q = _to_numpy(quat, dtype=np.float32).reshape(-1)
+    if q.size < 4:
+        return np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32)
+    q4 = q[:4].astype(np.float32, copy=False)
+    if not np.all(np.isfinite(q4)):
+        return np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32)
+    n = float(np.linalg.norm(q4))
+    if not np.isfinite(n) or n < 1e-6:
+        return np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32)
+    return (q4 / n).astype(np.float32)
+
+
+def _quat_mul_wxyz(a: np.ndarray, b: np.ndarray) -> np.ndarray:
+    aw, ax, ay, az = _normalize_quat_wxyz(a)
+    bw, bx, by, bz = _normalize_quat_wxyz(b)
+    return _normalize_quat_wxyz(
+        np.array(
+            [
+                aw * bw - ax * bx - ay * by - az * bz,
+                aw * bx + ax * bw + ay * bz - az * by,
+                aw * by - ax * bz + ay * bw + az * bx,
+                aw * bz + ax * by - ay * bx + az * bw,
+            ],
+            dtype=np.float32,
+        )
+    )
+
+
+def _quat_to_rot_wxyz(quat: np.ndarray) -> np.ndarray:
+    w, x, y, z = _normalize_quat_wxyz(quat)
+    xx, yy, zz = x * x, y * y, z * z
+    xy, xz, yz = x * y, x * z, y * z
+    wx, wy, wz = w * x, w * y, w * z
+    return np.array(
+        [
+            [1.0 - 2.0 * (yy + zz), 2.0 * (xy - wz), 2.0 * (xz + wy)],
+            [2.0 * (xy + wz), 1.0 - 2.0 * (xx + zz), 2.0 * (yz - wx)],
+            [2.0 * (xz - wy), 2.0 * (yz + wx), 1.0 - 2.0 * (xx + yy)],
+        ],
+        dtype=np.float32,
+    )
+
+
+def _transform_local_pose_to_world(
+    object_pos: np.ndarray,
+    object_quat: np.ndarray,
+    local_pos: np.ndarray,
+    local_quat: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    obj_p = _to_numpy(object_pos, dtype=np.float32).reshape(-1)
+    obj_q = _normalize_quat_wxyz(object_quat)
+    loc_p = _to_numpy(local_pos, dtype=np.float32).reshape(-1)
+    loc_q = _normalize_quat_wxyz(local_quat)
+    if obj_p.size < 3:
+        obj_p = np.zeros((3,), dtype=np.float32)
+    if loc_p.size < 3:
+        loc_p = np.zeros((3,), dtype=np.float32)
+    rot = _quat_to_rot_wxyz(obj_q)
+    world_pos = obj_p[:3] + rot @ loc_p[:3]
+    world_quat = _quat_mul_wxyz(obj_q, loc_q)
+    return world_pos.astype(np.float32), world_quat.astype(np.float32)
+
+
+def _object_token_candidates(object_prim_path: str) -> list[str]:
+    raw = str(object_prim_path or "").lower()
+    leaf = raw.split("/")[-1]
+    tokens = set()
+    if leaf:
+        tokens.add(leaf)
+    for piece in re.split(r"[^a-z0-9]+", raw):
+        if piece:
+            tokens.add(piece)
+
+    aliases = {
+        "mug": ("mug", "cup", "coffee", "025", "ycb"),
+        "mustard": ("mustard", "006"),
+        "sugar": ("sugar", "004"),
+        "cracker": ("cracker", "003"),
+        "tomato": ("tomato", "soup", "005"),
+    }
+    expanded = set(tokens)
+    for canonical, words in aliases.items():
+        if any(w in tokens for w in words):
+            expanded.add(canonical)
+
+    ordered = sorted(expanded)
+    return [t for t in ordered if t]
+
+
+def _resolve_grasp_annotation_path(stage: Any, object_prim_path: str) -> Optional[Path]:
+    explicit = os.environ.get("COLLECT_GRASP_POSE_PATH", "").strip()
+    if explicit:
+        p = Path(explicit).expanduser()
+        if p.exists():
+            return p
+        LOG.warning("collect: COLLECT_GRASP_POSE_PATH not found: %s", p)
+
+    prim = stage.GetPrimAtPath(object_prim_path) if stage is not None else None
+    if prim and prim.IsValid():
+        for key in ("grasp_pose_path", "graspPosePath", "annotation_path"):
+            try:
+                raw = prim.GetCustomDataByKey(key)
+            except Exception:
+                raw = None
+            if isinstance(raw, str) and raw.strip():
+                p = Path(raw.strip()).expanduser()
+                if not p.is_absolute():
+                    p = (SCRIPT_DIR / p).resolve()
+                if p.exists():
+                    return p
+
+    roots = []
+    env_root = os.environ.get("COLLECT_GRASP_POSE_DIR", "").strip()
+    if env_root:
+        roots.append(Path(env_root).expanduser())
+    roots.extend(
+        [
+            Path(DEFAULT_GRASP_POSE_DIR),
+            SCRIPT_DIR / "grasp_pose",
+            SCRIPT_DIR / "grasp_ops" / "assets",
+            SCRIPT_DIR.parent / "grasp_ops" / "assets",
+        ]
+    )
+
+    tokens = _object_token_candidates(object_prim_path)
+    for root in roots:
+        if not root.exists():
+            continue
+        for tok in tokens:
+            for cand in (
+                root / f"{tok}_grasp_pose.json",
+                root / f"{tok}.json",
+                root / tok / "grasp_pose.json",
+                root / tok / f"{tok}_grasp_pose.json",
+            ):
+                if cand.exists():
+                    return cand
+            try:
+                for cand in sorted(root.glob(f"*{tok}*grasp_pose.json")):
+                    if cand.exists():
+                        return cand
+            except Exception:
+                pass
+    return None
+
+
+def _load_grasp_pose_candidates(annotation_path: Path) -> list[dict[str, Any]]:
+    try:
+        with annotation_path.open("r") as f:
+            data = json.load(f)
+    except Exception as exc:
+        LOG.warning("collect: failed to read grasp annotation %s: %s", annotation_path, exc)
+        return []
+
+    out: list[dict[str, Any]] = []
+
+    def _append_pose(label: str, pose: Any, source: str) -> None:
+        arr = _to_numpy(pose, dtype=np.float32).reshape(-1)
+        if arr.size < 7:
+            return
+        pos = arr[:3].astype(np.float32, copy=False)
+        quat = _normalize_quat_wxyz(arr[3:7])
+        if not np.all(np.isfinite(pos)):
+            return
+        approach_z = abs(float((-_quat_to_rot_wxyz(quat)[:, 2])[2]))
+        label_l = str(label or "body").lower()
+        label_bonus = 2.0 if "handle" in label_l else 0.0
+        score = label_bonus + max(0.0, 1.0 - approach_z)
+        out.append(
+            {
+                "label": label_l,
+                "local_pos": pos,
+                "local_quat": quat,
+                "score": float(score),
+                "source": source,
+            }
+        )
+
+    functional = data.get("functional_grasp", {})
+    if isinstance(functional, dict):
+        for label, poses in functional.items():
+            if isinstance(poses, list):
+                for p in poses:
+                    _append_pose(str(label), p, "functional_grasp")
+
+    grasp = data.get("grasp", {})
+    if isinstance(grasp, dict):
+        body = grasp.get("body", [])
+        if isinstance(body, list):
+            for p in body:
+                _append_pose("body", p, "grasp.body")
+
+    out.sort(key=lambda x: float(x.get("score", 0.0)), reverse=True)
+    return out
+
+
+def _select_annotation_grasp_target(
+    stage: Any,
+    object_prim_path: str,
+    usd: Any,
+    usd_geom: Any,
+    candidates: Sequence[dict[str, Any]],
+    attempt_index: int,
+) -> Optional[dict[str, Any]]:
+    if not candidates:
+        return None
+    idx = int(max(0, attempt_index - 1)) % len(candidates)
+    cand = candidates[idx]
+    obj_pos, obj_quat = _get_prim_world_pose(stage, object_prim_path, usd, usd_geom)
+    target_pos, target_quat = _transform_local_pose_to_world(
+        object_pos=obj_pos,
+        object_quat=obj_quat,
+        local_pos=_to_numpy(cand.get("local_pos"), dtype=np.float32),
+        local_quat=_to_numpy(cand.get("local_quat"), dtype=np.float32),
+    )
+    return {
+        "target_pos": target_pos.astype(np.float32),
+        "target_quat": target_quat.astype(np.float32),
+        "local_pos": _to_numpy(cand.get("local_pos"), dtype=np.float32)[:3].astype(np.float32),
+        "local_quat": _normalize_quat_wxyz(_to_numpy(cand.get("local_quat"), dtype=np.float32)),
+        "label": str(cand.get("label", "body")),
+        "source": "annotation",
+        "source_id": GRASP_POSE_SOURCE_IDS["annotation"],
+        "index": int(idx),
+    }
+
+
+def _build_frame_extras(
+    stage: Any,
+    object_prim_path: str,
+    usd: Any,
+    usd_geom: Any,
+    current_target: Optional[dict[str, Any]],
+) -> dict[str, Any]:
+    obj_pos, obj_quat = _get_prim_world_pose(stage, object_prim_path, usd, usd_geom)
+    object_pose = np.concatenate([obj_pos[:3], _normalize_quat_wxyz(obj_quat)], axis=0).astype(np.float32)
+
+    source_id = GRASP_POSE_SOURCE_IDS["none"]
+    target_pose = object_pose.copy()
+    valid = False
+    if current_target:
+        if current_target.get("source") == "annotation":
+            tgt_pos, tgt_quat = _transform_local_pose_to_world(
+                object_pos=obj_pos,
+                object_quat=obj_quat,
+                local_pos=_to_numpy(current_target.get("local_pos"), dtype=np.float32),
+                local_quat=_to_numpy(current_target.get("local_quat"), dtype=np.float32),
+            )
+            target_pose = np.concatenate([tgt_pos[:3], _normalize_quat_wxyz(tgt_quat)], axis=0).astype(np.float32)
+            source_id = GRASP_POSE_SOURCE_IDS["annotation"]
+            valid = True
+        else:
+            pos = _to_numpy(current_target.get("target_pos"), dtype=np.float32).reshape(-1)
+            quat = _normalize_quat_wxyz(_to_numpy(current_target.get("target_quat"), dtype=np.float32))
+            if pos.size >= 3 and np.all(np.isfinite(pos[:3])):
+                target_pose = np.concatenate([pos[:3], quat], axis=0).astype(np.float32)
+                source_id = float(current_target.get("source_id", GRASP_POSE_SOURCE_IDS["none"]))
+                valid = bool(current_target.get("valid", True))
+
+    return {
+        "observation.object_pose_world": object_pose.tolist(),
+        "observation.grasp_target_pose_world": target_pose.tolist(),
+        "observation.grasp_target_valid": bool(valid),
+        "observation.grasp_target_source_id": float(source_id),
+    }
 
 
 def _select_ik_frame_name(frame_names: Sequence[str], eef_prim_path: str) -> Optional[str]:
@@ -1266,8 +1549,23 @@ def _run_pick_place_episode(
     grasp_succeeded = False
     attempt_used = 0
     ik_target_orientation: np.ndarray | None = None
+    current_grasp_target: dict[str, Any] | None = None
     episode_started = time.monotonic()
     timeout_sec = max(0.0, float(episode_timeout_sec))
+
+    annotation_path = _resolve_grasp_annotation_path(stage=stage, object_prim_path=object_prim_path)
+    annotation_candidates: list[dict[str, Any]] = []
+    if annotation_path is not None:
+        annotation_candidates = _load_grasp_pose_candidates(annotation_path)
+        if annotation_candidates:
+            LOG.info(
+                "collect: loaded %d grasp annotations for %s from %s",
+                len(annotation_candidates),
+                object_prim_path,
+                annotation_path,
+            )
+        else:
+            LOG.warning("collect: grasp annotation file had no usable poses: %s", annotation_path)
 
     def _timeout_triggered() -> bool:
         nonlocal stopped
@@ -1309,6 +1607,13 @@ def _run_pick_place_episode(
                 state = _extract_state_vector(franka, stage, eef_prim_path, get_prim_at_path, usd, usd_geom)
                 action = np.concatenate([arm_target, np.array([gripper_target], dtype=np.float32)], axis=0)
                 action = _pad_or_trim(action, ACTION_DIM)
+                frame_extras = _build_frame_extras(
+                    stage=stage,
+                    object_prim_path=object_prim_path,
+                    usd=usd,
+                    usd_geom=usd_geom,
+                    current_target=current_grasp_target,
+                )
                 writer.add_frame(
                     episode_index=episode_index,
                     frame_index=frame_index,
@@ -1316,6 +1621,7 @@ def _run_pick_place_episode(
                     action=action,
                     timestamp=frame_index / float(fps),
                     next_done=False,
+                    extras=frame_extras,
                 )
                 for cam_name, cam_obj in cameras.items():
                     rgb = _capture_rgb(cam_obj, CAMERA_RESOLUTION)
@@ -1366,12 +1672,33 @@ def _run_pick_place_episode(
             stopped = True
             break
 
-        raw_pick_x, raw_pick_y, pick_source = _query_object_pick_xy(
+        annotation_target = _select_annotation_grasp_target(
             stage=stage,
             object_prim_path=object_prim_path,
             usd=usd,
             usd_geom=usd_geom,
+            candidates=annotation_candidates,
+            attempt_index=attempt,
         )
+        if annotation_target is not None:
+            raw_pick_x = float(annotation_target["target_pos"][0])
+            raw_pick_y = float(annotation_target["target_pos"][1])
+            pick_source = "annotation"
+            current_grasp_target = annotation_target
+        else:
+            raw_pick_x, raw_pick_y, pick_source = _query_object_pick_xy(
+                stage=stage,
+                object_prim_path=object_prim_path,
+                usd=usd,
+                usd_geom=usd_geom,
+            )
+            current_grasp_target = {
+                "target_pos": np.array([raw_pick_x, raw_pick_y, float(table_top_z)], dtype=np.float32),
+                "target_quat": np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32),
+                "source": pick_source,
+                "source_id": GRASP_POSE_SOURCE_IDS.get(pick_source, GRASP_POSE_SOURCE_IDS["none"]),
+                "valid": pick_source in {"bbox_center", "root_pose"},
+            }
         pick_x = float(np.clip(raw_pick_x, table_x_range[0], table_x_range[1]))
         pick_y = float(np.clip(raw_pick_y, table_y_range[0], table_y_range[1]))
         clamp_delta = float(np.linalg.norm(np.array([pick_x - raw_pick_x, pick_y - raw_pick_y], dtype=np.float32)))
@@ -1409,13 +1736,30 @@ def _run_pick_place_episode(
             fallback_object_height=object_height,
         )
         object_height = float(z_targets["object_height"])
-        if ik_target_orientation is None:
+        if annotation_target is not None:
+            ann_z = float(annotation_target["target_pos"][2])
+            min_z = float(table_top_z) + IK_PICK_MIN_CLEARANCE_FROM_TABLE
+            max_z = max(min_z + 0.01, float(z_targets["pick_approach_z"]) - 0.04)
+            z_targets["pick_grasp_z"] = float(np.clip(ann_z, min_z, max_z))
+            z_targets["pick_approach_z"] = max(
+                float(z_targets["pick_approach_z"]),
+                float(z_targets["pick_grasp_z"]) + 0.08,
+            )
+            ik_target_orientation = _normalize_quat_wxyz(annotation_target["target_quat"])
+        elif ik_target_orientation is None:
             _, cand_quat = _get_eef_pose(stage, eef_prim_path, get_prim_at_path, usd, usd_geom)
             cand_quat = np.asarray(cand_quat, dtype=np.float32).reshape(-1)
             if cand_quat.size >= 4 and np.all(np.isfinite(cand_quat[:4])):
                 norm = float(np.linalg.norm(cand_quat[:4]))
                 if np.isfinite(norm) and norm > 1e-6:
                     ik_target_orientation = (cand_quat[:4] / norm).astype(np.float32)
+
+        if current_grasp_target is not None and current_grasp_target.get("source") != "annotation":
+            pos = _to_numpy(current_grasp_target.get("target_pos"), dtype=np.float32).reshape(-1)
+            if pos.size >= 3:
+                pos = pos.copy()
+                pos[2] = float(z_targets["pick_grasp_z"])
+                current_grasp_target["target_pos"] = pos
 
         for _ in range(8):
             world.step(render=True)
@@ -1577,6 +1921,13 @@ def _run_pick_place_episode(
         )
         state = _extract_state_vector(franka, stage, eef_prim_path, get_prim_at_path, usd, usd_geom)
         action = np.zeros((ACTION_DIM,), dtype=np.float32)
+        frame_extras = _build_frame_extras(
+            stage=stage,
+            object_prim_path=object_prim_path,
+            usd=usd,
+            usd_geom=usd_geom,
+            current_target=current_grasp_target,
+        )
         writer.add_frame(
             episode_index=episode_index,
             frame_index=0,
@@ -1584,6 +1935,7 @@ def _run_pick_place_episode(
             action=action,
             timestamp=0.0,
             next_done=True,
+            extras=frame_extras,
         )
         for cam_name, cam_obj in cameras.items():
             rgb = _capture_rgb(cam_obj, CAMERA_RESOLUTION)
@@ -2141,6 +2493,7 @@ def run_collection_in_process(
         camera_resolution=CAMERA_RESOLUTION,
         state_names=STATE_NAMES,
         action_names=ACTION_NAMES,
+        extra_features=FRAME_EXTRA_FEATURES,
     )
 
     completed = 0

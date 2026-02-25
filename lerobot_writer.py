@@ -18,7 +18,7 @@ from __future__ import annotations
 import json
 import logging
 from pathlib import Path
-from typing import List, Optional
+from typing import Any, List, Optional
 
 import numpy as np
 import pandas as pd
@@ -41,6 +41,7 @@ class SimLeRobotWriter:
         camera_resolution: tuple[int, int] = (224, 224),
         state_names: Optional[List[str]] = None,
         action_names: Optional[List[str]] = None,
+        extra_features: Optional[dict[str, dict[str, Any]]] = None,
     ):
         self.output_dir = Path(output_dir)
         self.repo_id = repo_id
@@ -52,6 +53,7 @@ class SimLeRobotWriter:
         self.camera_resolution = camera_resolution
         self.state_names = state_names
         self.action_names = action_names
+        self.extra_features = dict(extra_features or {})
 
         # Create directory structure
         (self.output_dir / "meta" / "episodes" / "chunk-000").mkdir(parents=True, exist_ok=True)
@@ -80,19 +82,22 @@ class SimLeRobotWriter:
         action: np.ndarray,
         timestamp: float,
         next_done: bool = False,
+        extras: Optional[dict[str, Any]] = None,
     ) -> None:
         """Append one frame of tabular data (joint state + action)."""
-        self.all_frames.append(
-            {
-                "index": self.global_frame_idx,
-                "episode_index": episode_index,
-                "frame_index": frame_index,
-                "timestamp": float(timestamp),
-                "observation.state": observation_state.astype(np.float32).tolist(),
-                "action": action.astype(np.float32).tolist(),
-                "next.done": bool(next_done),
-            }
-        )
+        row = {
+            "index": self.global_frame_idx,
+            "episode_index": episode_index,
+            "frame_index": frame_index,
+            "timestamp": float(timestamp),
+            "observation.state": observation_state.astype(np.float32).tolist(),
+            "action": action.astype(np.float32).tolist(),
+            "next.done": bool(next_done),
+        }
+        if extras:
+            for key, value in extras.items():
+                row[key] = value
+        self.all_frames.append(row)
         self.global_frame_idx += 1
 
     def add_video_frame(self, camera_name: str, rgb: np.ndarray) -> None:
@@ -259,6 +264,7 @@ class SimLeRobotWriter:
                 "names": ["height", "width", "channels"],
                 "video_info": {"fps": self.fps, "codec": "libx264"},
             }
+        features.update(self.extra_features)
 
         info = {
             "codebase_version": "v3.0",
