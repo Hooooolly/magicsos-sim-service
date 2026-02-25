@@ -376,3 +376,27 @@ Files in platform repo:
   - E-stop can be triggered even when main thread is busy in collection loop.
   - collect stops as soon as collector loop observes `stop_event`.
   - physics is paused on next main-loop tick.
+
+## Hotfix (2026-02-25 02:35 UTC, borrow MagicSim grasp retry policy for collect)
+- User requirement:
+  - Collector should not "wave around and miss forever".
+  - Use object known pose -> approach/grasp -> verify.
+  - If grasp fails, open gripper and replan/retry.
+
+- Changes in `sim-service/isaac_pick_place_collector.py`:
+  - Added grasp verification metrics inspired by MagicSim Grasp task:
+    - gripper width gate
+    - object-to-eef distance gate
+    - retrieval lift-height gate
+  - Added retry loop (`GRASP_MAX_ATTEMPTS=3`) per episode:
+    - re-read current object pose each attempt
+    - replan IK waypoints from current object pose
+    - execute pick phase to LIFT
+    - verify close/retrieval metrics
+    - on failure: force open gripper, retreat, and retry
+  - Keeps `place_pos` stable for the episode while retrying grasp.
+  - Episode log now records `success` and `attempts`.
+
+- Expected effect:
+  - Fewer false-positive "grasped" episodes.
+  - More recoverable attempts when initial close misses object contact.

@@ -92,6 +92,12 @@ TABLE_Y_RANGE = (-0.3, 0.3)
 TABLE_Z = 0.41
 IK_APPROACH_Z_OFFSET = 0.18
 IK_GRASP_Z_OFFSET = 0.07
+GRASP_MAX_ATTEMPTS = 3
+VERIFY_CLOSE_MIN_GRIPPER_WIDTH = 0.006
+VERIFY_CLOSE_MAX_OBJECT_EEF_DISTANCE = 0.12
+VERIFY_CLOSE_MAX_OBJECT_EEF_XY_DISTANCE = 0.05
+VERIFY_RETRIEVAL_MIN_LIFT = 0.015
+VERIFY_RETRIEVAL_MAX_OBJECT_EEF_DISTANCE = 0.15
 
 COLLECTOR_ROOT = "/World/PickPlaceCollector"
 TABLE_PRIM_PATH = f"{COLLECTOR_ROOT}/Table"
@@ -1035,6 +1041,55 @@ def _sample_place_from_pick(
     return place_x, place_y
 
 
+def _compute_grasp_metrics(
+    franka: Any,
+    stage: Any,
+    eef_prim_path: str,
+    get_prim_at_path: Any,
+    usd: Any,
+    usd_geom: Any,
+    object_prim_path: str,
+    table_top_z: float,
+    object_height: float,
+) -> dict[str, float]:
+    joints = _to_numpy(franka.get_joint_positions())
+    if joints.size >= 9:
+        gripper_width = float(joints[7] + joints[8])
+    elif joints.size == 8:
+        gripper_width = float(2.0 * joints[7])
+    else:
+        gripper_width = 0.0
+
+    obj_pos, _ = _get_prim_world_pose(stage, object_prim_path, usd, usd_geom)
+    eef_pos, _ = _get_eef_pose(stage, eef_prim_path, get_prim_at_path, usd, usd_geom)
+    delta = obj_pos - eef_pos
+    obj_eef_dist = float(np.linalg.norm(delta))
+    obj_eef_xy_dist = float(np.linalg.norm(delta[:2]))
+    lift_height = float(obj_pos[2] - (float(table_top_z) + 0.5 * float(object_height)))
+    return {
+        "gripper_width": gripper_width,
+        "object_eef_distance": obj_eef_dist,
+        "object_eef_xy_distance": obj_eef_xy_dist,
+        "lift_height": lift_height,
+    }
+
+
+def _verify_after_close(metrics: dict[str, float]) -> bool:
+    return bool(
+        metrics.get("gripper_width", 0.0) >= VERIFY_CLOSE_MIN_GRIPPER_WIDTH
+        and metrics.get("object_eef_distance", 1e9) <= VERIFY_CLOSE_MAX_OBJECT_EEF_DISTANCE
+        and metrics.get("object_eef_xy_distance", 1e9) <= VERIFY_CLOSE_MAX_OBJECT_EEF_XY_DISTANCE
+    )
+
+
+def _verify_after_retrieval(metrics: dict[str, float]) -> bool:
+    return bool(
+        metrics.get("gripper_width", 0.0) >= VERIFY_CLOSE_MIN_GRIPPER_WIDTH
+        and metrics.get("lift_height", -1e9) >= VERIFY_RETRIEVAL_MIN_LIFT
+        and metrics.get("object_eef_distance", 1e9) <= VERIFY_RETRIEVAL_MAX_OBJECT_EEF_DISTANCE
+    )
+
+
 def _run_pick_place_episode(
     episode_index: int,
     world: Any,
@@ -1069,115 +1124,177 @@ def _run_pick_place_episode(
             except Exception as exc:
                 LOG.warning("Camera initialize() failed after reset: %s", exc)
 
-    obj_pos, _ = _get_prim_world_pose(stage, object_prim_path, usd, usd_geom)
-    pick_x = float(np.clip(obj_pos[0], table_x_range[0], table_x_range[1]))
-    pick_y = float(np.clip(obj_pos[1], table_y_range[0], table_y_range[1]))
-    pick_pos = (pick_x, pick_y)
-    if abs(pick_x - float(obj_pos[0])) > 1e-3 or abs(pick_y - float(obj_pos[1])) > 1e-3:
-        LOG.warning(
-            "collect: object pick pose clamped into workspace: raw=(%.3f, %.3f), clamped=(%.3f, %.3f)",
-            float(obj_pos[0]),
-            float(obj_pos[1]),
-            pick_x,
-            pick_y,
-        )
-    place_pos = _sample_place_from_pick(rng, table_x_range, table_y_range, pick_pos)
-    object_height = _estimate_object_height(stage, object_prim_path, usd_geom, fallback=OBJECT_SIZE)
-
-    for _ in range(10):
-        world.step(render=True)
-
-    waypoints = _make_pick_place_waypoints_ik(
-        ik_solver=ik_solver,
-        pick_pos=pick_pos,
-        place_pos=place_pos,
-        table_top_z=table_top_z,
-        object_height=object_height,
-        rng=rng,
-    )
-    if waypoints is None:
-        waypoints = _make_pick_place_waypoints(pick_pos, place_pos, rng, work_center=work_center)
-    _, home_arm, home_gripper = waypoints[0]
-    for _ in range(30):
-        arm_cmd, gr_cmd = _step_toward_joint_targets(franka, home_arm, home_gripper)
-        _set_joint_targets(franka, arm_cmd, gr_cmd, physics_control=True)
-        world.step(render=True)
-
     frame_index = 0
     stopped = False
-    transitions = list(zip(waypoints[:-1], waypoints[1:]))
+    place_pos: tuple[float, float] | None = None
+    last_pick_pos: tuple[float, float] = (float(work_center[0]), float(work_center[1]))
+    grasp_succeeded = False
+    attempt_used = 0
 
-    for transition_idx, (start_wp, end_wp) in enumerate(transitions):
-        start_name, start_arm, start_gripper = start_wp
-        end_name, end_arm, end_gripper = end_wp
+    def _execute_transitions(transitions: list[tuple[Any, Any]]) -> None:
+        nonlocal frame_index, stopped
+        for start_wp, end_wp in transitions:
+            _, start_arm, start_gripper = start_wp
+            end_name, end_arm, end_gripper = end_wp
 
-        for step in range(steps_per_segment):
-            if stop_event is not None and stop_event.is_set():
-                stopped = True
-                break
+            for step in range(steps_per_segment):
+                if stop_event is not None and stop_event.is_set():
+                    stopped = True
+                    return
 
-            alpha = float(step + 1) / float(steps_per_segment)
-            arm_target = ((1.0 - alpha) * start_arm + alpha * end_arm).astype(np.float32)
-            gripper_target = float((1.0 - alpha) * start_gripper + alpha * end_gripper)
+                alpha = float(step + 1) / float(steps_per_segment)
+                arm_target = ((1.0 - alpha) * start_arm + alpha * end_arm).astype(np.float32)
+                gripper_target = float((1.0 - alpha) * start_gripper + alpha * end_gripper)
 
-            arm_cmd, gr_cmd = _step_toward_joint_targets(franka, arm_target, gripper_target)
+                arm_cmd, gr_cmd = _step_toward_joint_targets(franka, arm_target, gripper_target)
+                _set_joint_targets(franka, arm_cmd, gr_cmd, physics_control=True)
+                world.step(render=True)
+
+                state = _extract_state_vector(franka, stage, eef_prim_path, get_prim_at_path, usd, usd_geom)
+                action = np.concatenate([arm_target, np.array([gripper_target], dtype=np.float32)], axis=0)
+                action = _pad_or_trim(action, ACTION_DIM)
+                writer.add_frame(
+                    episode_index=episode_index,
+                    frame_index=frame_index,
+                    observation_state=state,
+                    action=action,
+                    timestamp=frame_index / float(fps),
+                    next_done=False,
+                )
+                for cam_name, cam_obj in cameras.items():
+                    rgb = _capture_rgb(cam_obj, CAMERA_RESOLUTION)
+                    writer.add_video_frame(cam_name, rgb)
+                frame_index += 1
+
+            if stopped:
+                return
+
+            if end_name == "CLOSE":
+                for _ in range(20):
+                    arm_cmd, gr_cmd = _step_toward_joint_targets(franka, end_arm, end_gripper)
+                    _set_joint_targets(franka, arm_cmd, gr_cmd, physics_control=True)
+                    world.step(render=True)
+
+            if end_name == "OPEN":
+                for _ in range(10):
+                    arm_cmd, gr_cmd = _step_toward_joint_targets(franka, end_arm, end_gripper)
+                    _set_joint_targets(franka, arm_cmd, gr_cmd, physics_control=True)
+                    world.step(render=True)
+
+    for attempt in range(1, GRASP_MAX_ATTEMPTS + 1):
+        attempt_used = attempt
+        if stop_event is not None and stop_event.is_set():
+            stopped = True
+            break
+
+        obj_pos, _ = _get_prim_world_pose(stage, object_prim_path, usd, usd_geom)
+        pick_x = float(np.clip(obj_pos[0], table_x_range[0], table_x_range[1]))
+        pick_y = float(np.clip(obj_pos[1], table_y_range[0], table_y_range[1]))
+        last_pick_pos = (pick_x, pick_y)
+        if abs(pick_x - float(obj_pos[0])) > 1e-3 or abs(pick_y - float(obj_pos[1])) > 1e-3:
+            LOG.warning(
+                "collect: attempt %d pick pose clamped: raw=(%.3f, %.3f), clamped=(%.3f, %.3f)",
+                attempt,
+                float(obj_pos[0]),
+                float(obj_pos[1]),
+                pick_x,
+                pick_y,
+            )
+        if place_pos is None:
+            place_pos = _sample_place_from_pick(rng, table_x_range, table_y_range, last_pick_pos)
+        object_height = _estimate_object_height(stage, object_prim_path, usd_geom, fallback=OBJECT_SIZE)
+
+        for _ in range(8):
+            world.step(render=True)
+
+        waypoints = _make_pick_place_waypoints_ik(
+            ik_solver=ik_solver,
+            pick_pos=last_pick_pos,
+            place_pos=place_pos,
+            table_top_z=table_top_z,
+            object_height=object_height,
+            rng=rng,
+        )
+        if waypoints is None:
+            waypoints = _make_pick_place_waypoints(last_pick_pos, place_pos, rng, work_center=work_center)
+
+        names = [wp[0] for wp in waypoints]
+        if "LIFT" not in names:
+            LOG.warning("collect: invalid waypoint list without LIFT, skipping episode")
+            break
+        lift_idx = names.index("LIFT")
+
+        _, home_arm, home_gripper = waypoints[0]
+        for _ in range(30):
+            arm_cmd, gr_cmd = _step_toward_joint_targets(franka, home_arm, home_gripper)
             _set_joint_targets(franka, arm_cmd, gr_cmd, physics_control=True)
             world.step(render=True)
 
-            state = _extract_state_vector(franka, stage, eef_prim_path, get_prim_at_path, usd, usd_geom)
-            action = np.concatenate([arm_target, np.array([gripper_target], dtype=np.float32)], axis=0)
-            action = _pad_or_trim(action, ACTION_DIM)
-            is_last = transition_idx == (len(transitions) - 1) and step == (steps_per_segment - 1)
-            writer.add_frame(
-                episode_index=episode_index,
-                frame_index=frame_index,
-                observation_state=state,
-                action=action,
-                timestamp=frame_index / float(fps),
-                next_done=is_last,
-            )
-            for cam_name, cam_obj in cameras.items():
-                rgb = _capture_rgb(cam_obj, CAMERA_RESOLUTION)
-                writer.add_video_frame(cam_name, rgb)
+        pick_transitions = list(zip(waypoints[:lift_idx], waypoints[1 : lift_idx + 1]))
+        place_transitions = list(zip(waypoints[lift_idx:-1], waypoints[lift_idx + 1 :]))
 
-            frame_index += 1
-
+        _execute_transitions(pick_transitions)
         if stopped:
             break
 
-        if end_name == "CLOSE":
-            for _ in range(8):
-                arm_cmd, gr_cmd = _step_toward_joint_targets(franka, end_arm, end_gripper)
-                _set_joint_targets(franka, arm_cmd, gr_cmd, physics_control=True)
-                world.step(render=True)
-            # Pure physics grasp: no fixed-joint attach.
-            # Hold close for extra frames so contact/friction can settle.
-            for _ in range(12):
-                arm_cmd, gr_cmd = _step_toward_joint_targets(franka, end_arm, end_gripper)
-                _set_joint_targets(franka, arm_cmd, gr_cmd, physics_control=True)
-                world.step(render=True)
+        metrics = _compute_grasp_metrics(
+            franka=franka,
+            stage=stage,
+            eef_prim_path=eef_prim_path,
+            get_prim_at_path=get_prim_at_path,
+            usd=usd,
+            usd_geom=usd_geom,
+            object_prim_path=object_prim_path,
+            table_top_z=table_top_z,
+            object_height=object_height,
+        )
+        close_ok = _verify_after_close(metrics)
+        retrieval_ok = _verify_after_retrieval(metrics)
 
-        if end_name == "OPEN":
-            for _ in range(8):
-                arm_cmd, gr_cmd = _step_toward_joint_targets(franka, end_arm, end_gripper)
-                _set_joint_targets(franka, arm_cmd, gr_cmd, physics_control=True)
-                world.step(render=True)
+        if close_ok and retrieval_ok:
+            grasp_succeeded = True
+            _execute_transitions(place_transitions)
+            break
 
-    if stopped and writer.all_frames:
-        last = writer.all_frames[-1]
-        if int(last.get("episode_index", -1)) == episode_index:
-            last["next.done"] = True
+        LOG.warning(
+            "collect: grasp retry %d/%d close_ok=%s retrieval_ok=%s metrics=%s",
+            attempt,
+            GRASP_MAX_ATTEMPTS,
+            close_ok,
+            retrieval_ok,
+            metrics,
+        )
+
+        lift_arm = waypoints[lift_idx][1]
+        for _ in range(20):
+            arm_cmd, gr_cmd = _step_toward_joint_targets(franka, lift_arm, GRIPPER_OPEN)
+            _set_joint_targets(franka, arm_cmd, gr_cmd, physics_control=True)
+            world.step(render=True)
+        for _ in range(30):
+            arm_cmd, gr_cmd = _step_toward_joint_targets(franka, home_arm, GRIPPER_OPEN)
+            _set_joint_targets(franka, arm_cmd, gr_cmd, physics_control=True)
+            world.step(render=True)
+
+    # Mark this episode's final frame as done.
+    for i in range(len(writer.all_frames) - 1, -1, -1):
+        frame = writer.all_frames[i]
+        if int(frame.get("episode_index", -1)) == episode_index:
+            frame["next.done"] = True
+            break
 
     if not stopped:
         obj_pos, _ = _get_prim_world_pose(stage, object_prim_path, usd, usd_geom)
-        place_dist = float(np.linalg.norm(obj_pos[:2] - np.array(place_pos, dtype=np.float32)))
+        place_vec = np.array(place_pos if place_pos is not None else last_pick_pos, dtype=np.float32)
+        place_dist = float(np.linalg.norm(obj_pos[:2] - place_vec))
         LOG.info(
-            "Episode %d done: pick=(%.3f, %.3f) place=(%.3f, %.3f) final_obj=(%.3f, %.3f, %.3f) dist=%.3f",
+            "Episode %d done: success=%s attempts=%d pick=(%.3f, %.3f) place=(%.3f, %.3f) final_obj=(%.3f, %.3f, %.3f) dist=%.3f",
             episode_index + 1,
-            pick_pos[0],
-            pick_pos[1],
-            place_pos[0],
-            place_pos[1],
+            grasp_succeeded,
+            attempt_used,
+            last_pick_pos[0],
+            last_pick_pos[1],
+            place_vec[0],
+            place_vec[1],
             obj_pos[0],
             obj_pos[1],
             obj_pos[2],
