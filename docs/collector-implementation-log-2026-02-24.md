@@ -501,3 +501,29 @@ Files in platform repo:
   - Fewer premature close events when gripper has not really reached grasp area.
   - Cleaner retry behavior and fewer "poking table" attempts.
   - Behavior closer to MagicSim’s robust non-learning grasp loop while remaining dependency-free.
+
+## Hotfix (2026-02-25 05:20 UTC, scene-chat `create_table/create_franka` runtime helper injection)
+- User issue:
+  - Scene chat intermittently failed with frontend `Failed to fetch`.
+  - Runtime logs showed `NameError: name 'create_table' is not defined` during `/code/execute`.
+
+- Root cause:
+  - LLM-generated scene scripts increasingly use helper calls `create_table(stage)` / `create_franka(...)`.
+  - `run_interactive.py` already strips helper imports from generated code, but runtime execution globals did not provide these helper functions.
+
+- Changes in `sim-service/run_interactive.py`:
+  - Added runtime helper implementations:
+    - `_runtime_create_table(...)`
+    - `_runtime_create_franka(...)`
+  - Added articulation validation utility:
+    - `_prim_has_articulation_root(...)`
+  - Added deterministic candidate handling helper:
+    - `_unique_preserve_order(...)`
+  - Injected helpers into `/code/execute` `exec_globals` as:
+    - `create_table`
+    - `create_franka`
+  - Extended `_code_may_mutate_stage(...)` to detect helper calls so world recreation path is triggered after helper-based stage edits.
+
+- Expected effect:
+  - Scene scripts calling `create_table`/`create_franka` execute successfully without NameError.
+  - Reduced scene-chat execution failures surfacing as generic frontend fetch errors.

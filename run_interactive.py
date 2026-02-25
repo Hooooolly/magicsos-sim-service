@@ -364,6 +364,165 @@ def _strip_runtime_helper_imports(code: str) -> str:
     return "\n".join(cleaned)
 
 
+def _unique_preserve_order(items: list[str]) -> list[str]:
+    seen = set()
+    out = []
+    for item in items:
+        key = str(item or "").strip()
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        out.append(key)
+    return out
+
+
+def _prim_has_articulation_root(prim) -> bool:
+    from pxr import UsdPhysics, Usd
+
+    if prim is None or not prim.IsValid():
+        return False
+    if prim.HasAPI(UsdPhysics.ArticulationRootAPI):
+        return True
+    for p in Usd.PrimRange(prim):
+        if p.HasAPI(UsdPhysics.ArticulationRootAPI):
+            return True
+    return False
+
+
+def _runtime_create_table(
+    stage=None,
+    prim_path: str = "/World/Table",
+    width: float = 1.2,
+    depth: float = 0.8,
+    height: float = 0.75,
+    top_thickness: float = 0.04,
+):
+    """Runtime scene helper exposed to scene-chat code as create_table(...)."""
+    from pxr import UsdGeom, UsdPhysics, Gf
+
+    stage = stage or _get_stage()
+    if stage is None:
+        raise RuntimeError("No USD stage available")
+
+    existing = stage.GetPrimAtPath(prim_path)
+    if existing and existing.IsValid():
+        return prim_path
+
+    UsdGeom.Xform.Define(stage, prim_path)
+
+    top = UsdGeom.Cube.Define(stage, f"{prim_path}/Top")
+    top.GetSizeAttr().Set(1.0)
+    top_xf = UsdGeom.Xformable(top.GetPrim())
+    top_xf.ClearXformOpOrder()
+    top_xf.AddTranslateOp().Set(Gf.Vec3d(0.0, 0.0, float(height)))
+    top_xf.AddScaleOp().Set(Gf.Vec3d(float(width), float(depth), float(top_thickness)))
+    UsdPhysics.CollisionAPI.Apply(top.GetPrim())
+
+    leg_inset = 0.05
+    leg_w = 0.05
+    lx = float(width) / 2.0 - leg_inset
+    ly = float(depth) / 2.0 - leg_inset
+    leg_h = float(height) - float(top_thickness) / 2.0
+    for i, (px, py) in enumerate(((-lx, -ly), (lx, -ly), (-lx, ly), (lx, ly))):
+        leg = UsdGeom.Cube.Define(stage, f"{prim_path}/Leg{i}")
+        leg.GetSizeAttr().Set(1.0)
+        lxf = UsdGeom.Xformable(leg.GetPrim())
+        lxf.ClearXformOpOrder()
+        lxf.AddTranslateOp().Set(Gf.Vec3d(float(px), float(py), leg_h / 2.0))
+        lxf.AddScaleOp().Set(Gf.Vec3d(leg_w, leg_w, leg_h))
+        UsdPhysics.CollisionAPI.Apply(leg.GetPrim())
+
+    return prim_path
+
+
+def _runtime_create_franka(
+    stage=None,
+    prim_path: str = "/World/FrankaRobot",
+    position=(0.40, 0.00, 0.77),
+    usd_path: str | None = None,
+):
+    """Runtime scene helper exposed to scene-chat code as create_franka(...)."""
+    from pxr import UsdGeom, Gf
+    from omni.isaac.core.utils.stage import add_reference_to_stage
+
+    stage = stage or _get_stage()
+    if stage is None:
+        raise RuntimeError("No USD stage available")
+
+    candidates = []
+    if usd_path:
+        candidates.append(str(usd_path))
+
+    try:
+        from omni.isaac.core.utils.nucleus import get_assets_root_path
+
+        assets_root = get_assets_root_path()
+        if assets_root:
+            candidates.extend(
+                [
+                    assets_root + "/Isaac/Robots/FrankaRobotics/FrankaPanda/franka.usd",
+                    assets_root + "/Isaac/Robots/Franka/franka.usd",
+                ]
+            )
+    except Exception:
+        pass
+
+    candidates.extend(
+        [
+            "/home/user/magicphysics/MagicPhysics/packages/MagicSim/Assets/Robots/franka_umi.usd",
+            "https://omniverse-content-production.s3-us-west-2.amazonaws.com/Assets/Isaac/5.1/Isaac/Robots/FrankaRobotics/FrankaPanda/franka.usd",
+            "https://omniverse-content-production.s3-us-west-2.amazonaws.com/Assets/Isaac/4.5/Isaac/Robots/FrankaRobotics/FrankaPanda/franka.usd",
+        ]
+    )
+    candidates = _unique_preserve_order(candidates)
+
+    prim = stage.GetPrimAtPath(prim_path)
+    if (not prim.IsValid()) or (not _prim_has_articulation_root(prim)):
+        if prim and prim.IsValid():
+            try:
+                stage.RemovePrim(prim_path)
+                for _ in range(3):
+                    simulation_app.update()
+            except Exception:
+                pass
+
+        loaded_ok = False
+        last_error = ""
+        for robot_usd in candidates:
+            try:
+                add_reference_to_stage(usd_path=robot_usd, prim_path=prim_path)
+                for _ in range(10):
+                    simulation_app.update()
+                prim = stage.GetPrimAtPath(prim_path)
+                if prim.IsValid() and _prim_has_articulation_root(prim):
+                    loaded_ok = True
+                    break
+                stage.RemovePrim(prim_path)
+                for _ in range(3):
+                    simulation_app.update()
+            except Exception as exc:
+                last_error = str(exc)
+                continue
+
+        if not loaded_ok:
+            raise RuntimeError(
+                f"Franka prim invalid or non-articulation at {prim_path}. "
+                f"last_error={last_error or 'none'}"
+            )
+
+    xform = UsdGeom.Xformable(prim)
+    px, py, pz = position
+    translate_op = None
+    for op in xform.GetOrderedXformOps():
+        if op.GetOpName() == "xformOp:translate":
+            translate_op = op
+            break
+    if translate_op is None:
+        translate_op = xform.AddTranslateOp()
+    translate_op.Set(Gf.Vec3d(float(px), float(py), float(pz)))
+    return prim_path
+
+
 def _code_may_mutate_stage(code: str) -> bool:
     """Best-effort detection for code that mutates USD stage topology/transforms."""
     txt = str(code or "")
@@ -381,6 +540,8 @@ def _code_may_mutate_stage(code: str) -> bool:
         r"RigidBodyAPI\.Apply\(",
         r"CollisionAPI\.Apply\(",
         r"MeshCollisionAPI\.Apply\(",
+        r"\bcreate_table\(",
+        r"\bcreate_franka\(",
     ]
     return any(re.search(p, txt) for p in mutation_patterns)
 
@@ -918,6 +1079,8 @@ def _process_commands():
                     "omni": omni, "Gf": Gf, "Sdf": Sdf, "Vt": Vt,
                     "UsdGeom": UsdGeom, "Usd": Usd, "UsdPhysics": UsdPhysics, "UsdShade": UsdShade,
                     "stage": _get_stage(), "world": world, "simulation_app": simulation_app,
+                    "create_table": _runtime_create_table,
+                    "create_franka": _runtime_create_franka,
                     "print": lambda *a, **kw: stdout_capture.write(" ".join(str(x) for x in a) + "\n"),
                     **_extra_globals,
                 }
