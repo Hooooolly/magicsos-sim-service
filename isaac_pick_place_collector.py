@@ -1561,12 +1561,41 @@ def _run_pick_place_episode(
         if stopped:
             break
 
-    # Mark this episode's final frame as done.
-    for i in range(len(writer.all_frames) - 1, -1, -1):
-        frame = writer.all_frames[i]
-        if int(frame.get("episode_index", -1)) == episode_index:
-            frame["next.done"] = True
-            break
+    if not grasp_succeeded and not stopped and attempt_used >= GRASP_MAX_ATTEMPTS:
+        LOG.warning(
+            "collect: episode %d marked failed after %d grasp attempts",
+            episode_index + 1,
+            GRASP_MAX_ATTEMPTS,
+        )
+
+    # Ensure failed episodes are still visible in dataset metadata/data tables.
+    # If no frame was emitted due early-return branches, write one snapshot frame.
+    if frame_index <= 0 and not stopped:
+        LOG.warning(
+            "collect: episode %d produced 0 frames; writing fallback snapshot frame",
+            episode_index + 1,
+        )
+        state = _extract_state_vector(franka, stage, eef_prim_path, get_prim_at_path, usd, usd_geom)
+        action = np.zeros((ACTION_DIM,), dtype=np.float32)
+        writer.add_frame(
+            episode_index=episode_index,
+            frame_index=0,
+            observation_state=state,
+            action=action,
+            timestamp=0.0,
+            next_done=True,
+        )
+        for cam_name, cam_obj in cameras.items():
+            rgb = _capture_rgb(cam_obj, CAMERA_RESOLUTION)
+            writer.add_video_frame(cam_name, rgb)
+        frame_index = 1
+    else:
+        # Mark this episode's final frame as done.
+        for i in range(len(writer.all_frames) - 1, -1, -1):
+            frame = writer.all_frames[i]
+            if int(frame.get("episode_index", -1)) == episode_index:
+                frame["next.done"] = True
+                break
 
     if not stopped:
         obj_pos, _ = _get_prim_world_pose(stage, object_prim_path, usd, usd_geom)

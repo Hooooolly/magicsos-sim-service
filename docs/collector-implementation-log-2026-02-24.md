@@ -527,3 +527,19 @@ Files in platform repo:
 - Expected effect:
   - Scene scripts calling `create_table`/`create_franka` execute successfully without NameError.
   - Reduced scene-chat execution failures surfacing as generic frontend fetch errors.
+
+## Hotfix (2026-02-25 05:48 UTC, failed-episode dataset visibility guarantee)
+- User requirement:
+  - If grasp fails after max retries (3), mark episode as failed and still complete one recorded episode so dataset remains visible.
+
+- Changes in `sim-service/isaac_pick_place_collector.py`:
+  - Added explicit failure log when retry budget is exhausted:
+    - `episode marked failed after 3 grasp attempts`.
+  - Added a dataset write safeguard:
+    - when an episode exits failure path with `frame_index == 0` and not interrupted,
+      collector writes one fallback snapshot frame (`next.done=True`) plus one camera frame per stream.
+    - ensures parquet/video entries exist for that episode and prevents "invisible" failed episodes.
+
+- Expected effect:
+  - 3x grasp failure is still treated as failed episode (for `done_with_failures` status).
+  - dataset remains visible and queryable even if an early-return branch produced no trajectory frames.
