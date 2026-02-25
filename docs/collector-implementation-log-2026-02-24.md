@@ -543,3 +543,48 @@ Files in platform repo:
 - Expected effect:
   - 3x grasp failure is still treated as failed episode (for `done_with_failures` status).
   - dataset remains visible and queryable even if an early-return branch produced no trajectory frames.
+
+## Hotfix (2026-02-25 06:40 UTC, VLM grasp-pose apply + per-frame grasp GT export)
+- User requirement:
+  - Mug/object grasp pose can come from VLM annotation JSON and be applied in collect planning.
+  - Dataset should expose per-frame grasp ground truth target location/orientation.
+
+- Changes in `sim-service/isaac_pick_place_collector.py`:
+  - Added grasp annotation discovery and loading:
+    - `_resolve_grasp_annotation_path(...)`:
+      - supports explicit `COLLECT_GRASP_POSE_PATH`
+      - supports `COLLECT_GRASP_POSE_DIR`
+      - auto-searches default local dirs (including `grasp_ops/assets`) using object-name tokens.
+    - `_load_grasp_pose_candidates(...)`:
+      - parses `functional_grasp` + `grasp.body` in `grasp_pose.json`.
+      - ranks candidates (handle label bonus + approach orientation score).
+  - Added annotation target apply in episode planner:
+    - `_select_annotation_grasp_target(...)` selects pose by attempt index.
+    - pick XY comes from selected annotation world pose when available.
+    - pick Z is clamped from annotation target with table-safety bounds.
+    - IK orientation is set from annotation quaternion for annotation-driven grasps.
+  - Added per-frame GT export payload:
+    - `_build_frame_extras(...)` writes:
+      - `observation.object_pose_world` (7D)
+      - `observation.grasp_target_pose_world` (7D)
+      - `observation.grasp_target_valid` (bool)
+      - `observation.grasp_target_source_id` (float id)
+    - exported on normal frames and fallback snapshot frame.
+
+- Changes in `sim-service/lerobot_writer.py`:
+  - Extended writer to support optional extra frame fields:
+    - `SimLeRobotWriter(..., extra_features=...)`
+    - `add_frame(..., extras=...)`
+  - `meta/info.json` now includes declared extra feature schema via `features.update(self.extra_features)`.
+
+- Compatibility notes:
+  - Existing 23D `observation.state` and 8D `action` are unchanged.
+  - Extra GT columns are additive and backward-compatible for consumers that ignore unknown fields.
+
+- Artifact produced in workspace:
+  - Ran VLM annotator on local mug mesh:
+    - input: `scenesmith/tests/test_data/.../coffee_mug.gltf`
+    - output: `sim-service/grasp_poses/mug_grasp_pose.json`
+  - Runtime summary:
+    - VLM region labels were returned, but face back-projection produced zero guided faces for this mesh.
+    - script fell back to blind antipodal + top-down and generated 54 body grasps.

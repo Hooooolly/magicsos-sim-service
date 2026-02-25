@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import os
 import re
 from pathlib import Path
 from typing import Any
@@ -59,15 +60,31 @@ def _find_named_usd(root: Path, name_prefix: str, recursive: bool) -> list[Path]
     it = root.rglob("*") if recursive else root.glob("*")
     pref = name_prefix.lower()
     return sorted([p for p in it if _is_usd(p) and p.stem.lower().startswith(pref)])
-def find_usd_for_object(scene_dir: Path | str, obj: dict[str, Any]) -> str | None:
+def find_usd_for_object(
+    scene_dir: Path | str,
+    obj: dict[str, Any],
+    *,
+    room_root: Path | None = None,
+    scene_state_path: Path | None = None,
+) -> str | None:
     """Find object USD using SceneSmith search order; fallback to geometry_path."""
     scene_root = Path(scene_dir).resolve()
+    room_root = room_root.resolve() if room_root is not None else None
+    scene_state_path = scene_state_path.resolve() if scene_state_path is not None else None
     name = str(obj.get("name") or obj.get("object_id") or "").strip()
-    search = [
-        (scene_root / "mujoco" / "usd" / "Payload", False),
-        (scene_root / "mujoco" / "usd", False),
-        (scene_root / "generated_assets", True),
-    ]
+    search: list[tuple[Path, bool]] = []
+    bases: list[Path] = []
+    for base in [room_root, scene_root]:
+        if isinstance(base, Path) and base not in bases:
+            bases.append(base)
+    for base in bases:
+        search.extend(
+            [
+                (base / "mujoco" / "usd" / "Payload", False),
+                (base / "mujoco" / "usd", False),
+                (base / "generated_assets", True),
+            ]
+        )
     for root, recursive in search:
         matches = _find_named_usd(root, name, recursive)
         if matches:
@@ -75,35 +92,91 @@ def find_usd_for_object(scene_dir: Path | str, obj: dict[str, Any]) -> str | Non
     geom = obj.get("geometry_path")
     if isinstance(geom, str) and geom.strip():
         p = Path(geom)
-        if not p.is_absolute():
-            p = scene_root / p
-        if p.exists():
-            return str(p.resolve())
+        candidates: list[Path] = []
+        if p.is_absolute():
+            candidates.append(p)
+        else:
+            if room_root is not None:
+                candidates.append(room_root / p)
+            if scene_state_path is not None:
+                # scene_state.json is usually under room_*/scene_states/final_scene/.
+                # Try resolving relative paths against both state dir and room dir.
+                state_dir = scene_state_path.parent
+                candidates.extend([state_dir / p, state_dir.parent / p, state_dir.parent.parent / p])
+            candidates.append(scene_root / p)
+        seen: set[str] = set()
+        for cand in candidates:
+            key = str(cand)
+            if key in seen:
+                continue
+            seen.add(key)
+            if cand.exists():
+                return str(cand.resolve())
     return None
 def find_room_usd(scene_dir: Path | str) -> str | None:
     scene_root = Path(scene_dir).resolve()
-    preferred = scene_root / "mujoco" / "usd" / "scene.usd"
-    if preferred.is_file():
-        return str(preferred.resolve())
-    found = discover_room_usd(scene_root)
-    return str(found.resolve()) if found else None
+    roots: list[Path] = [scene_root]
+    for child in sorted(scene_root.glob("room_*")):
+        if child.is_dir():
+            roots.append(child.resolve())
+    seen: set[str] = set()
+    unique_roots: list[Path] = []
+    for root in roots:
+        key = str(root)
+        if key in seen:
+            continue
+        seen.add(key)
+        unique_roots.append(root)
+    for root in unique_roots:
+        preferred = root / "mujoco" / "usd" / "scene.usd"
+        if preferred.is_file():
+            return str(preferred.resolve())
+    for root in unique_roots:
+        found = discover_room_usd(root)
+        if found:
+            return str(found.resolve())
+    return None
 def _scene_after_idx(path: Path) -> int:
     m = re.search(r"scene_after_(\d+)$", path.name)
     return int(m.group(1)) if m else -1
-def load_scene_state(scene_dir: str) -> dict[str, Any]:
+def _discover_scene_state(scene_root: Path) -> tuple[Path, Path]:
+    room_roots: list[Path] = []
+    direct_states = scene_root / "scene_states"
+    if direct_states.is_dir():
+        room_roots.append(scene_root)
+    for room in sorted(scene_root.glob("room_*")):
+        if room.is_dir() and (room / "scene_states").is_dir():
+            room_roots.append(room.resolve())
+    if not room_roots:
+        raise FileNotFoundError(f"No scene_states directory found under {scene_root} or scene_root/room_*")
+    for room_root in room_roots:
+        final_state = room_root / "scene_states" / "final_scene" / "scene_state.json"
+        if final_state.is_file():
+            return final_state, room_root
+    after_candidates: list[tuple[int, float, Path, Path]] = []
+    for room_root in room_roots:
+        states = room_root / "scene_states"
+        for after_dir in states.glob("scene_after_*"):
+            if not after_dir.is_dir():
+                continue
+            state_path = after_dir / "scene_state.json"
+            if state_path.is_file():
+                after_candidates.append((_scene_after_idx(after_dir), state_path.stat().st_mtime, state_path, room_root))
+    if after_candidates:
+        after_candidates.sort(key=lambda item: (item[0], item[1]), reverse=True)
+        _, _, state_path, room_root = after_candidates[0]
+        return state_path, room_root
+    searched = ", ".join(str(root / "scene_states") for root in room_roots)
+    raise FileNotFoundError(f"No scene_state.json found under: {searched}")
+def load_scene_state_with_meta(scene_dir: str) -> tuple[dict[str, Any], Path, Path]:
     scene_root = Path(scene_dir).resolve()
-    states = scene_root / "scene_states"
-    candidates: list[Path] = []
-    final_state = states / "final_scene" / "scene_state.json"
-    if final_state.is_file():
-        candidates.append(final_state)
-    after_dirs = sorted([p for p in states.glob("scene_after_*") if p.is_dir()], key=_scene_after_idx, reverse=True)
-    candidates.extend([p / "scene_state.json" for p in after_dirs if (p / "scene_state.json").is_file()])
-    if not candidates:
-        raise FileNotFoundError(f"No scene_state.json found under {states}/final_scene or scene_after_*")
-    data = json.loads(candidates[0].read_text(encoding="utf-8"))
+    state_path, room_root = _discover_scene_state(scene_root)
+    data = json.loads(state_path.read_text(encoding="utf-8"))
     if not isinstance(data, dict):
-        raise ValueError(f"scene_state.json at {candidates[0]} is not a JSON object")
+        raise ValueError(f"scene_state.json at {state_path} is not a JSON object")
+    return data, state_path, room_root
+def load_scene_state(scene_dir: str) -> dict[str, Any]:
+    data, _, _ = load_scene_state_with_meta(scene_dir)
     return data
 def physics_type_for_object(obj: dict[str, Any]) -> str:
     kind = str(obj.get("object_type", "")).strip().lower()
@@ -175,7 +248,11 @@ def _manual_yaml_dump(v: Any, indent: int = 0) -> str:
     return f"{sp}{_yaml_scalar(v)}"
 def generate_magicsim_yaml(scene_dir: str, output_path: str | None = None) -> str:
     scene_root = Path(scene_dir).resolve()
-    scene_state = load_scene_state(str(scene_root))
+    scene_state, state_path, room_root = load_scene_state_with_meta(str(scene_root))
+    if os.environ.get("SCENE_LOADER_DEBUG", "").lower() not in ("", "0", "false", "no"):
+        print(f"[scene_loader] debug: scene_root={scene_root}")
+        print(f"[scene_loader] debug: room_root={room_root}")
+        print(f"[scene_loader] debug: scene_state={state_path}")
     room_usd = find_room_usd(scene_root)
     doc: dict[str, Any] = {"objects": {}}
     if room_usd:
@@ -195,10 +272,14 @@ def generate_magicsim_yaml(scene_dir: str, output_path: str | None = None) -> st
     for object_id, obj in objects.items():
         if not isinstance(obj, dict):
             continue
-        usd_path = find_usd_for_object(scene_root, obj)
+        usd_path = find_usd_for_object(scene_root, obj, room_root=room_root, scene_state_path=state_path)
         if usd_path is None:
             print(f"[scene_loader] warning: skipping '{obj.get('name') or object_id}' (no USD/geometry path found)")
             continue
+        if Path(usd_path).suffix.lower() not in USD_SUFFIXES:
+            print(
+                f"[scene_loader] warning: '{obj.get('name') or object_id}' resolved to non-USD asset: {usd_path}"
+            )
         transform = obj.get("transform") if isinstance(obj.get("transform"), dict) else {}
         pos = _vec3(transform.get("translation"), (0.0, 0.0, 0.0))
         quat = transform.get("rotation_wxyz")
