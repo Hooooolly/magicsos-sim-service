@@ -172,7 +172,7 @@ Two cameras, same as grasp collector:
 | Camera | Prim Path | Position | Orientation | Purpose |
 |--------|-----------|----------|-------------|---------|
 | cam_high | `/World/OverheadCam` | `(0.3, -0.3, 1.3)` relative to robot | 25° tilt, focal 14mm | Overview of workspace |
-| cam_wrist | `{robot}/panda_hand/wrist_cam` | `(0.05, 0, 0.04)` on hand | 90° pitch | Close-up of grasp |
+| cam_wrist | `{robot}/panda_hand/wrist_cam` | ROS local pose `(0.025, 0, 0)` | ROS quat `(0.7071, 0, 0, 0.7071)` via `camera_axes="ros"` | Close-up of gripper/object |
 
 Resolution: 512×512 pixels, 30 FPS.
 

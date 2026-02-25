@@ -99,8 +99,8 @@ IK_PICK_GRASP_HEIGHT_RATIO = 0.60
 IK_PICK_MIN_CLEARANCE_FROM_TABLE = 0.01
 IK_PLACE_MIN_CLEARANCE_FROM_TABLE = 0.02
 GRASP_MAX_ATTEMPTS = 3
-REACH_BEFORE_CLOSE_MAX_OBJECT_EEF_DISTANCE = 0.10
-REACH_BEFORE_CLOSE_MAX_OBJECT_EEF_XY_DISTANCE = 0.04
+REACH_BEFORE_CLOSE_MAX_OBJECT_EEF_DISTANCE = 0.16
+REACH_BEFORE_CLOSE_MAX_OBJECT_EEF_XY_DISTANCE = 0.08
 CLOSE_HOLD_STEPS = 8
 VERIFY_CLOSE_MIN_GRIPPER_WIDTH = 0.0025
 VERIFY_CLOSE_MAX_OBJECT_EEF_DISTANCE = 0.25
@@ -112,8 +112,15 @@ ROBOT_REACH_RADIUS_Y = 0.75
 REACH_INTERSECTION_MIN_SPAN = 0.25
 PICK_CLAMP_MAX_DELTA = 0.03
 DEFAULT_EPISODE_TIMEOUT_SEC = 180.0
-WRIST_CAM_TRANSLATE = (0.05, 0.0, 0.04)
-WRIST_CAM_ROTATE_XYZ = (10.0, 90.0, 0.0)
+STATE_JOINT_VEL_CLIP_RAD_S = 20.0
+# Use ROS camera frame pose for wrist camera to avoid USD axis confusion:
+# - +Z forward, +Y up (camera_axes='ros').
+# These values align with common IsaacLab hand-camera usage.
+WRIST_CAM_LOCAL_POS_ROS = (0.025, 0.0, 0.0)
+WRIST_CAM_LOCAL_QUAT_ROS = (0.7071068, 0.0, 0.0, 0.7071068)
+# Fallback when Camera.set_local_pose(camera_axes=...) is unavailable.
+WRIST_CAM_FALLBACK_TRANSLATE = (0.0, 0.0, 0.10)
+WRIST_CAM_FALLBACK_ROTATE_XYZ = (0.0, 180.0, 0.0)
 
 COLLECTOR_ROOT = "/World/PickPlaceCollector"
 TABLE_PRIM_PATH = f"{COLLECTOR_ROOT}/Table"
@@ -288,6 +295,49 @@ def _transform_local_pose_to_world(
     world_pos = obj_p[:3] + rot @ loc_p[:3]
     world_quat = _quat_mul_wxyz(obj_q, loc_q)
     return world_pos.astype(np.float32), world_quat.astype(np.float32)
+
+
+def _apply_wrist_camera_pose(
+    camera_wrist: Any | None,
+    stage: Any,
+    usd_geom: Any,
+    gf: Any,
+    wrist_cam_path: Optional[str] = None,
+) -> None:
+    """Set a stable wrist-camera pose with ROS camera-axis semantics.
+
+    Primary path uses Camera.set_local_pose(..., camera_axes='ros'), which avoids
+    manual USD/OpenGL axis conversion mistakes. If unavailable, fallback to a
+    conservative USD transform that looks outward from the hand.
+    """
+    cam_path = str(wrist_cam_path or getattr(camera_wrist, "prim_path", "") or "")
+    ros_pos = np.array(WRIST_CAM_LOCAL_POS_ROS, dtype=np.float32)
+    ros_quat = np.array(WRIST_CAM_LOCAL_QUAT_ROS, dtype=np.float32)
+
+    if camera_wrist is not None and hasattr(camera_wrist, "set_local_pose"):
+        try:
+            camera_wrist.set_local_pose(ros_pos, ros_quat, camera_axes="ros")
+            return
+        except TypeError:
+            # Older Isaac builds may not expose camera_axes arg.
+            try:
+                camera_wrist.set_local_pose(ros_pos, ros_quat)
+                LOG.warning("collect: wrist camera set_local_pose fallback without camera_axes")
+                return
+            except Exception as exc:
+                LOG.warning("collect: wrist camera set_local_pose fallback failed: %s", exc)
+        except Exception as exc:
+            LOG.warning("collect: wrist camera set_local_pose failed: %s", exc)
+
+    if not cam_path or stage is None:
+        return
+    wrist_prim = stage.GetPrimAtPath(cam_path)
+    if not wrist_prim or not wrist_prim.IsValid():
+        return
+    wrist_xform = usd_geom.Xformable(wrist_prim)
+    wrist_xform.ClearXformOpOrder()
+    wrist_xform.AddTranslateOp().Set(gf.Vec3d(*WRIST_CAM_FALLBACK_TRANSLATE))
+    wrist_xform.AddRotateXYZOp().Set(gf.Vec3f(*WRIST_CAM_FALLBACK_ROTATE_XYZ))
 
 
 def _object_token_candidates(object_prim_path: str) -> list[str]:
@@ -492,6 +542,47 @@ def _build_frame_extras(
         "observation.grasp_target_valid": bool(valid),
         "observation.grasp_target_source_id": float(source_id),
     }
+
+
+def _compute_live_grasp_target_pose(
+    stage: Any,
+    object_prim_path: str,
+    usd: Any,
+    usd_geom: Any,
+    current_target: Optional[dict[str, Any]],
+    z_override: float | None = None,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Resolve grasp target pose from live object ground truth.
+
+    For annotation targets, keep local grasp pose attached to the object's live pose.
+    For fallback targets, track live object center in XY and preserve target Z/orientation when available.
+    """
+    obj_pos, obj_quat = _get_object_tracking_pose(stage, object_prim_path, usd, usd_geom)
+    tgt_pos = obj_pos.astype(np.float32, copy=True)
+    tgt_quat = _normalize_quat_wxyz(obj_quat)
+
+    if current_target:
+        if current_target.get("source") == "annotation":
+            tgt_pos, tgt_quat = _transform_local_pose_to_world(
+                object_pos=obj_pos,
+                object_quat=obj_quat,
+                local_pos=_to_numpy(current_target.get("local_pos"), dtype=np.float32),
+                local_quat=_to_numpy(current_target.get("local_quat"), dtype=np.float32),
+            )
+            tgt_pos = _to_numpy(tgt_pos, dtype=np.float32)[:3]
+            tgt_quat = _normalize_quat_wxyz(_to_numpy(tgt_quat, dtype=np.float32))
+        else:
+            raw_pos = _to_numpy(current_target.get("target_pos"), dtype=np.float32).reshape(-1)
+            raw_quat = _to_numpy(current_target.get("target_quat"), dtype=np.float32).reshape(-1)
+            if raw_pos.size >= 3 and np.isfinite(raw_pos[2]):
+                tgt_pos[2] = float(raw_pos[2])
+            if raw_quat.size >= 4:
+                tgt_quat = _normalize_quat_wxyz(raw_quat[:4])
+
+    if z_override is not None and np.isfinite(float(z_override)):
+        tgt_pos[2] = float(z_override)
+
+    return tgt_pos.astype(np.float32, copy=False), tgt_quat.astype(np.float32, copy=False)
 
 
 def _select_ik_frame_name(frame_names: Sequence[str], eef_prim_path: str) -> Optional[str]:
@@ -1242,7 +1333,8 @@ def _extract_state_vector(
     joint_vel_padded = _pad_or_trim(joint_velocities_all, 7)
 
     joint_pos = joint_pos_padded[:7]
-    joint_vel = joint_vel_padded[:7]
+    joint_vel = np.nan_to_num(joint_vel_padded[:7], nan=0.0, posinf=0.0, neginf=0.0)
+    joint_vel = np.clip(joint_vel, -STATE_JOINT_VEL_CLIP_RAD_S, STATE_JOINT_VEL_CLIP_RAD_S)
     gripper_pos = joint_pos_padded[7:9]
     eef_pos, eef_quat = _get_eef_pose(stage, eef_prim_path, get_prim_at_path, usd, usd_geom)
 
@@ -1593,6 +1685,54 @@ def _run_pick_place_episode(
                 cam_obj.initialize()
             except Exception as exc:
                 LOG.warning("Camera initialize() failed after reset: %s", exc)
+    _apply_wrist_camera_pose(
+        camera_wrist=cameras.get("cam_wrist"),
+        stage=stage,
+        usd_geom=usd_geom,
+        gf=gf,
+        wrist_cam_path=getattr(cameras.get("cam_wrist"), "prim_path", None),
+    )
+    current_grasp_target: dict[str, Any] | None = None
+
+    def _current_arm_target() -> np.ndarray:
+        joints = _to_numpy(franka.get_joint_positions())
+        return _pad_or_trim(joints[:7], 7)
+
+    def _current_gripper_target() -> float:
+        joints = _to_numpy(franka.get_joint_positions())
+        if joints.size >= 9:
+            return float(0.5 * (joints[7] + joints[8]))
+        if joints.size == 8:
+            return float(joints[7])
+        return float(GRIPPER_OPEN)
+
+    def _record_frame(arm_target: Optional[np.ndarray] = None, gripper_target: Optional[float] = None) -> None:
+        nonlocal frame_index
+        arm_cmd = _current_arm_target() if arm_target is None else _pad_or_trim(_to_numpy(arm_target), 7)
+        grip_cmd = _current_gripper_target() if gripper_target is None else float(gripper_target)
+        state = _extract_state_vector(franka, stage, eef_prim_path, get_prim_at_path, usd, usd_geom)
+        action = np.concatenate([arm_cmd, np.array([grip_cmd], dtype=np.float32)], axis=0)
+        action = _pad_or_trim(action, ACTION_DIM)
+        frame_extras = _build_frame_extras(
+            stage=stage,
+            object_prim_path=object_prim_path,
+            usd=usd,
+            usd_geom=usd_geom,
+            current_target=current_grasp_target,
+        )
+        writer.add_frame(
+            episode_index=episode_index,
+            frame_index=frame_index,
+            observation_state=state,
+            action=action,
+            timestamp=frame_index / float(fps),
+            next_done=False,
+            extras=frame_extras,
+        )
+        for cam_name, cam_obj in cameras.items():
+            rgb = _capture_rgb(cam_obj, CAMERA_RESOLUTION)
+            writer.add_video_frame(cam_name, rgb)
+        frame_index += 1
 
     frame_index = 0
     stopped = False
@@ -1601,7 +1741,6 @@ def _run_pick_place_episode(
     grasp_succeeded = False
     attempt_used = 0
     ik_target_orientation: np.ndarray | None = None
-    current_grasp_target: dict[str, Any] | None = None
     episode_started = time.monotonic()
     timeout_sec = max(0.0, float(episode_timeout_sec))
 
@@ -1635,8 +1774,51 @@ def _run_pick_place_episode(
         stopped = True
         return True
 
-    def _execute_transitions(transitions: list[tuple[Any, Any]]) -> None:
-        nonlocal frame_index, stopped
+    def _execute_transitions(
+        transitions: list[tuple[Any, Any]],
+        live_target_z_by_waypoint: Optional[dict[str, float]] = None,
+    ) -> None:
+        nonlocal frame_index, stopped, current_grasp_target
+
+        def _resolve_live_arm_target(waypoint_name: str, fallback_arm: np.ndarray) -> np.ndarray:
+            if not live_target_z_by_waypoint or waypoint_name not in live_target_z_by_waypoint:
+                return fallback_arm
+            if ik_solver is None:
+                return fallback_arm
+            live_pos, live_quat = _compute_live_grasp_target_pose(
+                stage=stage,
+                object_prim_path=object_prim_path,
+                usd=usd,
+                usd_geom=usd_geom,
+                current_target=current_grasp_target,
+                z_override=float(live_target_z_by_waypoint[waypoint_name]),
+            )
+            # Keep live target inside current workspace envelope.
+            live_pos = live_pos.copy()
+            live_pos[0] = float(np.clip(live_pos[0], table_x_range[0], table_x_range[1]))
+            live_pos[1] = float(np.clip(live_pos[1], table_y_range[0], table_y_range[1]))
+            current_target_orientation = ik_target_orientation if ik_target_orientation is not None else live_quat
+            q = _solve_ik_arm_target(
+                ik_solver,
+                target_position=live_pos,
+                target_orientation=current_target_orientation,
+            )
+            if q is None and current_target_orientation is not None:
+                q = _solve_ik_arm_target(
+                    ik_solver,
+                    target_position=live_pos,
+                    target_orientation=None,
+                )
+            if q is None:
+                return fallback_arm
+
+            # Keep fallback targets synchronized with live world target for logging/action extras.
+            if current_grasp_target is not None and current_grasp_target.get("source") != "annotation":
+                current_grasp_target["target_pos"] = live_pos.astype(np.float32, copy=False)
+                current_grasp_target["target_quat"] = _normalize_quat_wxyz(current_target_orientation)
+                current_grasp_target["valid"] = True
+            return q.astype(np.float32, copy=False)
+
         for start_wp, end_wp in transitions:
             _, start_arm, start_gripper = start_wp
             end_name, end_arm, end_gripper = end_wp
@@ -1649,47 +1831,31 @@ def _run_pick_place_episode(
                     return
 
                 alpha = float(step + 1) / float(steps_per_segment)
-                arm_target = ((1.0 - alpha) * start_arm + alpha * end_arm).astype(np.float32)
+                live_end_arm = _resolve_live_arm_target(end_name, end_arm)
+                if live_target_z_by_waypoint and end_name in live_target_z_by_waypoint:
+                    # In live-tracking mode, command directly toward refreshed IK target.
+                    arm_target = live_end_arm.astype(np.float32, copy=False)
+                else:
+                    arm_target = ((1.0 - alpha) * start_arm + alpha * live_end_arm).astype(np.float32)
                 gripper_target = float((1.0 - alpha) * start_gripper + alpha * end_gripper)
 
                 arm_cmd, gr_cmd = _step_toward_joint_targets(franka, arm_target, gripper_target)
                 _set_joint_targets(franka, arm_cmd, gr_cmd, physics_control=True)
                 world.step(render=True)
-
-                state = _extract_state_vector(franka, stage, eef_prim_path, get_prim_at_path, usd, usd_geom)
-                action = np.concatenate([arm_target, np.array([gripper_target], dtype=np.float32)], axis=0)
-                action = _pad_or_trim(action, ACTION_DIM)
-                frame_extras = _build_frame_extras(
-                    stage=stage,
-                    object_prim_path=object_prim_path,
-                    usd=usd,
-                    usd_geom=usd_geom,
-                    current_target=current_grasp_target,
-                )
-                writer.add_frame(
-                    episode_index=episode_index,
-                    frame_index=frame_index,
-                    observation_state=state,
-                    action=action,
-                    timestamp=frame_index / float(fps),
-                    next_done=False,
-                    extras=frame_extras,
-                )
-                for cam_name, cam_obj in cameras.items():
-                    rgb = _capture_rgb(cam_obj, CAMERA_RESOLUTION)
-                    writer.add_video_frame(cam_name, rgb)
-                frame_index += 1
+                _record_frame(arm_target=arm_target, gripper_target=gripper_target)
 
             if stopped:
                 return
 
             if end_name == "CLOSE":
+                close_arm = _resolve_live_arm_target(end_name, end_arm)
                 for _ in range(20):
                     if _timeout_triggered():
                         return
-                    arm_cmd, gr_cmd = _step_toward_joint_targets(franka, end_arm, end_gripper)
+                    arm_cmd, gr_cmd = _step_toward_joint_targets(franka, close_arm, end_gripper)
                     _set_joint_targets(franka, arm_cmd, gr_cmd, physics_control=True)
                     world.step(render=True)
+                    _record_frame(arm_target=close_arm, gripper_target=end_gripper)
 
             if end_name == "OPEN":
                 for _ in range(10):
@@ -1698,6 +1864,7 @@ def _run_pick_place_episode(
                     arm_cmd, gr_cmd = _step_toward_joint_targets(franka, end_arm, end_gripper)
                     _set_joint_targets(franka, arm_cmd, gr_cmd, physics_control=True)
                     world.step(render=True)
+                    _record_frame(arm_target=end_arm, gripper_target=end_gripper)
 
     def _retreat_to_home_open(home_arm: np.ndarray, lift_arm: np.ndarray) -> None:
         nonlocal stopped
@@ -1707,6 +1874,7 @@ def _run_pick_place_episode(
             arm_cmd, gr_cmd = _step_toward_joint_targets(franka, lift_arm, GRIPPER_OPEN)
             _set_joint_targets(franka, arm_cmd, gr_cmd, physics_control=True)
             world.step(render=True)
+            _record_frame(arm_target=lift_arm, gripper_target=GRIPPER_OPEN)
         if stopped:
             return
         for _ in range(30):
@@ -1715,6 +1883,7 @@ def _run_pick_place_episode(
             arm_cmd, gr_cmd = _step_toward_joint_targets(franka, home_arm, GRIPPER_OPEN)
             _set_joint_targets(franka, arm_cmd, gr_cmd, physics_control=True)
             world.step(render=True)
+            _record_frame(arm_target=home_arm, gripper_target=GRIPPER_OPEN)
 
     for attempt in range(1, GRASP_MAX_ATTEMPTS + 1):
         if _timeout_triggered():
@@ -1756,7 +1925,7 @@ def _run_pick_place_episode(
         clamp_delta = float(np.linalg.norm(np.array([pick_x - raw_pick_x, pick_y - raw_pick_y], dtype=np.float32)))
         if clamp_delta > PICK_CLAMP_MAX_DELTA and np.isfinite(raw_pick_x) and np.isfinite(raw_pick_y):
             LOG.warning(
-                "collect: attempt %d workspace mismatch (%s raw=(%.3f, %.3f), clamped=(%.3f, %.3f), delta=%.3f) -> using raw pick pose",
+                "collect: attempt %d workspace mismatch (%s raw=(%.3f, %.3f), clamped=(%.3f, %.3f), delta=%.3f) -> using CLAMPED live target",
                 attempt,
                 pick_source,
                 raw_pick_x,
@@ -1765,7 +1934,26 @@ def _run_pick_place_episode(
                 pick_y,
                 clamp_delta,
             )
-            pick_x, pick_y = raw_pick_x, raw_pick_y
+            # Keep target inside robot-table reachable workspace for physically valid approach.
+            if current_grasp_target is not None:
+                if current_grasp_target.get("source") == "annotation":
+                    # Annotation can point to unreachable local handles; switch to live bbox target.
+                    current_grasp_target = {
+                        "target_pos": np.array([pick_x, pick_y, float(table_top_z)], dtype=np.float32),
+                        "target_quat": np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32),
+                        "source": "bbox_center",
+                        "source_id": GRASP_POSE_SOURCE_IDS["bbox_center"],
+                        "valid": True,
+                    }
+                else:
+                    pos = _to_numpy(current_grasp_target.get("target_pos"), dtype=np.float32).reshape(-1)
+                    if pos.size < 3:
+                        pos = np.array([pick_x, pick_y, float(table_top_z)], dtype=np.float32)
+                    else:
+                        pos = pos.copy()
+                        pos[0] = pick_x
+                        pos[1] = pick_y
+                    current_grasp_target["target_pos"] = pos.astype(np.float32, copy=False)
         last_pick_pos = (pick_x, pick_y)
         if abs(pick_x - raw_pick_x) > 1e-3 or abs(pick_y - raw_pick_y) > 1e-3:
             LOG.warning(
@@ -1815,6 +2003,7 @@ def _run_pick_place_episode(
 
         for _ in range(8):
             world.step(render=True)
+            _record_frame()
 
         waypoints = _make_pick_place_waypoints_ik(
             ik_solver=ik_solver,
@@ -1851,6 +2040,7 @@ def _run_pick_place_episode(
             arm_cmd, gr_cmd = _step_toward_joint_targets(franka, home_arm, home_gripper)
             _set_joint_targets(franka, arm_cmd, gr_cmd, physics_control=True)
             world.step(render=True)
+            _record_frame(arm_target=home_arm, gripper_target=home_gripper)
         if stopped:
             break
 
@@ -1858,7 +2048,14 @@ def _run_pick_place_episode(
         lift_transitions = list(zip(waypoints[close_idx:lift_idx], waypoints[close_idx + 1 : lift_idx + 1]))
         place_transitions = list(zip(waypoints[lift_idx:-1], waypoints[lift_idx + 1 :]))
 
-        _execute_transitions(pick_transitions)
+        _execute_transitions(
+            pick_transitions,
+            live_target_z_by_waypoint={
+                "APPROACH_PICK": float(z_targets["pick_approach_z"]),
+                "DOWN_PICK": float(z_targets["pick_grasp_z"]),
+                "CLOSE": float(z_targets["pick_grasp_z"]),
+            },
+        )
         if stopped:
             break
 
@@ -1895,6 +2092,7 @@ def _run_pick_place_episode(
                 arm_cmd, gr_cmd = _step_toward_joint_targets(franka, close_arm, GRIPPER_CLOSED)
                 _set_joint_targets(franka, arm_cmd, gr_cmd, physics_control=True)
                 world.step(render=True)
+                _record_frame(arm_target=close_arm, gripper_target=GRIPPER_CLOSED)
         if stopped:
             break
 
@@ -2029,6 +2227,7 @@ def _run_pick_place_episode(
                 arm_cmd, gr_cmd = _step_toward_joint_targets(franka, HOME, GRIPPER_OPEN)
                 _set_joint_targets(franka, arm_cmd, gr_cmd, physics_control=True)
                 world.step(render=True)
+                _record_frame(arm_target=HOME, gripper_target=GRIPPER_OPEN)
             LOG.info("Episode %d returned to HOME pose", episode_index + 1)
         except Exception as exc:
             LOG.warning("Episode %d failed to return HOME pose: %s", episode_index + 1, exc)
@@ -2099,10 +2298,10 @@ def _setup_pick_place_scene_template(
     wrist_prim = wrist_cam_usd.GetPrim()
     wrist_xform = UsdGeom.Xformable(wrist_prim)
     wrist_xform.ClearXformOpOrder()
-    # Place wrist camera slightly in front of the hand and pitch downward
-    # so fingers + grasp target remain in view.
-    wrist_xform.AddTranslateOp().Set(Gf.Vec3d(*WRIST_CAM_TRANSLATE))
-    wrist_xform.AddRotateXYZOp().Set(Gf.Vec3f(*WRIST_CAM_ROTATE_XYZ))
+    # Conservative fallback USD pose; precise ROS-frame pose is applied later
+    # via Camera.set_local_pose(..., camera_axes='ros') after initialization.
+    wrist_xform.AddTranslateOp().Set(Gf.Vec3d(*WRIST_CAM_FALLBACK_TRANSLATE))
+    wrist_xform.AddRotateXYZOp().Set(Gf.Vec3f(*WRIST_CAM_FALLBACK_ROTATE_XYZ))
     wrist_cam_usd.GetFocalLengthAttr().Set(14.0)
     wrist_cam_usd.GetClippingRangeAttr().Set(Gf.Vec2f(0.01, 1000.0))
 
@@ -2193,6 +2392,13 @@ def _setup_pick_place_scene_template(
                 cam.initialize()
             except Exception as exc:
                 LOG.warning("Camera initialize() failed: %s", exc)
+    _apply_wrist_camera_pose(
+        camera_wrist=camera_wrist,
+        stage=stage,
+        usd_geom=UsdGeom,
+        gf=Gf,
+        wrist_cam_path=WRIST_CAM_PATH,
+    )
 
     eef_prim_path = _resolve_eef_prim(stage, ROBOT_PRIM_PATH, get_prim_at_path)
     if eef_prim_path is None:
@@ -2421,8 +2627,8 @@ def _setup_pick_place_scene_reuse_or_patch(
         wrist_usd = UsdGeom.Camera(wrist_prim)
         wrist_xf = UsdGeom.Xformable(wrist_prim)
         wrist_xf.ClearXformOpOrder()
-        wrist_xf.AddTranslateOp().Set(Gf.Vec3d(*WRIST_CAM_TRANSLATE))
-        wrist_xf.AddRotateXYZOp().Set(Gf.Vec3f(*WRIST_CAM_ROTATE_XYZ))
+        wrist_xf.AddTranslateOp().Set(Gf.Vec3d(*WRIST_CAM_FALLBACK_TRANSLATE))
+        wrist_xf.AddRotateXYZOp().Set(Gf.Vec3f(*WRIST_CAM_FALLBACK_ROTATE_XYZ))
         try:
             wrist_usd.GetFocalLengthAttr().Set(14.0)
             wrist_usd.GetClippingRangeAttr().Set(Gf.Vec2f(0.01, 1000.0))
@@ -2465,6 +2671,13 @@ def _setup_pick_place_scene_reuse_or_patch(
                 cam.initialize()
             except Exception as exc:
                 LOG.warning("Camera initialize() failed: %s", exc)
+    _apply_wrist_camera_pose(
+        camera_wrist=camera_wrist,
+        stage=stage,
+        usd_geom=UsdGeom,
+        gf=Gf,
+        wrist_cam_path=wrist_cam_path,
+    )
 
     from omni.isaac.core.utils.prims import get_prim_at_path
 
@@ -2530,7 +2743,7 @@ def run_collection_in_process(
     os.makedirs(output_dir, exist_ok=True)
 
     rng = np.random.default_rng(seed)
-    if scene_mode in {"auto", "reuse", "existing", "patch"}:
+    if scene_mode in {"auto", "reuse", "existing", "patch", "preserve"}:
         ctx = _setup_pick_place_scene_reuse_or_patch(
             world=world,
             simulation_app=simulation_app,
