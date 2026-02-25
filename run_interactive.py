@@ -77,6 +77,17 @@ class _TeeTextStream:
         except Exception:
             return False
 
+    def fileno(self):
+        for s in self._streams:
+            try:
+                return int(s.fileno())
+            except Exception:
+                continue
+        try:
+            return int(sys.__stderr__.fileno())
+        except Exception:
+            return 2
+
 
 def _resolve_persistent_log_dir() -> Path | None:
     candidates: list[Path] = []
