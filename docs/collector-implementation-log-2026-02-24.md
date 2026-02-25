@@ -472,3 +472,32 @@ Files in platform repo:
 - Expected effect:
   - Pick XY tracks the actual object center more robustly after contact disturbances.
   - Planning no longer depends on object prim pivot alignment for normal cases.
+
+## Hotfix (2026-02-25 04:35 UTC, phase-gated pure-physics grasp flow aligned with MagicSim style)
+- User requirement:
+  - Non-MagicSim collector should follow robust grasp phase logic similar to MagicSim:
+    - reach gate before close
+    - close verification
+    - retrieval verification
+    - retry with replan
+  - Keep pure physics grasp (no attach/fixed-joint).
+
+- Changes in `sim-service/isaac_pick_place_collector.py`:
+  - Added phase gate thresholds:
+    - `REACH_BEFORE_CLOSE_MAX_OBJECT_EEF_DISTANCE`
+    - `REACH_BEFORE_CLOSE_MAX_OBJECT_EEF_XY_DISTANCE`
+    - `CLOSE_HOLD_STEPS`
+  - Added `_verify_reach_before_close(...)`.
+  - Reworked episode attempt flow:
+    - execute to `CLOSE` phase, then run `reach_before_close` verification
+    - hold close command for short settle cycles
+    - run close verification
+    - execute lift phase
+    - run retrieval verification
+    - on any failure: open gripper + retreat home + retry (replan from live object pose next attempt)
+  - No attach/fake binding introduced.
+
+- Expected effect:
+  - Fewer premature close events when gripper has not really reached grasp area.
+  - Cleaner retry behavior and fewer "poking table" attempts.
+  - Behavior closer to MagicSim’s robust non-learning grasp loop while remaining dependency-free.

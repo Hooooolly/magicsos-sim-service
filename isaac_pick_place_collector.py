@@ -98,6 +98,9 @@ IK_PICK_GRASP_HEIGHT_RATIO = 0.60
 IK_PICK_MIN_CLEARANCE_FROM_TABLE = 0.01
 IK_PLACE_MIN_CLEARANCE_FROM_TABLE = 0.02
 GRASP_MAX_ATTEMPTS = 3
+REACH_BEFORE_CLOSE_MAX_OBJECT_EEF_DISTANCE = 0.10
+REACH_BEFORE_CLOSE_MAX_OBJECT_EEF_XY_DISTANCE = 0.04
+CLOSE_HOLD_STEPS = 15
 VERIFY_CLOSE_MIN_GRIPPER_WIDTH = 0.006
 VERIFY_CLOSE_MAX_OBJECT_EEF_DISTANCE = 0.12
 VERIFY_CLOSE_MAX_OBJECT_EEF_XY_DISTANCE = 0.05
@@ -1214,6 +1217,13 @@ def _verify_after_retrieval(metrics: dict[str, float]) -> bool:
     )
 
 
+def _verify_reach_before_close(metrics: dict[str, float]) -> bool:
+    return bool(
+        metrics.get("object_eef_distance", 1e9) <= REACH_BEFORE_CLOSE_MAX_OBJECT_EEF_DISTANCE
+        and metrics.get("object_eef_xy_distance", 1e9) <= REACH_BEFORE_CLOSE_MAX_OBJECT_EEF_XY_DISTANCE
+    )
+
+
 def _run_pick_place_episode(
     episode_index: int,
     world: Any,
@@ -1331,6 +1341,23 @@ def _run_pick_place_episode(
                     _set_joint_targets(franka, arm_cmd, gr_cmd, physics_control=True)
                     world.step(render=True)
 
+    def _retreat_to_home_open(home_arm: np.ndarray, lift_arm: np.ndarray) -> None:
+        nonlocal stopped
+        for _ in range(20):
+            if _timeout_triggered():
+                break
+            arm_cmd, gr_cmd = _step_toward_joint_targets(franka, lift_arm, GRIPPER_OPEN)
+            _set_joint_targets(franka, arm_cmd, gr_cmd, physics_control=True)
+            world.step(render=True)
+        if stopped:
+            return
+        for _ in range(30):
+            if _timeout_triggered():
+                break
+            arm_cmd, gr_cmd = _step_toward_joint_targets(franka, home_arm, GRIPPER_OPEN)
+            _set_joint_targets(franka, arm_cmd, gr_cmd, physics_control=True)
+            world.step(render=True)
+
     for attempt in range(1, GRASP_MAX_ATTEMPTS + 1):
         if _timeout_triggered():
             break
@@ -1408,10 +1435,18 @@ def _run_pick_place_episode(
             waypoints = _make_pick_place_waypoints(last_pick_pos, place_pos, rng, work_center=work_center)
 
         names = [wp[0] for wp in waypoints]
-        if "LIFT" not in names:
-            LOG.warning("collect: invalid waypoint list without LIFT, skipping episode")
+        if "CLOSE" not in names or "LIFT" not in names:
+            LOG.warning("collect: invalid waypoint list without CLOSE/LIFT, skipping episode")
             break
+        close_idx = names.index("CLOSE")
         lift_idx = names.index("LIFT")
+        if close_idx <= 0 or lift_idx <= close_idx:
+            LOG.warning(
+                "collect: invalid waypoint order (close_idx=%d lift_idx=%d), skipping episode",
+                close_idx,
+                lift_idx,
+            )
+            break
 
         _, home_arm, home_gripper = waypoints[0]
         for _ in range(30):
@@ -1423,14 +1458,15 @@ def _run_pick_place_episode(
         if stopped:
             break
 
-        pick_transitions = list(zip(waypoints[:lift_idx], waypoints[1 : lift_idx + 1]))
+        pick_transitions = list(zip(waypoints[:close_idx], waypoints[1 : close_idx + 1]))
+        lift_transitions = list(zip(waypoints[close_idx:lift_idx], waypoints[close_idx + 1 : lift_idx + 1]))
         place_transitions = list(zip(waypoints[lift_idx:-1], waypoints[lift_idx + 1 :]))
 
         _execute_transitions(pick_transitions)
         if stopped:
             break
 
-        metrics = _compute_grasp_metrics(
+        reach_metrics = _compute_grasp_metrics(
             franka=franka,
             stage=stage,
             eef_prim_path=eef_prim_path,
@@ -1441,38 +1477,87 @@ def _run_pick_place_episode(
             table_top_z=table_top_z,
             object_height=object_height,
         )
-        close_ok = _verify_after_close(metrics)
-        retrieval_ok = _verify_after_retrieval(metrics)
+        reach_ok = _verify_reach_before_close(reach_metrics)
+        if not reach_ok:
+            LOG.warning(
+                "collect: grasp retry %d/%d reach_before_close failed metrics=%s",
+                attempt,
+                GRASP_MAX_ATTEMPTS,
+                reach_metrics,
+            )
+            lift_arm = waypoints[lift_idx][1]
+            _retreat_to_home_open(home_arm=home_arm, lift_arm=lift_arm)
+            if stopped:
+                break
+            continue
 
-        if close_ok and retrieval_ok:
+        if CLOSE_HOLD_STEPS > 0:
+            close_arm = waypoints[close_idx][1]
+            for _ in range(CLOSE_HOLD_STEPS):
+                if _timeout_triggered():
+                    break
+                arm_cmd, gr_cmd = _step_toward_joint_targets(franka, close_arm, GRIPPER_CLOSED)
+                _set_joint_targets(franka, arm_cmd, gr_cmd, physics_control=True)
+                world.step(render=True)
+        if stopped:
+            break
+
+        close_metrics = _compute_grasp_metrics(
+            franka=franka,
+            stage=stage,
+            eef_prim_path=eef_prim_path,
+            get_prim_at_path=get_prim_at_path,
+            usd=usd,
+            usd_geom=usd_geom,
+            object_prim_path=object_prim_path,
+            table_top_z=table_top_z,
+            object_height=object_height,
+        )
+        close_ok = _verify_after_close(close_metrics)
+        if not close_ok:
+            LOG.warning(
+                "collect: grasp retry %d/%d close_verify failed metrics=%s",
+                attempt,
+                GRASP_MAX_ATTEMPTS,
+                close_metrics,
+            )
+            lift_arm = waypoints[lift_idx][1]
+            _retreat_to_home_open(home_arm=home_arm, lift_arm=lift_arm)
+            if stopped:
+                break
+            continue
+
+        _execute_transitions(lift_transitions)
+        if stopped:
+            break
+
+        retrieval_metrics = _compute_grasp_metrics(
+            franka=franka,
+            stage=stage,
+            eef_prim_path=eef_prim_path,
+            get_prim_at_path=get_prim_at_path,
+            usd=usd,
+            usd_geom=usd_geom,
+            object_prim_path=object_prim_path,
+            table_top_z=table_top_z,
+            object_height=object_height,
+        )
+        retrieval_ok = _verify_after_retrieval(retrieval_metrics)
+
+        if retrieval_ok:
             grasp_succeeded = True
             _execute_transitions(place_transitions)
             break
 
         LOG.warning(
-            "collect: grasp retry %d/%d close_ok=%s retrieval_ok=%s metrics=%s",
+            "collect: grasp retry %d/%d retrieval_verify failed metrics=%s",
             attempt,
             GRASP_MAX_ATTEMPTS,
-            close_ok,
-            retrieval_ok,
-            metrics,
+            retrieval_metrics,
         )
 
         lift_arm = waypoints[lift_idx][1]
-        for _ in range(20):
-            if _timeout_triggered():
-                break
-            arm_cmd, gr_cmd = _step_toward_joint_targets(franka, lift_arm, GRIPPER_OPEN)
-            _set_joint_targets(franka, arm_cmd, gr_cmd, physics_control=True)
-            world.step(render=True)
-        if stopped:
-            break
-        for _ in range(30):
-            if _timeout_triggered():
-                break
-            arm_cmd, gr_cmd = _step_toward_joint_targets(franka, home_arm, GRIPPER_OPEN)
-            _set_joint_targets(franka, arm_cmd, gr_cmd, physics_control=True)
-            world.step(render=True)
+        _retreat_to_home_open(home_arm=home_arm, lift_arm=lift_arm)
         if stopped:
             break
 
