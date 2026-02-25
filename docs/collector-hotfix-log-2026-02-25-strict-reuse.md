@@ -41,3 +41,11 @@ If required scene elements are missing, collect fails with a direct reason inste
   - /World/OverheadCam
   - <robot>/panda_hand/wrist_cam
 - Table/Franka/target object remain strict-required and are never auto-created.
+
+## Update (articulation init)
+- In strict mode, collector now also runs world.reset() before initialize() to ensure valid articulation views and avoid  errors.
+- This reset is for sim-view initialization on current stage; no template scene creation path is enabled.
+
+## Update (articulation init)
+- In strict mode, collector now also runs `world.reset()` before `initialize()` to ensure valid articulation views and avoid "Franka articulation not ready" errors.
+- This reset is for sim-view initialization on current stage; template scene creation is still disabled.

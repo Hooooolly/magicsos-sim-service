@@ -4045,13 +4045,11 @@ def _setup_pick_place_scene_reuse_or_patch(
     world.scene.add(camera_high)
     world.scene.add(camera_wrist)
 
-    if allow_patch:
-        world.reset()
-        for _ in range(20):
-            world.step(render=True)
-    else:
-        for _ in range(20):
-            world.step(render=True)
+    # Always reset world here so Isaac creates valid articulation/camera views
+    # for the currently-open stage. This does not rebuild template assets.
+    world.reset()
+    for _ in range(20):
+        world.step(render=True)
 
     if hasattr(franka, "initialize"):
         try:
