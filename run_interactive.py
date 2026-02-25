@@ -567,7 +567,11 @@ def _sanitize_franka_root_rigidbody(stage) -> list[str]:
     return cleaned
 
 
-def _lift_objects_above_table_if_needed(stage, clearance: float = 0.004) -> list[dict]:
+def _lift_objects_above_table_if_needed(
+    stage,
+    clearance: float = 0.004,
+    max_delta_z: float = 0.12,
+) -> list[dict]:
     """Lift root objects that interpenetrate table top so they stay visible and graspable."""
     if stage is None:
         return []
@@ -622,6 +626,14 @@ def _lift_objects_above_table_if_needed(stage, clearance: float = 0.004) -> list
             continue
 
         delta_z = target_min_z - min_z
+        # Guard against bad bounds (common on some referenced assets) that can
+        # otherwise launch objects far above the table.
+        if delta_z > float(max_delta_z):
+            print(
+                f"[scene] skip auto-lift for {prim.GetPath()}: "
+                f"suspicious delta_z={delta_z:.4f} (> {max_delta_z:.4f})"
+            )
+            continue
         xf = UsdGeom.Xformable(prim)
         translate_op = None
         for op in xf.GetOrderedXformOps():
