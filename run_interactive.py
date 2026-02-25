@@ -20,6 +20,8 @@ import os
 import sys
 import time
 import threading
+import re
+import uuid
 
 # ── Env defaults ──────────────────────────────────────────────
 os.environ.setdefault("ACCEPT_EULA", "Y")
@@ -31,6 +33,22 @@ BRIDGE_PORT = int(os.environ.get("BRIDGE_PORT", "5800"))
 WEBRTC_PORT = int(os.environ.get("WEBRTC_PORT", "49100"))
 KIT_API_PORT = int(os.environ.get("KIT_API_PORT", "8011"))
 MEDIA_PORT = int(os.environ.get("MEDIA_PORT", "47998"))
+SIM_SESSION_NAME = (
+    os.environ.get("SIM_SESSION_NAME")
+    or os.environ.get("POD_NAME")
+    or os.environ.get("HOSTNAME")
+    or "interactive"
+)
+# Default off: stale autosave restores were causing invalid world/camera states.
+AUTOSAVE_ENABLED = os.environ.get("SIM_AUTOSAVE_ENABLED", "0").strip() != "0"
+AUTOSAVE_DIR = os.path.join("/data", "sim_sessions", SIM_SESSION_NAME)
+AUTOSAVE_STAGE_PATH = os.path.join(AUTOSAVE_DIR, "last_stage.usda")
+AUTOSAVE_META_PATH = os.path.join(AUTOSAVE_DIR, "last_stage_meta.json")
+EMBODIED_DATASETS_ROOT = os.environ.get("EMBODIED_DATASETS_ROOT", "/data/embodied/datasets")
+LEGACY_COLLECT_OUTPUT_DIRS = {
+    "/data/collections/latest",
+    "/data/embodied/datasets/sim_collect_latest",
+}
 
 # ── Inject Kit args for WebRTC + Kit API ports BEFORE any Isaac imports ──
 sys.argv.append(f"--kit_args=--/app/livestream/port={WEBRTC_PORT}")
@@ -125,11 +143,70 @@ except Exception:
     pass
 print(f"[interactive] Kit API port: requested={KIT_API_PORT}, actual={_actual_kit_port}")
 
+
+def _sanitize_dataset_token(value: str) -> str:
+    token = re.sub(r"[^a-zA-Z0-9._-]+", "_", str(value or "").strip().lower())
+    token = token.strip("._-")
+    return token or "pick_place"
+
+
+def _make_auto_collect_output_dir(skill: str) -> str:
+    skill_token = _sanitize_dataset_token(skill)
+    timestamp = time.strftime("%Y%m%d_%H%M%S", time.localtime())
+    suffix = uuid.uuid4().hex[:6]
+    return os.path.join(EMBODIED_DATASETS_ROOT, f"sim_{skill_token}_{timestamp}_{suffix}")
+
+
+def _normalize_collect_output_dir(output_dir: str | None, skill: str) -> str:
+    raw = "" if output_dir is None else str(output_dir).strip()
+    if not raw or raw in LEGACY_COLLECT_OUTPUT_DIRS:
+        try:
+            os.makedirs(EMBODIED_DATASETS_ROOT, exist_ok=True)
+        except Exception:
+            pass
+        return _make_auto_collect_output_dir(skill)
+    return raw
+
+
+def _create_world(*, add_ground_plane: bool):
+    from omni.isaac.core import World
+
+    w = World(physics_dt=1.0 / 120.0, rendering_dt=1.0 / 30.0)
+    if add_ground_plane:
+        try:
+            w.scene.add_default_ground_plane()
+        except Exception as exc:
+            print(f"[world] WARNING: add_default_ground_plane failed: {exc}")
+    return w
+
+
+def _recreate_world_for_open_stage(reason: str) -> bool:
+    """Rebuild World after open_stage(), which invalidates prior World handles."""
+    global world, PHYSICS_RUNNING
+    try:
+        if world is not None:
+            try:
+                world.stop()
+            except Exception:
+                pass
+        world = _create_world(add_ground_plane=False)
+        PHYSICS_RUNNING = False
+        if isinstance(globals().get("_state"), dict):
+            _state["physics"] = False
+        print(f"[world] recreated after {reason} (physics PAUSED)")
+        return True
+    except Exception as exc:
+        world = None
+        PHYSICS_RUNNING = False
+        if isinstance(globals().get("_state"), dict):
+            _state["physics"] = False
+        print(f"[world] ERROR: recreate failed after {reason}: {exc}")
+        return False
+
+
 # ── World + physics (paused by default) ──────────────────────
 try:
-    from omni.isaac.core import World
-    world = World(physics_dt=1.0 / 120.0, rendering_dt=1.0 / 30.0)
-    world.scene.add_default_ground_plane()
+    world = _create_world(add_ground_plane=True)
     # Don't call world.play() — start in viewer mode
     PHYSICS_RUNNING = False
     print("[interactive] World created (physics PAUSED)")
@@ -147,12 +224,17 @@ _state = {
     "step": 0,
     "collecting": False,
     "collect_progress": None,
+    "autosave_enabled": AUTOSAVE_ENABLED,
+    "autosave_stage_path": AUTOSAVE_STAGE_PATH if AUTOSAVE_ENABLED else None,
+    "restored_from_autosave": False,
+    "last_autosave_reason": None,
 }
 
 # ── Thread-safe command queue for main-thread execution ──────
 # Isaac Sim API is NOT thread-safe — must execute on main thread.
 # Flask handlers push commands here; main loop executes and signals done.
 import queue
+import inspect
 _cmd_queue = queue.Queue()
 _CMD_TIMEOUT = 10  # seconds to wait for main thread to process
 
@@ -212,6 +294,254 @@ def _get_stage():
     return ctx.get_stage() if ctx else None
 
 
+def _contains_unsafe_franka_physics_code(code: str) -> bool:
+    """Block code patterns that corrupt Franka articulation physics hierarchy."""
+    if not code:
+        return False
+    txt = str(code)
+    # Direct API apply on Franka-related paths.
+    direct_apply = re.search(
+        r"UsdPhysics\.(?:RigidBodyAPI|CollisionAPI|MeshCollisionAPI)\.Apply\([^)]*(?:/World/Franka|FrankaRobot|/Franka\W)",
+        txt,
+        re.IGNORECASE | re.DOTALL,
+    )
+    if direct_apply:
+        return True
+
+    # Traverse + startswith('/World/Franka...') + physics apply pattern.
+    traverse_apply = (
+        re.search(r"stage\.Traverse\(\)", txt, re.IGNORECASE)
+        and re.search(r"startswith\(\s*['\"](?:/World/Franka|/World/FrankaRobot)", txt, re.IGNORECASE)
+        and re.search(r"UsdPhysics\.(?:RigidBodyAPI|CollisionAPI|MeshCollisionAPI)\.Apply", txt, re.IGNORECASE)
+    )
+    return bool(traverse_apply)
+
+
+def _strip_runtime_helper_imports(code: str) -> str:
+    """Remove invalid helper imports that LLM may generate for runtime-injected helpers."""
+    if not code:
+        return code
+    helper_names = {"create_table", "create_franka"}
+    stage_import_re = re.compile(r"^(\s*from\s+omni\.isaac\.core\.utils\.stage\s+import\s+)(.+)$")
+    cleaned = []
+    for line in code.splitlines():
+        raw = line.rstrip()
+        m = stage_import_re.match(raw)
+        if m:
+            prefix, imports = m.group(1), m.group(2)
+            parts = [p.strip() for p in imports.strip().strip("()").split(",") if p.strip()]
+            kept = []
+            for part in parts:
+                name = part.split(" as ")[0].strip()
+                if name in helper_names:
+                    continue
+                kept.append(part)
+            if kept:
+                cleaned.append(prefix + ", ".join(kept))
+            continue
+
+        if "import" in raw and any(h in raw for h in helper_names) and "def " not in raw:
+            tmp = re.sub(
+                r"\b(create_table|create_franka)\b(?:\s+as\s+[A-Za-z_][A-Za-z0-9_]*)?\s*,?\s*",
+                "",
+                raw,
+            )
+            tmp = re.sub(r",\s*,", ", ", tmp).strip()
+            if tmp.endswith("import"):
+                continue
+            if tmp:
+                cleaned.append(tmp)
+            continue
+
+        cleaned.append(line)
+    return "\n".join(cleaned)
+
+
+def _code_may_mutate_stage(code: str) -> bool:
+    """Best-effort detection for code that mutates USD stage topology/transforms."""
+    txt = str(code or "")
+    if not txt:
+        return False
+    mutation_patterns = [
+        r"\bRemovePrim\(",
+        r"\bDefine\(",
+        r"\badd_reference_to_stage\(",
+        r"\bcreate_prim\(",
+        r"\bAddTranslateOp\(",
+        r"\bAddRotate[A-Za-z]*Op\(",
+        r"\bAddScaleOp\(",
+        r"\.Set\(",
+        r"RigidBodyAPI\.Apply\(",
+        r"CollisionAPI\.Apply\(",
+        r"MeshCollisionAPI\.Apply\(",
+    ]
+    return any(re.search(p, txt) for p in mutation_patterns)
+
+
+def _sanitize_franka_root_rigidbody(stage) -> list[str]:
+    """Remove accidental RigidBodyAPI on Franka root prims before physics play."""
+    from pxr import UsdPhysics
+
+    cleaned = []
+    for prim in stage.Traverse():
+        if not prim or not prim.IsValid():
+            continue
+        path = str(prim.GetPath())
+        low = path.lower()
+        if not (low.endswith("/franka") or low.endswith("/frankarobot")):
+            continue
+        if prim.HasAPI(UsdPhysics.RigidBodyAPI):
+            try:
+                prim.RemoveAPI(UsdPhysics.RigidBodyAPI)
+                cleaned.append(path)
+            except Exception as exc:
+                print(f"[physics] WARN remove RigidBodyAPI failed on {path}: {exc}")
+    return cleaned
+
+
+def _lift_objects_above_table_if_needed(stage, clearance: float = 0.004) -> list[dict]:
+    """Lift root objects that interpenetrate table top so they stay visible and graspable."""
+    if stage is None:
+        return []
+
+    table_top = stage.GetPrimAtPath("/World/Table/Top")
+    world = stage.GetPrimAtPath("/World")
+    if not table_top.IsValid() or not world.IsValid():
+        return []
+
+    try:
+        bbox_cache = UsdGeom.BBoxCache(0, [UsdGeom.Tokens.default_, UsdGeom.Tokens.render])
+        table_range = bbox_cache.ComputeWorldBound(table_top).GetRange()
+        table_min = table_range.GetMin()
+        table_max = table_range.GetMax()
+        table_top_z = float(table_max[2])
+    except Exception:
+        return []
+
+    moved = []
+    for prim in world.GetChildren():
+        if not prim or not prim.IsValid():
+            continue
+        name = prim.GetName() or ""
+        low = name.lower()
+        if low in {"table", "frankarobot", "defaultgroundplane"}:
+            continue
+        if prim.IsA(UsdGeom.Camera):
+            continue
+
+        try:
+            bbox_cache.Clear()
+            pr = bbox_cache.ComputeWorldBound(prim).GetRange()
+            pmin = pr.GetMin()
+            pmax = pr.GetMax()
+        except Exception:
+            continue
+
+        # Only auto-lift objects that are over table footprint.
+        cx = float((pmin[0] + pmax[0]) * 0.5)
+        cy = float((pmin[1] + pmax[1]) * 0.5)
+        if (
+            cx < float(table_min[0]) - 0.02
+            or cx > float(table_max[0]) + 0.02
+            or cy < float(table_min[1]) - 0.02
+            or cy > float(table_max[1]) + 0.02
+        ):
+            continue
+
+        min_z = float(pmin[2])
+        target_min_z = table_top_z + float(clearance)
+        if min_z >= target_min_z:
+            continue
+
+        delta_z = target_min_z - min_z
+        xf = UsdGeom.Xformable(prim)
+        translate_op = None
+        for op in xf.GetOrderedXformOps():
+            if op.GetOpType() == UsdGeom.XformOp.TypeTranslate:
+                translate_op = op
+                break
+        if translate_op is None:
+            translate_op = xf.AddTranslateOp(UsdGeom.XformOp.PrecisionDouble)
+            current = Gf.Vec3d(0.0, 0.0, 0.0)
+        else:
+            try:
+                t = translate_op.Get()
+                current = Gf.Vec3d(float(t[0]), float(t[1]), float(t[2]))
+            except Exception:
+                current = Gf.Vec3d(0.0, 0.0, 0.0)
+
+        translate_op.Set(Gf.Vec3d(current[0], current[1], current[2] + delta_z))
+        moved.append({"path": str(prim.GetPath()), "delta_z": round(delta_z, 4)})
+
+    return moved
+
+
+def _save_autosave_stage(reason: str) -> bool:
+    """Persist the current USD stage so a restarted pod can restore it."""
+    if not AUTOSAVE_ENABLED:
+        return False
+    stage = _get_stage()
+    if not stage:
+        return False
+
+    try:
+        os.makedirs(AUTOSAVE_DIR, exist_ok=True)
+        root_layer = stage.GetRootLayer()
+        if root_layer is None:
+            return False
+        ok = bool(root_layer.Export(AUTOSAVE_STAGE_PATH))
+        if not ok:
+            print(f"[autosave] export failed: {AUTOSAVE_STAGE_PATH}")
+            return False
+        meta = {
+            "saved_at_unix": time.time(),
+            "reason": reason,
+            "scene": _state.get("scene"),
+            "session": SIM_SESSION_NAME,
+        }
+        with open(AUTOSAVE_META_PATH, "w", encoding="utf-8") as f:
+            json.dump(meta, f, ensure_ascii=True, indent=2)
+        _state["last_autosave_reason"] = reason
+        print(f"[autosave] saved ({reason}) -> {AUTOSAVE_STAGE_PATH}")
+        return True
+    except Exception as exc:
+        print(f"[autosave] save failed ({reason}): {exc}")
+        return False
+
+
+def _restore_autosave_stage() -> bool:
+    """Restore previously autosaved stage during startup."""
+    if not AUTOSAVE_ENABLED:
+        return False
+    if not os.path.exists(AUTOSAVE_STAGE_PATH):
+        return False
+
+    try:
+        ctx = omni.usd.get_context()
+        if not ctx:
+            return False
+        print(f"[autosave] restoring stage from: {AUTOSAVE_STAGE_PATH}")
+        ok = bool(ctx.open_stage(AUTOSAVE_STAGE_PATH))
+        if not ok:
+            print(f"[autosave] restore failed: open_stage returned false")
+            return False
+        for _ in range(300):
+            simulation_app.update()
+            if ctx.get_stage_state() == omni.usd.StageState.OPENED:
+                break
+            time.sleep(0.01)
+        _recreate_world_for_open_stage("autosave_restore")
+        _state["scene"] = AUTOSAVE_STAGE_PATH
+        _state["robots"] = {}
+        _state["physics"] = False
+        _state["restored_from_autosave"] = True
+        print(f"[autosave] restore done: {AUTOSAVE_STAGE_PATH}")
+        return True
+    except Exception as exc:
+        print(f"[autosave] restore failed: {exc}")
+        return False
+
+
 @bridge.route("/health", methods=["GET"])
 def bridge_health():
     return jsonify({
@@ -222,6 +552,9 @@ def bridge_health():
         "robots": _state["robots"],
         "step": _state["step"],
         "collecting": _state["collecting"],
+        "autosave_enabled": _state["autosave_enabled"],
+        "autosave_stage_path": _state["autosave_stage_path"],
+        "restored_from_autosave": _state["restored_from_autosave"],
     })
 
 
@@ -340,20 +673,32 @@ _collect_request = None
 
 @bridge.route("/collect/start", methods=["POST"])
 def collect_start():
+    if _state["collecting"] or _collect_request is not None:
+        return jsonify({"error": "Collection already running"}), 409
     data = flask_request.get_json(silent=True) or {}
     num_episodes = int(data.get("num_episodes", 10))
-    output_dir = data.get("output_dir", "/data/collections/latest")
+    steps_per_segment = int(data.get("steps_per_segment", os.environ.get("COLLECT_STEPS_PER_SEGMENT_DEFAULT", "70")))
     skill = str(data.get("skill", "pick_place") or "pick_place")
+    output_dir = _normalize_collect_output_dir(data.get("output_dir"), skill)
+    scene_mode = str(data.get("scene_mode", "auto") or "auto")
+    target_objects = data.get("target_objects")
+    if target_objects is not None and not isinstance(target_objects, list):
+        return jsonify({"error": "target_objects must be a list when provided"}), 400
 
     if num_episodes <= 0:
         return jsonify({"error": "num_episodes must be > 0"}), 400
+    if steps_per_segment <= 0:
+        return jsonify({"error": "steps_per_segment must be > 0"}), 400
 
     # Main-thread execution only (Isaac Sim API is not thread-safe).
     return _enqueue_cmd(
         "collect_start",
         num_episodes=num_episodes,
+        steps_per_segment=steps_per_segment,
         output_dir=output_dir,
         skill=skill,
+        scene_mode=scene_mode,
+        target_objects=target_objects,
     )
 
 
@@ -386,6 +731,7 @@ print(f"[interactive] Bridge API on :{BRIDGE_PORT}")
 print("[interactive] Running warmup frames...")
 for _ in range(60):
     simulation_app.update()
+_restore_autosave_stage()
 print(f"[interactive] Ready. WebRTC port={WEBRTC_PORT}, Kit API=8011, Bridge={BRIDGE_PORT}")
 
 # ── Main-thread command processor ────────────────────────────
@@ -401,6 +747,11 @@ def _process_commands():
         cmd_type = cmd["type"]
         try:
             if cmd_type == "physics_play":
+                stage = _get_stage()
+                if stage is not None:
+                    cleaned = _sanitize_franka_root_rigidbody(stage)
+                    if cleaned:
+                        print(f"[physics] removed accidental robot root RigidBodyAPI: {cleaned}")
                 world.play()
                 PHYSICS_RUNNING = True
                 _state["physics"] = True
@@ -434,10 +785,15 @@ def _process_commands():
                             if ctx.get_stage_state() == omni.usd.StageState.OPENED:
                                 break
                             time.sleep(0.05)
-                        _state["scene"] = usd_path
-                        _state["robots"] = {}
-                        print(f"[interactive] Scene loaded: {usd_path}")
-                        cmd["result"] = {"success": True, "scene": usd_path}
+                        if not _recreate_world_for_open_stage("scene_load"):
+                            cmd["error"] = "Failed to recreate world after scene load"
+                        else:
+                            _state["scene"] = usd_path
+                            _state["robots"] = {}
+                            _state["physics"] = False
+                            _save_autosave_stage("scene_load")
+                            print(f"[interactive] Scene loaded: {usd_path}")
+                            cmd["result"] = {"success": True, "scene": usd_path}
 
             elif cmd_type == "robot_spawn":
                 stage = _get_stage()
@@ -456,6 +812,7 @@ def _process_commands():
                         "position": cmd["position"],
                         "usd": cmd["usd_path"],
                     }
+                    _save_autosave_stage("robot_spawn")
                     print(f"[interactive] Spawned {cmd['robot_type']} at {cmd['prim_path']}")
                     cmd["result"] = {"success": True, "prim_path": cmd["prim_path"],
                                      "robot_type": cmd["robot_type"]}
@@ -464,7 +821,27 @@ def _process_commands():
                 import io as _io
                 import builtins as _builtins
                 from pxr import UsdPhysics, UsdShade, Sdf, Vt
+                import sys as _sys
                 stdout_capture = _io.StringIO()
+                exec_code = _strip_runtime_helper_imports(cmd.get("code", ""))
+                stage_mutated = _code_may_mutate_stage(exec_code)
+                if _contains_unsafe_franka_physics_code(exec_code):
+                    stdout_capture.write(
+                        "Blocked unsafe Franka physics edit. "
+                        "Do not apply RigidBody/Collision APIs on /World/Franka* roots.\n"
+                    )
+                    cmd["result"] = {"success": True, "output": stdout_capture.getvalue()}
+                    continue
+                # Tolerate LLM code that does `import UsdPhysics` (without pxr prefix).
+                # pxr bindings are real Python modules, so aliasing them in sys.modules
+                # allows plain imports to resolve instead of failing with ModuleNotFoundError.
+                _sys.modules.setdefault("UsdPhysics", UsdPhysics)
+                _sys.modules.setdefault("UsdGeom", UsdGeom)
+                _sys.modules.setdefault("UsdShade", UsdShade)
+                _sys.modules.setdefault("Usd", Usd)
+                _sys.modules.setdefault("Sdf", Sdf)
+                _sys.modules.setdefault("Vt", Vt)
+                _sys.modules.setdefault("Gf", Gf)
                 # Try importing common Isaac Sim utilities
                 _extra_globals = {}
                 try:
@@ -486,7 +863,7 @@ def _process_commands():
                     **_extra_globals,
                 }
                 try:
-                    exec(cmd["code"], exec_globals)
+                    exec(exec_code, exec_globals)
                 except Exception as _exec_exc:
                     _exc_str = str(_exec_exc)
                     # USD pxr precision mismatch is a warning, not a real error
@@ -494,6 +871,15 @@ def _process_commands():
                         pass  # operation succeeded despite warning
                     else:
                         raise
+                # Keep objects visible on table: if a newly placed object intersects table top,
+                # lift it slightly above the surface.
+                try:
+                    stage_now = _get_stage()
+                    lifted = _lift_objects_above_table_if_needed(stage_now) if stage_now else []
+                    if lifted:
+                        print(f"[scene] auto-lifted objects for table clearance: {lifted}")
+                except Exception as _lift_exc:
+                    print(f"[scene] WARNING: auto-lift failed: {_lift_exc}")
                 # Clear selection to hide gizmo overlay in WebRTC stream
                 try:
                     omni.usd.get_context().get_selection().clear_selected_prim_paths()
@@ -501,19 +887,39 @@ def _process_commands():
                     pass
                 for _ in range(5):
                     simulation_app.update()
+                # Scene edits that remove/redefine prims can invalidate simulation/articulation views.
+                # Rebuild world context after mutating code to keep collect/articulation stable.
+                if stage_mutated:
+                    was_physics_running = bool(PHYSICS_RUNNING)
+                    if _recreate_world_for_open_stage("code_execute"):
+                        if was_physics_running and world is not None:
+                            try:
+                                world.play()
+                                PHYSICS_RUNNING = True
+                                _state["physics"] = True
+                            except Exception as _play_exc:
+                                print(f"[world] WARNING: failed to resume physics after code_execute: {_play_exc}")
+                    else:
+                        print("[world] WARNING: failed to recreate world after code_execute mutation")
+                _save_autosave_stage("code_execute")
                 cmd["result"] = {"success": True, "output": stdout_capture.getvalue()}
 
             elif cmd_type == "collect_start":
-                if _state["collecting"]:
+                if _state["collecting"] or _collect_request is not None:
                     cmd["error"] = "Collection already running"
                 elif not _state["physics"]:
                     cmd["error"] = "Physics must be running first (POST /physics/play)"
                 else:
                     num_episodes = int(cmd.get("num_episodes", 10))
-                    output_dir = str(cmd.get("output_dir", "/data/collections/latest"))
+                    steps_per_segment = int(cmd.get("steps_per_segment", os.environ.get("COLLECT_STEPS_PER_SEGMENT_DEFAULT", "70")))
                     skill = str(cmd.get("skill", "pick_place") or "pick_place")
+                    output_dir = _normalize_collect_output_dir(cmd.get("output_dir"), skill)
+                    scene_mode = str(cmd.get("scene_mode", "auto") or "auto")
+                    target_objects = cmd.get("target_objects")
                     if num_episodes <= 0:
                         cmd["error"] = "num_episodes must be > 0"
+                    elif steps_per_segment <= 0:
+                        cmd["error"] = "steps_per_segment must be > 0"
                     else:
                         _collect_stop.clear()
                         _state["collecting"] = True
@@ -521,23 +927,33 @@ def _process_commands():
                             "total": num_episodes,
                             "completed": 0,
                             "skill": skill,
+                            "steps_per_segment": steps_per_segment,
                             "output_dir": output_dir,
                             "status": "running",
+                            "scene_mode": scene_mode,
+                            "target_objects": target_objects,
                         }
                         _collect_request = {
                             "num_episodes": num_episodes,
+                            "steps_per_segment": steps_per_segment,
                             "output_dir": output_dir,
                             "skill": skill,
+                            "scene_mode": scene_mode,
+                            "target_objects": target_objects,
                         }
                         cmd["result"] = {
                             "status": "started",
                             "num_episodes": num_episodes,
+                            "steps_per_segment": steps_per_segment,
                             "output_dir": output_dir,
                             "skill": skill,
+                            "scene_mode": scene_mode,
+                            "target_objects": target_objects,
                         }
                         print(
                             f"[collect] queued main-thread collection: skill={skill}, "
-                            f"episodes={num_episodes}, output={output_dir}"
+                            f"scene_mode={scene_mode}, episodes={num_episodes}, "
+                            f"steps_per_segment={steps_per_segment}, output={output_dir}"
                         )
 
             else:
@@ -559,24 +975,45 @@ def _run_pending_collection():
     req = _collect_request
     _collect_request = None
     num_episodes = int(req.get("num_episodes", 10))
-    output_dir = str(req.get("output_dir", "/data/collections/latest"))
+    steps_per_segment = int(req.get("steps_per_segment", os.environ.get("COLLECT_STEPS_PER_SEGMENT_DEFAULT", "70")))
     skill = str(req.get("skill", "pick_place"))
+    output_dir = _normalize_collect_output_dir(req.get("output_dir"), skill)
+    scene_mode = str(req.get("scene_mode", "auto") or "auto")
+    target_objects = req.get("target_objects")
 
     try:
         os.makedirs(output_dir, exist_ok=True)
-        print(f"[collect] start main-thread run: skill={skill}, episodes={num_episodes}, output={output_dir}")
+        print(
+            f"[collect] start main-thread run: skill={skill}, scene_mode={scene_mode}, "
+            f"episodes={num_episodes}, steps_per_segment={steps_per_segment}, "
+            f"output={output_dir}, targets={target_objects}"
+        )
 
         from isaac_pick_place_collector import run_collection_in_process
 
-        result = run_collection_in_process(
-            world=world,
-            simulation_app=simulation_app,
-            num_episodes=num_episodes,
-            output_dir=output_dir,
-            stop_event=_collect_stop,
-            progress_callback=lambda ep: _state["collect_progress"].update({"completed": ep}),
-            task_name=skill,
-        )
+        collect_kwargs = {
+            "world": world,
+            "simulation_app": simulation_app,
+            "num_episodes": num_episodes,
+            "output_dir": output_dir,
+            "steps_per_segment": steps_per_segment,
+            "stop_event": _collect_stop,
+            "progress_callback": lambda ep: _state["collect_progress"].update({"completed": ep}),
+        }
+        # Backward compatibility: older collector builds may not accept task_name.
+        try:
+            if "task_name" in inspect.signature(run_collection_in_process).parameters:
+                collect_kwargs["task_name"] = skill
+            if "scene_mode" in inspect.signature(run_collection_in_process).parameters:
+                collect_kwargs["scene_mode"] = scene_mode
+            if "target_objects" in inspect.signature(run_collection_in_process).parameters:
+                collect_kwargs["target_objects"] = target_objects
+            if "dataset_repo_id" in inspect.signature(run_collection_in_process).parameters:
+                collect_kwargs["dataset_repo_id"] = f"local/{os.path.basename(output_dir.rstrip('/'))}"
+        except Exception:
+            pass
+
+        result = run_collection_in_process(**collect_kwargs)
 
         final_status = "stopped" if _collect_stop.is_set() else "done"
         _state["collect_progress"]["status"] = final_status
