@@ -104,8 +104,12 @@ IK_WAYPOINT_NOISE_RAD = float(np.clip(IK_WAYPOINT_NOISE_RAD, 0.0, 0.03))
 _EARLY_HALT_RAW = str(os.environ.get("COLLECT_ENABLE_EARLY_REACH_HALT", "1")).strip().lower()
 ENABLE_EARLY_REACH_HALT = _EARLY_HALT_RAW not in {"0", "false", "no", "off"}
 
-_PLANNER_BACKEND_RAW = os.environ.get("COLLECT_PLANNER_BACKEND", "ik").strip().lower()
+_PLANNER_BACKEND_RAW = os.environ.get("COLLECT_PLANNER_BACKEND", "curobo").strip().lower()
 PLANNER_BACKEND = _PLANNER_BACKEND_RAW if _PLANNER_BACKEND_RAW in {"ik", "curobo"} else "ik"
+LOG.info("collect: PLANNER_BACKEND=%s (raw=%r)", PLANNER_BACKEND, _PLANNER_BACKEND_RAW)
+_VERBOSE_DEBUG_RAW = str(os.environ.get("COLLECT_VERBOSE_DEBUG", "1")).strip().lower()
+COLLECT_VERBOSE_DEBUG = _VERBOSE_DEBUG_RAW not in {"0", "false", "no", "off"}
+LOG.info("collect: COLLECT_VERBOSE_DEBUG=%s (raw=%r)", COLLECT_VERBOSE_DEBUG, _VERBOSE_DEBUG_RAW)
 
 TABLE_X_RANGE = (0.3, 0.7)
 TABLE_Y_RANGE = (-0.3, 0.3)
@@ -3364,6 +3368,23 @@ def _run_pick_place_episode(
     world.reset()
     for _ in range(10):
         world.step(render=True)
+    if COLLECT_VERBOSE_DEBUG:
+        LOG.info(
+            "collect-debug: episode=%d planner=%s steps_per_segment=%d "
+            "reach_thresh(eef=%.3f,eef_xy=%.3f,tip=%.3f,tip_xy=%.3f,tip_dz=%.3f) "
+            "close_thresh(width=%.4f,eef=%.3f,eef_xy=%.3f)",
+            episode_index + 1,
+            PLANNER_BACKEND,
+            int(steps_per_segment),
+            REACH_BEFORE_CLOSE_MAX_OBJECT_EEF_DISTANCE,
+            REACH_BEFORE_CLOSE_MAX_OBJECT_EEF_XY_DISTANCE,
+            REACH_BEFORE_CLOSE_MAX_OBJECT_TIP_MID_DISTANCE,
+            REACH_BEFORE_CLOSE_MAX_OBJECT_TIP_MID_XY_DISTANCE,
+            REACH_BEFORE_CLOSE_MAX_ABS_TIP_MID_Z_DELTA,
+            VERIFY_CLOSE_MIN_GRIPPER_WIDTH,
+            VERIFY_CLOSE_MAX_OBJECT_EEF_DISTANCE,
+            VERIFY_CLOSE_MAX_OBJECT_EEF_XY_DISTANCE,
+        )
 
     for cam_obj in cameras.values():
         if hasattr(cam_obj, "initialize"):
@@ -3796,6 +3817,63 @@ def _run_pick_place_episode(
         except Exception as exc:
             LOG.error("Curobo init failed, falling back to IK: %s", exc)
 
+    def _log_attempt_world_debug(attempt: int, tag: str, target: dict[str, Any] | None) -> None:
+        if not COLLECT_VERBOSE_DEBUG:
+            return
+        try:
+            obj_pos_dbg, _ = _get_object_tracking_pose(stage, object_prim_path, usd, usd_geom)
+            eef_pos_dbg, _ = _get_eef_pose(stage, eef_prim_path, get_prim_at_path, usd, usd_geom)
+            target_pos_dbg = None
+            if target:
+                target_pos_dbg = _to_numpy(target.get("target_pos"), dtype=np.float32).reshape(-1)
+                if target_pos_dbg.size < 3 or not np.all(np.isfinite(target_pos_dbg[:3])):
+                    target_pos_dbg = None
+            if target_pos_dbg is None:
+                LOG.info(
+                    "collect-debug: attempt %d %s object_world=(%.4f, %.4f, %.4f) "
+                    "eef_world=(%.4f, %.4f, %.4f) target_world=(none)",
+                    attempt,
+                    tag,
+                    float(obj_pos_dbg[0]),
+                    float(obj_pos_dbg[1]),
+                    float(obj_pos_dbg[2]),
+                    float(eef_pos_dbg[0]),
+                    float(eef_pos_dbg[1]),
+                    float(eef_pos_dbg[2]),
+                )
+                return
+            obj_to_tgt = target_pos_dbg[:3] - obj_pos_dbg[:3]
+            eef_to_tgt = target_pos_dbg[:3] - eef_pos_dbg[:3]
+            eef_to_obj = obj_pos_dbg[:3] - eef_pos_dbg[:3]
+            LOG.info(
+                "collect-debug: attempt %d %s object_world=(%.4f, %.4f, %.4f) "
+                "eef_world=(%.4f, %.4f, %.4f) target_world=(%.4f, %.4f, %.4f) "
+                "obj_to_target=(%.4f, %.4f, %.4f) eef_to_target=(%.4f, %.4f, %.4f) "
+                "eef_to_obj=(%.4f, %.4f, %.4f)",
+                attempt,
+                tag,
+                float(obj_pos_dbg[0]),
+                float(obj_pos_dbg[1]),
+                float(obj_pos_dbg[2]),
+                float(eef_pos_dbg[0]),
+                float(eef_pos_dbg[1]),
+                float(eef_pos_dbg[2]),
+                float(target_pos_dbg[0]),
+                float(target_pos_dbg[1]),
+                float(target_pos_dbg[2]),
+                float(obj_to_tgt[0]),
+                float(obj_to_tgt[1]),
+                float(obj_to_tgt[2]),
+                float(eef_to_tgt[0]),
+                float(eef_to_tgt[1]),
+                float(eef_to_tgt[2]),
+                float(eef_to_obj[0]),
+                float(eef_to_obj[1]),
+                float(eef_to_obj[2]),
+            )
+        except Exception as exc:
+            LOG.debug("collect-debug: attempt %d %s logging failed: %s", attempt, tag, exc)
+
     for attempt in range(1, GRASP_MAX_ATTEMPTS + 1):
         if _timeout_triggered():
             break
@@ -3917,6 +3995,16 @@ def _run_pick_place_episode(
                 pick_x,
                 pick_y,
             )
+        LOG.info(
+            "collect: attempt %d planner=%s source=%s pick=(%.4f, %.4f) place_hint=%s",
+            attempt,
+            PLANNER_BACKEND,
+            pick_source,
+            pick_x,
+            pick_y,
+            "none" if place_pos is None else f"({place_pos[0]:.4f}, {place_pos[1]:.4f})",
+        )
+        _log_attempt_world_debug(attempt, "pre_plan", current_grasp_target)
         if place_pos is None:
             place_pos = _sample_place_from_pick(rng, table_x_range, table_y_range, last_pick_pos)
         object_height = _estimate_object_height(stage, object_prim_path, usd_geom, fallback=OBJECT_SIZE)
@@ -4130,13 +4218,20 @@ def _run_pick_place_episode(
             current_target=current_grasp_target,
             tip_mid_offset_in_hand=annotation_tip_mid_offset_hand,
         )
+        _log_attempt_world_debug(attempt, "pre_close_gate", current_grasp_target)
         reach_ok = _verify_reach_before_close(reach_metrics)
         if not reach_ok:
             LOG.warning(
-                "collect: grasp retry %d/%d reach_before_close failed metrics=%s",
+                "collect: grasp retry %d/%d reach_before_close failed metrics=%s "
+                "thresholds={eef<=%.3f,eef_xy<=%.3f,tip<=%.3f,tip_xy<=%.3f,|tip_dz|<=%.3f}",
                 attempt,
                 GRASP_MAX_ATTEMPTS,
                 reach_metrics,
+                REACH_BEFORE_CLOSE_MAX_OBJECT_EEF_DISTANCE,
+                REACH_BEFORE_CLOSE_MAX_OBJECT_EEF_XY_DISTANCE,
+                REACH_BEFORE_CLOSE_MAX_OBJECT_TIP_MID_DISTANCE,
+                REACH_BEFORE_CLOSE_MAX_OBJECT_TIP_MID_XY_DISTANCE,
+                REACH_BEFORE_CLOSE_MAX_ABS_TIP_MID_Z_DELTA,
             )
             _record_failed_annotation_target(
                 cache_key=annotation_failed_pose_cache_key,
@@ -4182,10 +4277,14 @@ def _run_pick_place_episode(
         close_ok = _verify_after_close(close_metrics)
         if not close_ok:
             LOG.warning(
-                "collect: grasp retry %d/%d close_verify failed metrics=%s",
+                "collect: grasp retry %d/%d close_verify failed metrics=%s "
+                "thresholds={width>=%.4f,eef<=%.3f,eef_xy<=%.3f}",
                 attempt,
                 GRASP_MAX_ATTEMPTS,
                 close_metrics,
+                VERIFY_CLOSE_MIN_GRIPPER_WIDTH,
+                VERIFY_CLOSE_MAX_OBJECT_EEF_DISTANCE,
+                VERIFY_CLOSE_MAX_OBJECT_EEF_XY_DISTANCE,
             )
             _record_failed_annotation_target(
                 cache_key=annotation_failed_pose_cache_key,
@@ -4227,10 +4326,14 @@ def _run_pick_place_episode(
             break
 
         LOG.warning(
-            "collect: grasp retry %d/%d retrieval_verify failed metrics=%s",
+            "collect: grasp retry %d/%d retrieval_verify failed metrics=%s "
+            "thresholds={width>=%.4f,lift>=%.4f,eef<=%.3f}",
             attempt,
             GRASP_MAX_ATTEMPTS,
             retrieval_metrics,
+            VERIFY_CLOSE_MIN_GRIPPER_WIDTH,
+            VERIFY_RETRIEVAL_MIN_LIFT,
+            VERIFY_RETRIEVAL_MAX_OBJECT_EEF_DISTANCE,
         )
         _record_failed_annotation_target(
             cache_key=annotation_failed_pose_cache_key,
