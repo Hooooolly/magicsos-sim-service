@@ -692,6 +692,7 @@ def _runtime_create_mug(
 
     candidates.append(c1_http)
     candidates = _unique_preserve_order(candidates)
+    px, py, pz = position
 
     existing = stage.GetPrimAtPath(prim_path)
     if existing and existing.IsValid():
@@ -707,10 +708,21 @@ def _runtime_create_mug(
     for mug_usd in candidates:
         try:
             add_reference_to_stage(usd_path=mug_usd, prim_path=prim_path)
-            for _ in range(8):
+            # Keep update budget small before we move the prim to target pose,
+            # otherwise users see a brief flash at the authored/default location.
+            for _ in range(2):
                 simulation_app.update()
             prim = stage.GetPrimAtPath(prim_path)
             if prim and prim.IsValid():
+                try:
+                    xf = UsdGeom.Xformable(prim)
+                    xf.ClearXformOpOrder()
+                    xf.AddTranslateOp().Set(Gf.Vec3d(float(px), float(py), float(pz)))
+                    xf.AddScaleOp().Set(Gf.Vec3d(0.01, 0.01, 0.01))
+                except Exception:
+                    pass
+                for _ in range(2):
+                    simulation_app.update()
                 loaded_ok = True
                 break
             stage.RemovePrim(prim_path)
@@ -726,7 +738,6 @@ def _runtime_create_mug(
     prim = stage.GetPrimAtPath(prim_path)
     xf = UsdGeom.Xformable(prim)
     xf.ClearXformOpOrder()
-    px, py, pz = position
     xf.AddTranslateOp().Set(Gf.Vec3d(float(px), float(py), float(pz)))
     xf.AddScaleOp().Set(Gf.Vec3d(0.01, 0.01, 0.01))
 
@@ -783,6 +794,7 @@ def _runtime_create_apple(
         ]
     )
     candidates = _unique_preserve_order(candidates)
+    px, py, pz = position
 
     existing = stage.GetPrimAtPath(prim_path)
     if existing and existing.IsValid():
@@ -801,10 +813,19 @@ def _runtime_create_apple(
             continue
         try:
             add_reference_to_stage(usd_path=str(apple_usd), prim_path=prim_path)
-            for _ in range(8):
+            # Move object early to avoid visible teleport from default pose.
+            for _ in range(2):
                 simulation_app.update()
             prim = stage.GetPrimAtPath(prim_path)
             if prim and prim.IsValid():
+                try:
+                    xf = UsdGeom.Xformable(prim)
+                    xf.ClearXformOpOrder()
+                    xf.AddTranslateOp().Set(Gf.Vec3d(float(px), float(py), float(pz)))
+                except Exception:
+                    pass
+                for _ in range(2):
+                    simulation_app.update()
                 loaded_ok = True
                 break
             stage.RemovePrim(prim_path)
@@ -820,7 +841,6 @@ def _runtime_create_apple(
     prim = stage.GetPrimAtPath(prim_path)
     xf = UsdGeom.Xformable(prim)
     xf.ClearXformOpOrder()
-    px, py, pz = position
     xf.AddTranslateOp().Set(Gf.Vec3d(float(px), float(py), float(pz)))
 
     try:
@@ -881,6 +901,7 @@ def _runtime_create_ball(
         ]
     )
     candidates = _unique_preserve_order(candidates)
+    px, py, pz = position
 
     existing = stage.GetPrimAtPath(prim_path)
     if existing and existing.IsValid():
@@ -899,10 +920,19 @@ def _runtime_create_ball(
             continue
         try:
             add_reference_to_stage(usd_path=str(ball_usd), prim_path=prim_path)
-            for _ in range(8):
+            # Move object early to avoid visible teleport from default pose.
+            for _ in range(2):
                 simulation_app.update()
             prim = stage.GetPrimAtPath(prim_path)
             if prim and prim.IsValid():
+                try:
+                    xf = UsdGeom.Xformable(prim)
+                    xf.ClearXformOpOrder()
+                    xf.AddTranslateOp().Set(Gf.Vec3d(float(px), float(py), float(pz)))
+                except Exception:
+                    pass
+                for _ in range(2):
+                    simulation_app.update()
                 loaded_ok = True
                 break
             stage.RemovePrim(prim_path)
@@ -918,7 +948,6 @@ def _runtime_create_ball(
     prim = stage.GetPrimAtPath(prim_path)
     xf = UsdGeom.Xformable(prim)
     xf.ClearXformOpOrder()
-    px, py, pz = position
     xf.AddTranslateOp().Set(Gf.Vec3d(float(px), float(py), float(pz)))
 
     try:
