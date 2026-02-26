@@ -110,6 +110,9 @@ LOG.info("collect: PLANNER_BACKEND=%s (raw=%r)", PLANNER_BACKEND, _PLANNER_BACKE
 _VERBOSE_DEBUG_RAW = str(os.environ.get("COLLECT_VERBOSE_DEBUG", "1")).strip().lower()
 COLLECT_VERBOSE_DEBUG = _VERBOSE_DEBUG_RAW not in {"0", "false", "no", "off"}
 LOG.info("collect: COLLECT_VERBOSE_DEBUG=%s (raw=%r)", COLLECT_VERBOSE_DEBUG, _VERBOSE_DEBUG_RAW)
+_STEP_WORLD_LOG_RAW = str(os.environ.get("COLLECT_STEP_WORLD_LOG", "1")).strip().lower()
+COLLECT_STEP_WORLD_LOG = _STEP_WORLD_LOG_RAW not in {"0", "false", "no", "off"}
+LOG.info("collect: COLLECT_STEP_WORLD_LOG=%s (raw=%r)", COLLECT_STEP_WORLD_LOG, _STEP_WORLD_LOG_RAW)
 
 TABLE_X_RANGE = (0.3, 0.7)
 TABLE_Y_RANGE = (-0.3, 0.3)
@@ -3413,8 +3416,55 @@ def _run_pick_place_episode(
             return float(joints[7])
         return float(GRIPPER_OPEN)
 
+    def _log_step_world_debug(frame_id: int) -> None:
+        if not (COLLECT_VERBOSE_DEBUG and COLLECT_STEP_WORLD_LOG):
+            return
+        try:
+            obj_pos_dbg, _ = _get_object_tracking_pose(stage, object_prim_path, usd, usd_geom)
+            eef_pos_dbg, _ = _get_eef_pose(stage, eef_prim_path, get_prim_at_path, usd, usd_geom)
+            target_pos_dbg = None
+            if current_grasp_target is not None:
+                target_pos_dbg = _to_numpy(current_grasp_target.get("target_pos"), dtype=np.float32).reshape(-1)
+                if target_pos_dbg.size < 3 or not np.all(np.isfinite(target_pos_dbg[:3])):
+                    target_pos_dbg = None
+            if target_pos_dbg is None:
+                LOG.info(
+                    "collect-step: episode=%d attempt=%d frame=%d "
+                    "object_world=(%.4f, %.4f, %.4f) eef_world=(%.4f, %.4f, %.4f) target_world=(none)",
+                    episode_index + 1,
+                    int(attempt_used),
+                    int(frame_id),
+                    float(obj_pos_dbg[0]),
+                    float(obj_pos_dbg[1]),
+                    float(obj_pos_dbg[2]),
+                    float(eef_pos_dbg[0]),
+                    float(eef_pos_dbg[1]),
+                    float(eef_pos_dbg[2]),
+                )
+                return
+            LOG.info(
+                "collect-step: episode=%d attempt=%d frame=%d "
+                "object_world=(%.4f, %.4f, %.4f) eef_world=(%.4f, %.4f, %.4f) "
+                "target_world=(%.4f, %.4f, %.4f)",
+                episode_index + 1,
+                int(attempt_used),
+                int(frame_id),
+                float(obj_pos_dbg[0]),
+                float(obj_pos_dbg[1]),
+                float(obj_pos_dbg[2]),
+                float(eef_pos_dbg[0]),
+                float(eef_pos_dbg[1]),
+                float(eef_pos_dbg[2]),
+                float(target_pos_dbg[0]),
+                float(target_pos_dbg[1]),
+                float(target_pos_dbg[2]),
+            )
+        except Exception as exc:
+            LOG.debug("collect-step: episode=%d frame=%d logging failed: %s", episode_index + 1, frame_id, exc)
+
     def _record_frame(arm_target: Optional[np.ndarray] = None, gripper_target: Optional[float] = None) -> None:
         nonlocal frame_index
+        frame_id = int(frame_index)
         arm_cmd = _current_arm_target() if arm_target is None else _pad_or_trim(_to_numpy(arm_target), 7)
         grip_cmd = _current_gripper_target() if gripper_target is None else float(gripper_target)
         state = _extract_state_vector(franka, stage, eef_prim_path, get_prim_at_path, usd, usd_geom)
@@ -3429,17 +3479,18 @@ def _run_pick_place_episode(
         )
         writer.add_frame(
             episode_index=episode_index,
-            frame_index=frame_index,
+            frame_index=frame_id,
             observation_state=state,
             action=action,
-            timestamp=frame_index / float(fps),
+            timestamp=frame_id / float(fps),
             next_done=False,
             extras=frame_extras,
         )
         for cam_name, cam_obj in cameras.items():
             rgb = _capture_rgb(cam_obj, CAMERA_RESOLUTION)
             writer.add_video_frame(cam_name, rgb)
-        frame_index += 1
+        _log_step_world_debug(frame_id)
+        frame_index = frame_id + 1
 
     frame_index = 0
     stopped = False
