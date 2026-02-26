@@ -95,6 +95,18 @@ except Exception:
     MAX_ARM_STEP_RAD = 0.03
 MAX_ARM_STEP_RAD = float(np.clip(MAX_ARM_STEP_RAD, 0.005, 0.10))
 
+try:
+    IK_WAYPOINT_NOISE_RAD = float(os.environ.get("COLLECT_IK_WAYPOINT_NOISE_RAD", "0.0"))
+except Exception:
+    IK_WAYPOINT_NOISE_RAD = 0.0
+IK_WAYPOINT_NOISE_RAD = float(np.clip(IK_WAYPOINT_NOISE_RAD, 0.0, 0.03))
+
+_EARLY_HALT_RAW = str(os.environ.get("COLLECT_ENABLE_EARLY_REACH_HALT", "1")).strip().lower()
+ENABLE_EARLY_REACH_HALT = _EARLY_HALT_RAW not in {"0", "false", "no", "off"}
+
+_PLANNER_BACKEND_RAW = os.environ.get("COLLECT_PLANNER_BACKEND", "ik").strip().lower()
+PLANNER_BACKEND = _PLANNER_BACKEND_RAW if _PLANNER_BACKEND_RAW in {"ik", "curobo"} else "ik"
+
 TABLE_X_RANGE = (0.3, 0.7)
 TABLE_Y_RANGE = (-0.3, 0.3)
 TABLE_Z = 0.41
@@ -107,19 +119,24 @@ IK_PICK_MIN_CLEARANCE_FROM_TABLE = 0.01
 IK_PLACE_MIN_CLEARANCE_FROM_TABLE = 0.02
 IK_PRE_GRASP_OFFSET = 0.10
 IK_PRE_GRASP_MIN_ABOVE_TABLE = 0.02
-GRASP_MAX_ATTEMPTS = 3
+GRASP_MAX_ATTEMPTS = 5
 REACH_BEFORE_CLOSE_MAX_OBJECT_EEF_DISTANCE = 0.16
 REACH_BEFORE_CLOSE_MAX_OBJECT_EEF_XY_DISTANCE = 0.08
 REACH_BEFORE_CLOSE_MAX_OBJECT_TIP_MID_DISTANCE = 0.03
 REACH_BEFORE_CLOSE_MAX_OBJECT_TIP_MID_XY_DISTANCE = 0.022
 REACH_BEFORE_CLOSE_MAX_ABS_TIP_MID_Z_DELTA = 0.03
-REACH_REQUIRE_TIP_MID = True
+_REACH_REQUIRE_TIP_MID_RAW = str(os.environ.get("COLLECT_REACH_REQUIRE_TIP_MID", "0")).strip().lower()
+REACH_REQUIRE_TIP_MID = _REACH_REQUIRE_TIP_MID_RAW in {"1", "true", "yes", "on"}
 CLOSE_HOLD_STEPS = 8
 try:
     PRE_CLOSE_SETTLE_STEPS = int(os.environ.get("COLLECT_PRE_CLOSE_SETTLE_STEPS", "18"))
 except Exception:
     PRE_CLOSE_SETTLE_STEPS = 18
 PRE_CLOSE_SETTLE_STEPS = int(np.clip(PRE_CLOSE_SETTLE_STEPS, 0, 120))
+# Convergence settle: keep stepping until joints converge to target.
+# Handles large IK jumps that exceed the rate-limited step budget.
+SETTLE_MAX_STEPS = 120
+SETTLE_CONVERGENCE_RAD = 0.02
 VERIFY_CLOSE_MIN_GRIPPER_WIDTH = 0.0025
 VERIFY_CLOSE_MAX_OBJECT_EEF_DISTANCE = 0.25
 VERIFY_CLOSE_MAX_OBJECT_EEF_XY_DISTANCE = 0.08
@@ -541,6 +558,9 @@ def _object_token_candidates(object_prim_path: str) -> list[str]:
 
     aliases = {
         "mug": ("mug", "cup", "coffee", "025", "ycb"),
+        "apple": ("apple", "apple001", "001"),
+        "ball": ("ball", "sphere", "ball012", "012", "015", "016"),
+        "cube": ("cube", "block"),
         "mustard": ("mustard", "006"),
         "sugar": ("sugar", "004"),
         "cracker": ("cracker", "003"),
@@ -739,6 +759,74 @@ def _load_grasp_pose_candidates(annotation_path: Path) -> tuple[list[dict[str, A
     return out, meta_info
 
 
+def _compute_annotation_local_bounds(
+    stage: Any,
+    object_prim_path: str,
+    usd: Any,
+    usd_geom: Any,
+) -> Optional[tuple[np.ndarray, np.ndarray, str]]:
+    """Return mesh-local bounds for annotation validation.
+
+    Annotation positions are object-local coordinates. Using `ComputeLocalBound`
+    on a transformed root prim can include world translation, which breaks local
+    pose checks. Prefer `ComputeUntransformedBound` and fall back safely.
+    """
+    if stage is None:
+        return None
+    prim = stage.GetPrimAtPath(object_prim_path)
+    if prim is None or not prim.IsValid():
+        return None
+
+    bbox_cache = usd_geom.BBoxCache(
+        usd.TimeCode.Default(),
+        [usd_geom.Tokens.default_],
+        useExtentsHint=True,
+    )
+
+    def _extract(bound: Any) -> Optional[tuple[np.ndarray, np.ndarray]]:
+        try:
+            rng = bound.GetRange()
+            min_pt = np.asarray(rng.GetMin(), dtype=np.float32)
+            max_pt = np.asarray(rng.GetMax(), dtype=np.float32)
+        except Exception:
+            return None
+        if min_pt.size < 3 or max_pt.size < 3:
+            return None
+        if not np.all(np.isfinite(min_pt[:3])) or not np.all(np.isfinite(max_pt[:3])):
+            return None
+        if float(np.max(np.abs(max_pt[:3] - min_pt[:3]))) < 1e-6:
+            return None
+        return min_pt[:3], max_pt[:3]
+
+    def _maybe_recenter(mn: np.ndarray, mx: np.ndarray, tag: str) -> tuple[np.ndarray, np.ndarray, str]:
+        center = 0.5 * (mn + mx)
+        half = 0.5 * np.abs(mx - mn)
+        radius = float(np.max(half))
+        center_norm = float(np.linalg.norm(center))
+        if np.isfinite(radius) and radius > 1e-6 and np.isfinite(center_norm) and center_norm > radius * 3.0:
+            return mn - center, mx - center, f"{tag}_recentered"
+        return mn, mx, tag
+
+    try:
+        ub = bbox_cache.ComputeUntransformedBound(prim)
+        extracted = _extract(ub)
+        if extracted is not None:
+            mn, mx = extracted
+            return _maybe_recenter(mn, mx, "untransformed")
+    except Exception:
+        pass
+
+    try:
+        lb = bbox_cache.ComputeLocalBound(prim)
+        extracted = _extract(lb)
+        if extracted is None:
+            return None
+        mn, mx = extracted
+        return _maybe_recenter(mn, mx, "local")
+    except Exception:
+        return None
+
+
 def _infer_annotation_position_scale(
     stage: Any,
     object_prim_path: str,
@@ -756,19 +844,16 @@ def _infer_annotation_position_scale(
     if stage is None or not candidates:
         return 1.0
     try:
-        prim = stage.GetPrimAtPath(object_prim_path)
-        if prim is None or not prim.IsValid():
-            return 1.0
-
-        bbox_cache = usd_geom.BBoxCache(
-            usd.TimeCode.Default(),
-            [usd_geom.Tokens.default_],
-            useExtentsHint=True,
+        bounds = _compute_annotation_local_bounds(
+            stage=stage,
+            object_prim_path=object_prim_path,
+            usd=usd,
+            usd_geom=usd_geom,
         )
-        bbox = bbox_cache.ComputeLocalBound(prim)
-        rng = bbox.GetRange()
-        min_pt = np.asarray(rng.GetMin(), dtype=np.float32)
-        max_pt = np.asarray(rng.GetMax(), dtype=np.float32)
+        if bounds is None:
+            return 1.0
+        min_pt, max_pt, _bound_frame = bounds
+        center = 0.5 * (min_pt + max_pt)
         half = 0.5 * np.abs(max_pt - min_pt)
         mesh_radius = float(np.max(half))
         if not np.isfinite(mesh_radius) or mesh_radius < 1e-6:
@@ -782,7 +867,7 @@ def _infer_annotation_position_scale(
             lp = _to_numpy(cand.get("local_pos"), dtype=np.float32).reshape(-1)
             if lp.size < 3 or not np.all(np.isfinite(lp[:3])):
                 continue
-            norms.append(float(np.linalg.norm(lp[:3] * preset)))
+            norms.append(float(np.linalg.norm((lp[:3] * preset) - center)))
         if len(norms) < 3:
             return 1.0
 
@@ -823,21 +908,18 @@ def _sanitize_annotation_candidates(
         report["kept"] = int(len(kept))
         return kept, report
     try:
-        prim = stage.GetPrimAtPath(object_prim_path)
-        if prim is None or not prim.IsValid():
+        bounds = _compute_annotation_local_bounds(
+            stage=stage,
+            object_prim_path=object_prim_path,
+            usd=usd,
+            usd_geom=usd_geom,
+        )
+        if bounds is None:
             kept = list(candidates)
             report["kept"] = int(len(kept))
             return kept, report
-
-        bbox_cache = usd_geom.BBoxCache(
-            usd.TimeCode.Default(),
-            [usd_geom.Tokens.default_],
-            useExtentsHint=True,
-        )
-        bbox = bbox_cache.ComputeLocalBound(prim)
-        rng = bbox.GetRange()
-        min_pt = np.asarray(rng.GetMin(), dtype=np.float32)
-        max_pt = np.asarray(rng.GetMax(), dtype=np.float32)
+        min_pt, max_pt, bound_frame = bounds
+        report["bound_frame"] = str(bound_frame)
         half = 0.5 * np.abs(max_pt - min_pt)
         mesh_radius = float(np.max(half))
         if not np.isfinite(mesh_radius) or mesh_radius < 1e-6:
@@ -1069,10 +1151,19 @@ def _select_annotation_grasp_target(
         ANNOTATION_BODY_MIN_LOCAL_Z_PERCENTILE,
     )
 
+    # Spread retry attempts across the candidate list for diversity.
+    # Instead of rotating by 1 (adjacent grasps with similar angles),
+    # stride by len/max_attempts to sample widely different poses.
+    def _diversity_shift(indices: list[int], attempt: int) -> int:
+        if len(indices) <= 1:
+            return 0
+        stride = max(1, len(indices) // max(GRASP_MAX_ATTEMPTS, 1))
+        return stride * max(0, attempt - 1)
+
     ordered_groups: list[tuple[str, list[int]]] = [
-        ("functional_handle", _rotate(handle_indices, attempt_index - 1)),
-        ("body", _rotate(body_indices, attempt_index - 1)),
-        ("topdown", _rotate(topdown_indices, attempt_index - 1)),
+        ("functional_handle", _rotate(handle_indices, _diversity_shift(handle_indices, attempt_index))),
+        ("body", _rotate(body_indices, _diversity_shift(body_indices, attempt_index))),
+        ("topdown", _rotate(topdown_indices, _diversity_shift(topdown_indices, attempt_index))),
     ]
 
     filtered_groups: list[tuple[str, list[int]]] = []
@@ -2495,6 +2586,236 @@ def _make_pick_place_waypoints(
     ]
 
 
+# ---------------------------------------------------------------------------
+#  Curobo motion-planning backend (lazy-loaded)
+# ---------------------------------------------------------------------------
+
+_CUROBO_STATE: dict | None = None
+
+
+def _extract_world_config(
+    usd_help: Any,
+    robot_prim_path: str,
+    table_prim_path: str,
+    object_prim_path: str | None,
+) -> Any:
+    """Build Curobo WorldConfig from current scene obstacles.
+
+    ``reference_prim_path=robot_prim_path`` transforms all obstacle
+    positions into the robot base frame so that Curobo planning targets
+    (also in robot base frame) are consistent.
+    """
+    from curobo.geom.types import WorldConfig
+
+    only_paths: list[str] = [table_prim_path]
+    if object_prim_path:
+        only_paths.append(object_prim_path)
+    try:
+        return (
+            usd_help.get_obstacles_from_stage(
+                only_paths=only_paths,
+                reference_prim_path=robot_prim_path,
+                ignore_substring=[robot_prim_path],
+            )
+            .get_collision_check_world()
+        )
+    except Exception as exc:
+        LOG.warning("Curobo WorldConfig extraction failed: %s; using empty world", exc)
+        return WorldConfig()
+
+
+def _init_curobo_motion_gen(
+    stage: Any,
+    robot_prim_path: str,
+    table_prim_path: str,
+    object_prim_path: str | None,
+) -> dict:
+    """Lazy-initialise a single Curobo MotionGen for synchronous planning."""
+    global _CUROBO_STATE
+    if _CUROBO_STATE is not None:
+        return _CUROBO_STATE
+
+    import torch
+
+    os.environ.setdefault("CUROBO_TORCH_CUDA_GRAPH_RESET", "1")
+
+    from curobo.geom.sdf.world import CollisionCheckerType
+    from curobo.types.base import TensorDeviceType
+    from curobo.util.usd_helper import UsdHelper
+    from curobo.util_file import get_robot_configs_path, join_path, load_yaml
+    from curobo.wrap.reacher.motion_gen import (
+        MotionGen,
+        MotionGenConfig,
+        MotionGenPlanConfig,
+    )
+
+    tensor_args = TensorDeviceType(device=torch.device("cuda:0"))
+
+    robot_yaml = None
+    for yml in ("magicsim_franka.yml", "franka.yml"):
+        try:
+            robot_yaml = load_yaml(join_path(get_robot_configs_path(), yml))
+            LOG.info("Curobo: loaded robot config %s", yml)
+            break
+        except Exception:
+            continue
+    if robot_yaml is None:
+        raise RuntimeError("Curobo: no usable Franka robot YAML found")
+
+    usd_help = UsdHelper()
+    usd_help.load_stage(stage)
+    world_cfg = _extract_world_config(
+        usd_help, robot_prim_path, table_prim_path, object_prim_path,
+    )
+
+    mg_cfg = MotionGenConfig.load_from_robot_config(
+        robot_yaml["robot_cfg"],
+        [world_cfg],
+        tensor_args,
+        collision_checker_type=CollisionCheckerType.MESH,
+        use_cuda_graph=False,
+        interpolation_dt=0.03,
+        collision_cache={"mesh": 10},
+        collision_activation_distance=0.015,
+        maximum_trajectory_dt=0.25,
+        n_collision_envs=1,
+    )
+    motion_gen = MotionGen(mg_cfg)
+
+    plan_config = MotionGenPlanConfig(
+        enable_graph=False,
+        max_attempts=16,
+        enable_finetune_trajopt=True,
+    )
+
+    _CUROBO_STATE = {
+        "motion_gen": motion_gen,
+        "plan_config": plan_config,
+        "tensor_args": tensor_args,
+        "usd_help": usd_help,
+    }
+    LOG.info("Curobo MotionGen initialised (device=cuda:0)")
+    return _CUROBO_STATE
+
+
+def _update_curobo_world(
+    curobo_state: dict,
+    stage: Any,
+    robot_prim_path: str,
+    table_prim_path: str,
+    object_prim_path: str | None,
+) -> None:
+    """Refresh collision world from the current USD stage."""
+    world_cfg = _extract_world_config(
+        curobo_state["usd_help"],
+        robot_prim_path,
+        table_prim_path,
+        object_prim_path,
+    )
+    curobo_state["motion_gen"].world_coll_checker.load_collision_model(
+        world_cfg, env_idx=0,
+    )
+
+
+def _world_to_robot_frame(
+    target_pos_world: np.ndarray,
+    target_quat_world: np.ndarray,
+    robot_base_pos: np.ndarray,
+    robot_base_quat: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Transform a world-frame pose into the robot base frame."""
+    rot_inv = _quat_to_rot_wxyz(robot_base_quat).T
+    pos_robot = (rot_inv @ (target_pos_world[:3] - robot_base_pos[:3])).astype(np.float32)
+    base_q_inv = _normalize_quat_wxyz(robot_base_quat).copy()
+    base_q_inv[1:] *= -1.0
+    quat_robot = _quat_mul_wxyz(base_q_inv, target_quat_world)
+    return pos_robot, quat_robot
+
+
+def _plan_curobo_segment(
+    curobo_state: dict,
+    current_joints_7: np.ndarray,
+    target_pos_world: np.ndarray,
+    target_quat_world: np.ndarray,
+    robot_base_pos: np.ndarray,
+    robot_base_quat: np.ndarray,
+) -> np.ndarray | None:
+    """Plan a collision-free trajectory from current joints to a Cartesian target.
+
+    Returns an ``[T, 7]`` numpy array of joint positions or *None* on failure.
+    The target pose is given in **world frame** and automatically transformed
+    into the robot base frame before planning.
+    """
+    import torch
+    from curobo.types.math import Pose
+    from curobo.types.state import JointState
+
+    mg = curobo_state["motion_gen"]
+    ta = curobo_state["tensor_args"]
+
+    pos_r, quat_r = _world_to_robot_frame(
+        target_pos_world, target_quat_world,
+        robot_base_pos, robot_base_quat,
+    )
+
+    kin_names = mg.kinematics.joint_names
+    n_joints = len(kin_names)
+    q_tensor = ta.to_device(current_joints_7[:n_joints].tolist()).view(1, -1)
+    cur_js = JointState(
+        position=q_tensor,
+        velocity=q_tensor * 0.0,
+        acceleration=q_tensor * 0.0,
+        jerk=q_tensor * 0.0,
+        joint_names=kin_names,
+    )
+
+    goal = Pose(
+        position=ta.to_device(pos_r.tolist()).view(1, 3),
+        quaternion=ta.to_device(quat_r.tolist()).view(1, 4),
+    )
+
+    try:
+        result = mg.plan_single(cur_js, goal, curobo_state["plan_config"].clone())
+    except Exception as exc:
+        LOG.warning("Curobo plan_single exception: %s", exc)
+        return None
+
+    if result.success is None or not result.success.item():
+        LOG.warning("Curobo plan_single returned success=False")
+        return None
+
+    traj = mg.get_full_js(result.get_interpolated_plan())
+    return traj.position.cpu().numpy().astype(np.float32)[:, :7]
+
+
+def _execute_curobo_trajectory(
+    franka: Any,
+    world: Any,
+    trajectory: np.ndarray,
+    gripper_target: float,
+    record_fn: Any,
+    timeout_fn: Any,
+    stop_event: Any = None,
+) -> None:
+    """Step through a Curobo-planned ``[T, 7]`` trajectory one tick at a time.
+
+    Uses a wider rate-limit (0.08 rad/step) than the default IK path because
+    the Curobo trajectory is already smooth (``interpolation_dt=0.03``).
+    """
+    for i in range(trajectory.shape[0]):
+        if timeout_fn():
+            return
+        if stop_event is not None and stop_event.is_set():
+            return
+        arm = np.clip(trajectory[i], FRANKA_ARM_LOWER, FRANKA_ARM_UPPER)
+        arm_cmd, gr_cmd = _step_toward_joint_targets(
+            franka, arm, gripper_target, max_arm_step=0.08,
+        )
+        _set_joint_targets(franka, arm_cmd, gr_cmd, physics_control=True)
+        world.step(render=True)
+        record_fn(arm_target=arm, gripper_target=gripper_target)
+
+
 def _make_pick_place_waypoints_ik(
     ik_solver: Any,
     pick_pos: tuple[float, float],
@@ -2538,6 +2859,11 @@ def _make_pick_place_waypoints_ik(
         "DOWN_PLACE": np.array([place_pos[0], place_pos[1], float(place_grasp_z)], dtype=np.float32),
     }
 
+    # Waypoints where IK endpoint accuracy is critical for grasp success.
+    # These must NOT be clamped — the execution layer (_step_toward_joint_targets)
+    # already rate-limits joint motion for smooth transitions.
+    _ENDPOINT_CRITICAL = {"PRE_GRASP", "DOWN_PICK"}
+
     solved: dict[str, np.ndarray] = {}
     prev_q: np.ndarray | None = None
     for name in ("APPROACH_PICK", "PRE_GRASP", "DOWN_PICK", "MOVE_TO_PLACE", "DOWN_PLACE"):
@@ -2554,15 +2880,26 @@ def _make_pick_place_waypoints_ik(
             jump = _shortest_angular_delta(q, prev_q)
             max_jump = float(np.max(np.abs(jump)))
             if max_jump > MAX_IK_WAYPOINT_JUMP_RAD:
-                LOG.warning(
-                    "IK waypoint '%s' jump %.3f rad too large; clamping for continuity",
-                    name,
-                    max_jump,
-                )
-                q = prev_q + np.clip(jump, -MAX_IK_WAYPOINT_JUMP_RAD, MAX_IK_WAYPOINT_JUMP_RAD)
-                q = np.clip(q, FRANKA_ARM_LOWER, FRANKA_ARM_UPPER).astype(np.float32, copy=False)
-        noise = rng.uniform(-0.01, 0.01, size=q.shape).astype(np.float32)
-        solved[name] = np.clip(q + noise, FRANKA_ARM_LOWER, FRANKA_ARM_UPPER).astype(np.float32)
+                if name in _ENDPOINT_CRITICAL:
+                    # Log but preserve the exact IK solution for grasp-critical waypoints.
+                    # Execution layer handles smooth transitions via rate-limited stepping.
+                    LOG.info(
+                        "IK waypoint '%s' jump %.3f rad (preserving exact IK solution for endpoint accuracy)",
+                        name,
+                        max_jump,
+                    )
+                else:
+                    LOG.warning(
+                        "IK waypoint '%s' jump %.3f rad too large; clamping for continuity",
+                        name,
+                        max_jump,
+                    )
+                    q = prev_q + np.clip(jump, -MAX_IK_WAYPOINT_JUMP_RAD, MAX_IK_WAYPOINT_JUMP_RAD)
+                    q = np.clip(q, FRANKA_ARM_LOWER, FRANKA_ARM_UPPER).astype(np.float32, copy=False)
+        if IK_WAYPOINT_NOISE_RAD > 0.0:
+            noise = rng.uniform(-IK_WAYPOINT_NOISE_RAD, IK_WAYPOINT_NOISE_RAD, size=q.shape).astype(np.float32)
+            q = np.clip(q + noise, FRANKA_ARM_LOWER, FRANKA_ARM_UPPER).astype(np.float32)
+        solved[name] = np.clip(q, FRANKA_ARM_LOWER, FRANKA_ARM_UPPER).astype(np.float32)
         prev_q = solved[name]
 
     home = _pad_or_trim(_to_numpy(home_arm), 7) if home_arm is not None else HOME.copy()
@@ -2657,6 +2994,8 @@ def _compute_grasp_metrics(
     object_height: float,
     finger_left_prim_path: str | None = None,
     finger_right_prim_path: str | None = None,
+    current_target: Optional[dict[str, Any]] = None,
+    tip_mid_offset_in_hand: np.ndarray | None = None,
 ) -> dict[str, float]:
     joints = _to_numpy(franka.get_joint_positions())
     if joints.size >= 9:
@@ -2671,6 +3010,30 @@ def _compute_grasp_metrics(
     delta = obj_pos - eef_pos
     obj_eef_dist = float(np.linalg.norm(delta))
     obj_eef_xy_dist = float(np.linalg.norm(delta[:2]))
+
+    target_pos = obj_pos
+    target_quat = np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32)
+    if current_target:
+        try:
+            live_target_pos, live_target_quat = _compute_live_grasp_target_pose(
+                stage=stage,
+                object_prim_path=object_prim_path,
+                usd=usd,
+                usd_geom=usd_geom,
+                current_target=current_target,
+            )
+            live_target_pos = _to_numpy(live_target_pos, dtype=np.float32).reshape(-1)
+            live_target_quat = _to_numpy(live_target_quat, dtype=np.float32).reshape(-1)
+            if live_target_pos.size >= 3 and np.all(np.isfinite(live_target_pos[:3])):
+                target_pos = live_target_pos[:3].astype(np.float32, copy=False)
+            if live_target_quat.size >= 4 and np.all(np.isfinite(live_target_quat[:4])):
+                target_quat = _normalize_quat_wxyz(live_target_quat[:4])
+        except Exception:
+            pass
+    target_delta = target_pos - eef_pos
+    tgt_eef_dist = float(np.linalg.norm(target_delta))
+    tgt_eef_xy_dist = float(np.linalg.norm(target_delta[:2]))
+
     tip_mid_metrics: dict[str, float] = {}
     if finger_left_prim_path and finger_right_prim_path:
         left_pos, _ = _get_prim_world_pose(stage, finger_left_prim_path, usd, usd_geom)
@@ -2678,46 +3041,146 @@ def _compute_grasp_metrics(
         if np.all(np.isfinite(left_pos[:3])) and np.all(np.isfinite(right_pos[:3])):
             tip_mid = 0.5 * (left_pos[:3] + right_pos[:3])
             tip_delta = obj_pos - tip_mid
+            target_tip_mid_pos = target_pos
+            if (
+                current_target
+                and current_target.get("source") == "annotation"
+                and bool(current_target.get("annotation_tip_mid_to_hand_converted", False))
+            ):
+                off = _to_numpy(tip_mid_offset_in_hand, dtype=np.float32).reshape(-1)
+                if off.size >= 3 and np.all(np.isfinite(off[:3])):
+                    try:
+                        target_tip_mid_pos = (
+                            target_pos + (_quat_to_rot_wxyz(target_quat) @ off[:3]).astype(np.float32)
+                        ).astype(np.float32, copy=False)
+                    except Exception:
+                        target_tip_mid_pos = target_pos
+            tip_delta_target = target_tip_mid_pos - tip_mid
             tip_mid_metrics = {
                 "object_tip_mid_distance": float(np.linalg.norm(tip_delta)),
                 "object_tip_mid_xy_distance": float(np.linalg.norm(tip_delta[:2])),
                 "object_tip_mid_z_delta": float(tip_delta[2]),
+                "target_tip_mid_distance": float(np.linalg.norm(tip_delta_target)),
+                "target_tip_mid_xy_distance": float(np.linalg.norm(tip_delta_target[:2])),
+                "target_tip_mid_z_delta": float(tip_delta_target[2]),
             }
     lift_height = float(obj_pos[2] - (float(table_top_z) + 0.5 * float(object_height)))
     out = {
         "gripper_width": gripper_width,
         "object_eef_distance": obj_eef_dist,
         "object_eef_xy_distance": obj_eef_xy_dist,
+        "target_eef_distance": tgt_eef_dist,
+        "target_eef_xy_distance": tgt_eef_xy_dist,
         "lift_height": lift_height,
     }
     out.update(tip_mid_metrics)
     return out
 
 
+def _metric_min_object_target(
+    metrics: dict[str, float],
+    object_key: str,
+    target_key: str,
+    default: float = 1e9,
+) -> float:
+    vals: list[float] = []
+    for key in (object_key, target_key):
+        try:
+            v = float(metrics.get(key, np.nan))
+            if np.isfinite(v):
+                vals.append(v)
+        except Exception:
+            pass
+    if vals:
+        return float(min(vals))
+    return float(default)
+
+
+def _metric_prefer_target(
+    metrics: dict[str, float],
+    target_key: str,
+    object_key: str,
+    default: float = 1e9,
+) -> float:
+    try:
+        tgt = float(metrics.get(target_key, np.nan))
+        if np.isfinite(tgt):
+            return tgt
+    except Exception:
+        pass
+    try:
+        obj = float(metrics.get(object_key, np.nan))
+        if np.isfinite(obj):
+            return obj
+    except Exception:
+        pass
+    return float(default)
+
+
 def _verify_after_close(metrics: dict[str, float]) -> bool:
+    eef_dist = _metric_min_object_target(
+        metrics,
+        object_key="object_eef_distance",
+        target_key="target_eef_distance",
+    )
+    eef_xy = _metric_min_object_target(
+        metrics,
+        object_key="object_eef_xy_distance",
+        target_key="target_eef_xy_distance",
+    )
     return bool(
         metrics.get("gripper_width", 0.0) >= VERIFY_CLOSE_MIN_GRIPPER_WIDTH
-        and metrics.get("object_eef_distance", 1e9) <= VERIFY_CLOSE_MAX_OBJECT_EEF_DISTANCE
-        and metrics.get("object_eef_xy_distance", 1e9) <= VERIFY_CLOSE_MAX_OBJECT_EEF_XY_DISTANCE
+        and eef_dist <= VERIFY_CLOSE_MAX_OBJECT_EEF_DISTANCE
+        and eef_xy <= VERIFY_CLOSE_MAX_OBJECT_EEF_XY_DISTANCE
     )
 
 
 def _verify_after_retrieval(metrics: dict[str, float]) -> bool:
+    eef_dist = _metric_min_object_target(
+        metrics,
+        object_key="object_eef_distance",
+        target_key="target_eef_distance",
+    )
     return bool(
         metrics.get("gripper_width", 0.0) >= VERIFY_CLOSE_MIN_GRIPPER_WIDTH
         and metrics.get("lift_height", -1e9) >= VERIFY_RETRIEVAL_MIN_LIFT
-        and metrics.get("object_eef_distance", 1e9) <= VERIFY_RETRIEVAL_MAX_OBJECT_EEF_DISTANCE
+        and eef_dist <= VERIFY_RETRIEVAL_MAX_OBJECT_EEF_DISTANCE
     )
 
 
 def _verify_reach_before_close(metrics: dict[str, float]) -> bool:
-    eef_ok = bool(
-        metrics.get("object_eef_distance", 1e9) <= REACH_BEFORE_CLOSE_MAX_OBJECT_EEF_DISTANCE
-        and metrics.get("object_eef_xy_distance", 1e9) <= REACH_BEFORE_CLOSE_MAX_OBJECT_EEF_XY_DISTANCE
+    eef_dist = _metric_prefer_target(
+        metrics,
+        target_key="target_eef_distance",
+        object_key="object_eef_distance",
     )
-    tip_dist = float(metrics.get("object_tip_mid_distance", np.nan))
-    tip_xy = float(metrics.get("object_tip_mid_xy_distance", np.nan))
-    tip_dz = float(metrics.get("object_tip_mid_z_delta", np.nan))
+    eef_xy = _metric_prefer_target(
+        metrics,
+        target_key="target_eef_xy_distance",
+        object_key="object_eef_xy_distance",
+    )
+    eef_ok = bool(
+        eef_dist <= REACH_BEFORE_CLOSE_MAX_OBJECT_EEF_DISTANCE
+        and eef_xy <= REACH_BEFORE_CLOSE_MAX_OBJECT_EEF_XY_DISTANCE
+    )
+    tip_dist = _metric_prefer_target(
+        metrics,
+        target_key="target_tip_mid_distance",
+        object_key="object_tip_mid_distance",
+        default=float("nan"),
+    )
+    tip_xy = _metric_prefer_target(
+        metrics,
+        target_key="target_tip_mid_xy_distance",
+        object_key="object_tip_mid_xy_distance",
+        default=float("nan"),
+    )
+    tip_dz = _metric_prefer_target(
+        metrics,
+        target_key="target_tip_mid_z_delta",
+        object_key="object_tip_mid_z_delta",
+        default=float("nan"),
+    )
     tip_available = np.isfinite(tip_dist) and np.isfinite(tip_xy) and np.isfinite(tip_dz)
     if not tip_available:
         return eef_ok
@@ -2756,6 +3219,8 @@ def _run_pick_place_episode(
     episode_timeout_sec: float = DEFAULT_EPISODE_TIMEOUT_SEC,
     finger_left_prim_path: str | None = None,
     finger_right_prim_path: str | None = None,
+    robot_prim_path: str | None = None,
+    table_prim_path: str | None = None,
 ) -> tuple[int, bool, bool]:
     world.reset()
     for _ in range(10):
@@ -3087,7 +3552,7 @@ def _run_pick_place_episode(
 
                 # Borrowed from MagicSim grasp phase behavior:
                 # if reach gate is already satisfied while descending, halt early and close.
-                if end_name == "DOWN_PICK" and step >= 4:
+                if ENABLE_EARLY_REACH_HALT and end_name == "DOWN_PICK" and step >= 4:
                     reach_metrics = _compute_grasp_metrics(
                         franka=franka,
                         stage=stage,
@@ -3100,6 +3565,8 @@ def _run_pick_place_episode(
                         object_height=max(float(object_height), 0.01),
                         finger_left_prim_path=finger_left_prim_path,
                         finger_right_prim_path=finger_right_prim_path,
+                        current_target=current_grasp_target,
+                        tip_mid_offset_in_hand=annotation_tip_mid_offset_hand,
                     )
                     if _verify_reach_before_close(reach_metrics):
                         close_anchor_arm = _current_arm_target().astype(np.float32, copy=False)
@@ -3164,6 +3631,17 @@ def _run_pick_place_episode(
             _set_joint_targets(franka, arm_cmd, gr_cmd, physics_control=True)
             world.step(render=True)
             _record_frame(arm_target=cur_arm, gripper_target=GRIPPER_OPEN)
+
+    # -- Curobo backend: lazy init (once per episode) -----------------------
+    curobo_state = None
+    if PLANNER_BACKEND == "curobo" and robot_prim_path and table_prim_path:
+        try:
+            curobo_state = _init_curobo_motion_gen(
+                stage, robot_prim_path, table_prim_path, object_prim_path,
+            )
+            LOG.info("collect: Curobo backend active")
+        except Exception as exc:
+            LOG.error("Curobo init failed, falling back to IK: %s", exc)
 
     for attempt in range(1, GRASP_MAX_ATTEMPTS + 1):
         if _timeout_triggered():
@@ -3388,26 +3866,138 @@ def _run_pick_place_episode(
         lift_transitions = list(zip(waypoints[close_idx:lift_idx], waypoints[close_idx + 1 : lift_idx + 1]))
         place_transitions = list(zip(waypoints[lift_idx:-1], waypoints[lift_idx + 1 :]))
 
-        _execute_transitions(
-            pick_transitions,
-            # Lock to per-attempt planned pose to avoid chasing disturbed mesh during descent.
-            live_target_z_by_waypoint=None,
-            # Reach-before-close gate should be evaluated before physically closing gripper.
-            enable_close_hold=False,
-        )
+        # ---- Curobo path: replace PRE_GRASP -> DOWN_PICK with Curobo trajectory ---
+        _pick_phase_handled = False
+        if curobo_state is not None and "PRE_GRASP" in names and "DOWN_PICK" in names:
+            pg_idx = names.index("PRE_GRASP")
+            dp_idx = names.index("DOWN_PICK")
+            if 0 < pg_idx < dp_idx < close_idx:
+                # Phase A: HOME -> ... -> PRE_GRASP via existing rate-limited stepping
+                pre_transitions = list(zip(waypoints[:pg_idx], waypoints[1 : pg_idx + 1]))
+                _execute_transitions(
+                    pre_transitions,
+                    live_target_z_by_waypoint=None,
+                    enable_close_hold=False,
+                )
+                if stopped:
+                    break
+
+                # Settle at PRE_GRASP (20 steps)
+                pregrasp_arm = waypoints[pg_idx][1]
+                for _settle in range(20):
+                    if _timeout_triggered():
+                        break
+                    arm_cmd, gr_cmd = _step_toward_joint_targets(
+                        franka, pregrasp_arm, GRIPPER_OPEN,
+                    )
+                    _set_joint_targets(franka, arm_cmd, gr_cmd, physics_control=True)
+                    world.step(render=True)
+                    _record_frame(arm_target=pregrasp_arm, gripper_target=GRIPPER_OPEN)
+                if stopped:
+                    break
+
+                # Phase B: PRE_GRASP -> DOWN_PICK via Curobo
+                try:
+                    _update_curobo_world(
+                        curobo_state, stage, robot_prim_path,
+                        table_prim_path, object_prim_path,
+                    )
+                except Exception as exc:
+                    LOG.warning("Curobo world update failed: %s", exc)
+
+                robot_base_pos, robot_base_quat = _get_prim_world_pose(
+                    stage, robot_prim_path, usd, usd_geom,
+                )
+                cur_q = _to_numpy(franka.get_joint_positions())[:7]
+                down_xyz = np.array(
+                    [last_pick_pos[0], last_pick_pos[1],
+                     float(z_targets["pick_grasp_z"])],
+                    dtype=np.float32,
+                )
+                down_quat = (
+                    ik_target_orientation
+                    if ik_target_orientation is not None
+                    else TOP_DOWN_FALLBACK_QUAT.copy()
+                )
+
+                curobo_traj = _plan_curobo_segment(
+                    curobo_state, cur_q, down_xyz, down_quat,
+                    robot_base_pos, robot_base_quat,
+                )
+                if curobo_traj is not None:
+                    LOG.info(
+                        "collect: attempt %d Curobo trajectory %d steps",
+                        attempt, curobo_traj.shape[0],
+                    )
+                    _execute_curobo_trajectory(
+                        franka, world, curobo_traj, GRIPPER_OPEN,
+                        record_fn=_record_frame,
+                        timeout_fn=_timeout_triggered,
+                        stop_event=stop_event,
+                    )
+                    # Execute remaining DOWN_PICK -> CLOSE via rate-limited stepping
+                    if dp_idx < close_idx:
+                        tail = list(zip(
+                            waypoints[dp_idx:close_idx],
+                            waypoints[dp_idx + 1 : close_idx + 1],
+                        ))
+                        _execute_transitions(
+                            tail,
+                            live_target_z_by_waypoint=None,
+                            enable_close_hold=False,
+                        )
+                    _pick_phase_handled = True
+                else:
+                    LOG.warning(
+                        "collect: attempt %d Curobo plan failed; IK fallback",
+                        attempt,
+                    )
+                    # Fall back: execute remaining PRE_GRASP -> CLOSE via IK path
+                    fallback = list(zip(
+                        waypoints[pg_idx:close_idx],
+                        waypoints[pg_idx + 1 : close_idx + 1],
+                    ))
+                    _execute_transitions(
+                        fallback,
+                        live_target_z_by_waypoint=None,
+                        enable_close_hold=False,
+                    )
+                    _pick_phase_handled = True
+
+        # ---- IK path (default or Curobo not applicable) ----
+        if not _pick_phase_handled:
+            _execute_transitions(
+                pick_transitions,
+                live_target_z_by_waypoint=None,
+                enable_close_hold=False,
+            )
         if stopped:
             break
 
-        # Settle near close pose with gripper open before reach gate (MagicSim-style).
-        if PRE_CLOSE_SETTLE_STEPS > 0:
-            close_arm_pre = waypoints[close_idx][1]
-            for _ in range(PRE_CLOSE_SETTLE_STEPS):
-                if _timeout_triggered():
-                    break
-                arm_cmd, gr_cmd = _step_toward_joint_targets(franka, close_arm_pre, GRIPPER_OPEN)
-                _set_joint_targets(franka, arm_cmd, gr_cmd, physics_control=True)
-                world.step(render=True)
-                _record_frame(arm_target=close_arm_pre, gripper_target=GRIPPER_OPEN)
+        # Convergence settle: step toward close pose until joints converge
+        # or max steps reached.  Handles large IK jumps that exceed the
+        # rate-limited step budget of the segment phase.
+        close_arm_pre = waypoints[close_idx][1]
+        for settle_step in range(SETTLE_MAX_STEPS):
+            if _timeout_triggered():
+                break
+            arm_cmd, gr_cmd = _step_toward_joint_targets(franka, close_arm_pre, GRIPPER_OPEN)
+            _set_joint_targets(franka, arm_cmd, gr_cmd, physics_control=True)
+            world.step(render=True)
+            _record_frame(arm_target=close_arm_pre, gripper_target=GRIPPER_OPEN)
+            # Check joint convergence after minimum settle period.
+            if settle_step >= PRE_CLOSE_SETTLE_STEPS - 1:
+                current_joints = _to_numpy(franka.get_joint_positions())
+                if current_joints.size >= 7:
+                    max_err = float(np.max(np.abs(
+                        close_arm_pre[:7] - current_joints[:7].astype(np.float32)
+                    )))
+                    if max_err < SETTLE_CONVERGENCE_RAD:
+                        LOG.info(
+                            "collect: attempt %d settle converged in %d steps (max_err=%.4f)",
+                            attempt, settle_step + 1, max_err,
+                        )
+                        break
         if stopped:
             break
 
@@ -3423,6 +4013,8 @@ def _run_pick_place_episode(
             object_height=object_height,
             finger_left_prim_path=finger_left_prim_path,
             finger_right_prim_path=finger_right_prim_path,
+            current_target=current_grasp_target,
+            tip_mid_offset_in_hand=annotation_tip_mid_offset_hand,
         )
         reach_ok = _verify_reach_before_close(reach_metrics)
         if not reach_ok:
@@ -3468,6 +4060,8 @@ def _run_pick_place_episode(
             object_height=object_height,
             finger_left_prim_path=finger_left_prim_path,
             finger_right_prim_path=finger_right_prim_path,
+            current_target=current_grasp_target,
+            tip_mid_offset_in_hand=annotation_tip_mid_offset_hand,
         )
         close_ok = _verify_after_close(close_metrics)
         if not close_ok:
@@ -3505,6 +4099,8 @@ def _run_pick_place_episode(
             object_height=object_height,
             finger_left_prim_path=finger_left_prim_path,
             finger_right_prim_path=finger_right_prim_path,
+            current_target=current_grasp_target,
+            tip_mid_offset_in_hand=annotation_tip_mid_offset_hand,
         )
         retrieval_ok = _verify_after_retrieval(retrieval_metrics)
 
@@ -4242,6 +4838,8 @@ def run_collection_in_process(
                     episode_timeout_sec=episode_timeout_sec,
                     finger_left_prim_path=ctx.get("finger_left_prim_path"),
                     finger_right_prim_path=ctx.get("finger_right_prim_path"),
+                    robot_prim_path=ctx.get("robot_prim_path"),
+                    table_prim_path=ctx.get("table_prim_path"),
                 )
             finally:
                 writer.finish_episode(

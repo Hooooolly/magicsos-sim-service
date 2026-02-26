@@ -454,7 +454,7 @@ def _strip_runtime_helper_imports(code: str) -> str:
     """Remove invalid helper imports that LLM may generate for runtime-injected helpers."""
     if not code:
         return code
-    helper_names = {"create_table", "create_franka", "create_mug"}
+    helper_names = {"create_table", "create_franka", "create_mug", "create_apple", "create_ball"}
     stage_import_re = re.compile(r"^(\s*from\s+omni\.isaac\.core\.utils\.stage\s+import\s+)(.+)$")
     cleaned = []
     for line in code.splitlines():
@@ -475,7 +475,7 @@ def _strip_runtime_helper_imports(code: str) -> str:
 
         if "import" in raw and any(h in raw for h in helper_names) and "def " not in raw:
             tmp = re.sub(
-                r"\b(create_table|create_franka|create_mug)\b(?:\s+as\s+[A-Za-z_][A-Za-z0-9_]*)?\s*,?\s*",
+                r"\b(create_table|create_franka|create_mug|create_apple|create_ball)\b(?:\s+as\s+[A-Za-z_][A-Za-z0-9_]*)?\s*,?\s*",
                 "",
                 raw,
             )
@@ -758,6 +758,202 @@ def _runtime_create_mug(
     return prim_path
 
 
+def _runtime_create_apple(
+    stage=None,
+    prim_path: str = "/World/Apple",
+    position=(0.30, 0.00, 0.79),
+    usd_path: str | None = None,
+):
+    """Runtime scene helper exposed to scene-chat code as create_apple(...)."""
+    from pxr import UsdGeom, UsdPhysics, Gf
+    from omni.isaac.core.utils.stage import add_reference_to_stage
+
+    stage = stage or _get_stage()
+    if stage is None:
+        raise RuntimeError("No USD stage available")
+
+    candidates = []
+    if usd_path:
+        candidates.append(str(usd_path))
+    candidates.extend(
+        [
+            "/sim-service/assets/OmniObject3D/apple_001/Object_rigid.usd",
+            "/home/magics/rlinf-workspace/assets/OmniObject3D/Selected_Objs/apple/apple_001/Object_rigid.usd",
+            "/data/assets/OmniObject3D/Selected_Objs/apple/apple_001/Object_rigid.usd",
+        ]
+    )
+    candidates = _unique_preserve_order(candidates)
+
+    existing = stage.GetPrimAtPath(prim_path)
+    if existing and existing.IsValid():
+        try:
+            stage.RemovePrim(prim_path)
+            for _ in range(2):
+                simulation_app.update()
+        except Exception:
+            pass
+
+    loaded_ok = False
+    last_error = ""
+    for apple_usd in candidates:
+        apple_path = Path(str(apple_usd)).expanduser()
+        if (not str(apple_usd).startswith(("omniverse://", "http://", "https://"))) and (not apple_path.exists()):
+            continue
+        try:
+            add_reference_to_stage(usd_path=str(apple_usd), prim_path=prim_path)
+            for _ in range(8):
+                simulation_app.update()
+            prim = stage.GetPrimAtPath(prim_path)
+            if prim and prim.IsValid():
+                loaded_ok = True
+                break
+            stage.RemovePrim(prim_path)
+        except Exception as exc:
+            last_error = str(exc)
+            continue
+
+    if not loaded_ok:
+        raise RuntimeError(
+            f"Apple prim invalid at {prim_path}. last_error={last_error or 'none'}"
+        )
+
+    prim = stage.GetPrimAtPath(prim_path)
+    xf = UsdGeom.Xformable(prim)
+    xf.ClearXformOpOrder()
+    px, py, pz = position
+    xf.AddTranslateOp().Set(Gf.Vec3d(float(px), float(py), float(pz)))
+
+    try:
+        ann_candidates = [
+            Path(__file__).resolve().parent / "grasp_poses" / "apple_001_grasp_pose.json",
+            Path("/sim-service/grasp_poses/apple_001_grasp_pose.json"),
+            Path("/code/grasp_poses/apple_001_grasp_pose.json"),
+        ]
+        for ann_path in ann_candidates:
+            if ann_path.exists():
+                ann_abs = str(ann_path.resolve())
+                prim.SetCustomDataByKey("grasp_pose_path", ann_abs)
+                prim.SetCustomDataByKey("annotation_path", ann_abs)
+                break
+    except Exception:
+        pass
+
+    try:
+        UsdPhysics.RigidBodyAPI.Apply(prim)
+    except Exception:
+        pass
+    for p in stage.Traverse():
+        path = str(p.GetPath())
+        if not path.startswith(prim_path):
+            continue
+        try:
+            if p.IsA(UsdGeom.Mesh):
+                UsdPhysics.CollisionAPI.Apply(p)
+                UsdPhysics.MeshCollisionAPI.Apply(p)
+        except Exception:
+            continue
+
+    return prim_path
+
+
+def _runtime_create_ball(
+    stage=None,
+    prim_path: str = "/World/Ball",
+    position=(0.30, 0.00, 0.79),
+    usd_path: str | None = None,
+):
+    """Runtime scene helper exposed to scene-chat code as create_ball(...)."""
+    from pxr import UsdGeom, UsdPhysics, Gf
+    from omni.isaac.core.utils.stage import add_reference_to_stage
+
+    stage = stage or _get_stage()
+    if stage is None:
+        raise RuntimeError("No USD stage available")
+
+    candidates = []
+    if usd_path:
+        candidates.append(str(usd_path))
+    candidates.extend(
+        [
+            "/sim-service/assets/OmniObject3D/ball_012/Object_rigid.usd",
+            "/home/magics/rlinf-workspace/assets/OmniObject3D/Selected_Objs/ball/ball_012/Object_rigid.usd",
+            "/data/assets/OmniObject3D/Selected_Objs/ball/ball_012/Object_rigid.usd",
+        ]
+    )
+    candidates = _unique_preserve_order(candidates)
+
+    existing = stage.GetPrimAtPath(prim_path)
+    if existing and existing.IsValid():
+        try:
+            stage.RemovePrim(prim_path)
+            for _ in range(2):
+                simulation_app.update()
+        except Exception:
+            pass
+
+    loaded_ok = False
+    last_error = ""
+    for ball_usd in candidates:
+        ball_path = Path(str(ball_usd)).expanduser()
+        if (not str(ball_usd).startswith(("omniverse://", "http://", "https://"))) and (not ball_path.exists()):
+            continue
+        try:
+            add_reference_to_stage(usd_path=str(ball_usd), prim_path=prim_path)
+            for _ in range(8):
+                simulation_app.update()
+            prim = stage.GetPrimAtPath(prim_path)
+            if prim and prim.IsValid():
+                loaded_ok = True
+                break
+            stage.RemovePrim(prim_path)
+        except Exception as exc:
+            last_error = str(exc)
+            continue
+
+    if not loaded_ok:
+        raise RuntimeError(
+            f"Ball prim invalid at {prim_path}. last_error={last_error or 'none'}"
+        )
+
+    prim = stage.GetPrimAtPath(prim_path)
+    xf = UsdGeom.Xformable(prim)
+    xf.ClearXformOpOrder()
+    px, py, pz = position
+    xf.AddTranslateOp().Set(Gf.Vec3d(float(px), float(py), float(pz)))
+
+    try:
+        ann_candidates = [
+            Path(__file__).resolve().parent / "grasp_poses" / "ball_012_grasp_pose.json",
+            Path("/sim-service/grasp_poses/ball_012_grasp_pose.json"),
+            Path("/code/grasp_poses/ball_012_grasp_pose.json"),
+        ]
+        for ann_path in ann_candidates:
+            if ann_path.exists():
+                ann_abs = str(ann_path.resolve())
+                prim.SetCustomDataByKey("grasp_pose_path", ann_abs)
+                prim.SetCustomDataByKey("annotation_path", ann_abs)
+                break
+    except Exception:
+        pass
+
+    try:
+        UsdPhysics.RigidBodyAPI.Apply(prim)
+    except Exception:
+        pass
+    for p in stage.Traverse():
+        path = str(p.GetPath())
+        if not path.startswith(prim_path):
+            continue
+        try:
+            if p.IsA(UsdGeom.Mesh):
+                UsdPhysics.CollisionAPI.Apply(p)
+                UsdPhysics.MeshCollisionAPI.Apply(p)
+        except Exception:
+            continue
+
+    return prim_path
+
+
 def _code_may_mutate_stage(code: str) -> bool:
     """Best-effort detection for code that mutates USD stage topology/transforms."""
     txt = str(code or "")
@@ -778,6 +974,8 @@ def _code_may_mutate_stage(code: str) -> bool:
         r"\bcreate_table\(",
         r"\bcreate_franka\(",
         r"\bcreate_mug\(",
+        r"\bcreate_apple\(",
+        r"\bcreate_ball\(",
     ]
     return any(re.search(p, txt) for p in mutation_patterns)
 
@@ -1338,6 +1536,8 @@ def _process_commands():
                     "create_table": _runtime_create_table,
                     "create_franka": _runtime_create_franka,
                     "create_mug": _runtime_create_mug,
+                    "create_apple": _runtime_create_apple,
+                    "create_ball": _runtime_create_ball,
                     "print": lambda *a, **kw: stdout_capture.write(" ".join(str(x) for x in a) + "\n"),
                     **_extra_globals,
                 }
