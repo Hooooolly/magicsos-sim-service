@@ -84,15 +84,15 @@ WAYPOINT_NOISE_RAD = 0.05
 OBJECT_SIZE = 0.04
 OBJECT_MASS = 0.1
 MIN_PICK_PLACE_DIST = 0.1
-STEPS_PER_SEGMENT = 50
+STEPS_PER_SEGMENT = 200
 TABLE_MARGIN = 0.08
 MAX_GRIPPER_STEP = 0.008
 MAX_IK_WAYPOINT_JUMP_RAD = 1.20
 
 try:
-    MAX_ARM_STEP_RAD = float(os.environ.get("COLLECT_MAX_ARM_STEP_RAD", "0.03"))
+    MAX_ARM_STEP_RAD = float(os.environ.get("COLLECT_MAX_ARM_STEP_RAD", "0.08"))
 except Exception:
-    MAX_ARM_STEP_RAD = 0.03
+    MAX_ARM_STEP_RAD = 0.08
 MAX_ARM_STEP_RAD = float(np.clip(MAX_ARM_STEP_RAD, 0.005, 0.10))
 
 try:
@@ -2666,6 +2666,8 @@ def _init_curobo_motion_gen(
     import torch
 
     os.environ.setdefault("CUROBO_TORCH_CUDA_GRAPH_RESET", "1")
+    os.environ.setdefault("CUDA_LAUNCH_BLOCKING", "1")
+    os.environ.setdefault("HYDRA_FULL_ERROR", "1")
 
     from curobo.geom.sdf.world import CollisionCheckerType
     from curobo.types.base import TensorDeviceType
