@@ -1421,7 +1421,9 @@ def _create_franka_ik_solver(
         lula = LulaKinematicsSolver(**cfg)
         base_pos, base_quat = _get_prim_world_pose(stage, robot_prim_path, usd, usd_geom)
         lula.set_robot_base_pose(base_pos, base_quat)
-        frame_name = _select_ik_frame_name(lula.get_all_frame_names(), eef_prim_path)
+        all_frames = list(lula.get_all_frame_names())
+        LOG.info("IK solver available frames: %s", all_frames)
+        frame_name = _select_ik_frame_name(all_frames, eef_prim_path)
         if not frame_name:
             LOG.warning("IK init skipped: no valid end-effector frame")
             return None
@@ -2370,12 +2372,20 @@ def _compute_tip_mid_offset_in_hand(
     usd: Any,
     usd_geom: Any,
 ) -> np.ndarray | None:
-    """Measure fingertip-midpoint offset expressed in the current hand frame."""
+    """Measure fingertip-midpoint offset expressed in the current hand frame.
+
+    The finger prim paths (panda_leftfinger / panda_rightfinger) point to the
+    finger *base* links.  The actual fingertip is ~4.6 cm further along the
+    finger z-axis (matching MagicSim ``FrankaFrameCfg`` offset ``(0, 0, 0.046)``
+    and the URDF ``panda_leftfingertip`` joint at ``xyz=(0, 0, 0.045)``).
+    We add this extension so that *tip_mid* represents the true fingertip
+    midpoint, not the finger-base midpoint.
+    """
     if not eef_prim_path or not finger_left_prim_path or not finger_right_prim_path:
         return None
     hand_pos, hand_quat = _get_eef_pose(stage, eef_prim_path, get_prim_at_path, usd, usd_geom)
-    left_pos, _ = _get_prim_world_pose(stage, finger_left_prim_path, usd, usd_geom)
-    right_pos, _ = _get_prim_world_pose(stage, finger_right_prim_path, usd, usd_geom)
+    left_pos, left_quat = _get_prim_world_pose(stage, finger_left_prim_path, usd, usd_geom)
+    right_pos, right_quat = _get_prim_world_pose(stage, finger_right_prim_path, usd, usd_geom)
     if not (
         np.all(np.isfinite(hand_pos[:3]))
         and np.all(np.isfinite(hand_quat[:4]))
@@ -2383,7 +2393,12 @@ def _compute_tip_mid_offset_in_hand(
         and np.all(np.isfinite(right_pos[:3]))
     ):
         return None
-    tip_mid = 0.5 * (left_pos[:3] + right_pos[:3])
+    # Extend finger-base positions to fingertip along each finger's local z.
+    # MagicSim uses 0.046 m; URDF panda_leftfingertip joint is 0.045 m.
+    _FINGERTIP_EXTENSION = 0.046
+    left_tip = left_pos[:3] + _quat_to_rot_wxyz(left_quat)[:, 2] * _FINGERTIP_EXTENSION
+    right_tip = right_pos[:3] + _quat_to_rot_wxyz(right_quat)[:, 2] * _FINGERTIP_EXTENSION
+    tip_mid = 0.5 * (left_tip + right_tip)
     offset_world = (tip_mid - hand_pos[:3]).astype(np.float32)
     rot_hand = _quat_to_rot_wxyz(hand_quat)
     offset_hand = rot_hand.T @ offset_world
@@ -3182,10 +3197,14 @@ def _compute_grasp_metrics(
 
     tip_mid_metrics: dict[str, float] = {}
     if finger_left_prim_path and finger_right_prim_path:
-        left_pos, _ = _get_prim_world_pose(stage, finger_left_prim_path, usd, usd_geom)
-        right_pos, _ = _get_prim_world_pose(stage, finger_right_prim_path, usd, usd_geom)
+        left_pos, left_quat = _get_prim_world_pose(stage, finger_left_prim_path, usd, usd_geom)
+        right_pos, right_quat = _get_prim_world_pose(stage, finger_right_prim_path, usd, usd_geom)
         if np.all(np.isfinite(left_pos[:3])) and np.all(np.isfinite(right_pos[:3])):
-            tip_mid = 0.5 * (left_pos[:3] + right_pos[:3])
+            # Extend finger-base to fingertip (same 4.6cm as _compute_tip_mid_offset_in_hand)
+            _FT_EXT = 0.046
+            left_tip = left_pos[:3] + _quat_to_rot_wxyz(left_quat)[:, 2] * _FT_EXT
+            right_tip = right_pos[:3] + _quat_to_rot_wxyz(right_quat)[:, 2] * _FT_EXT
+            tip_mid = 0.5 * (left_tip + right_tip)
             tip_delta = obj_pos - tip_mid
             target_tip_mid_pos = target_pos
             if (

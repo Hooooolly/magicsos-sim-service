@@ -173,6 +173,13 @@ LEGACY_COLLECT_OUTPUT_DIRS = {
     "/data/collections/latest",
     "/data/embodied/datasets/sim_collect_latest",
 }
+_SCENE_AUTO_LIFT_RAW = os.environ.get("SIM_SCENE_AUTO_LIFT", "0").strip().lower()
+SCENE_AUTO_LIFT_ENABLED = _SCENE_AUTO_LIFT_RAW in {"1", "true", "yes", "on"}
+LOG.info(
+    "Scene postprocess auto-lift after code_execute: %s (SIM_SCENE_AUTO_LIFT=%r)",
+    "enabled" if SCENE_AUTO_LIFT_ENABLED else "disabled",
+    _SCENE_AUTO_LIFT_RAW,
+)
 
 # ── Inject Kit args for WebRTC + Kit API ports BEFORE any Isaac imports ──
 sys.argv.append(f"--kit_args=--/app/livestream/port={WEBRTC_PORT}")
@@ -1579,15 +1586,16 @@ def _process_commands():
                         pass  # operation succeeded despite warning
                     else:
                         raise
-                # Keep objects visible on table: if a newly placed object intersects table top,
-                # lift it slightly above the surface.
-                try:
-                    stage_now = _get_stage()
-                    lifted = _lift_objects_above_table_if_needed(stage_now) if stage_now else []
-                    if lifted:
-                        print(f"[scene] auto-lifted objects for table clearance: {lifted}")
-                except Exception as _lift_exc:
-                    print(f"[scene] WARNING: auto-lift failed: {_lift_exc}")
+                # Optional postprocess: auto-lift objects above table if requested.
+                # Default OFF to avoid visible "spawn then jump" behavior in Scene Chat.
+                if SCENE_AUTO_LIFT_ENABLED:
+                    try:
+                        stage_now = _get_stage()
+                        lifted = _lift_objects_above_table_if_needed(stage_now) if stage_now else []
+                        if lifted:
+                            print(f"[scene] auto-lifted objects for table clearance: {lifted}")
+                    except Exception as _lift_exc:
+                        print(f"[scene] WARNING: auto-lift failed: {_lift_exc}")
                 # Clear selection to hide gizmo overlay in WebRTC stream
                 try:
                     omni.usd.get_context().get_selection().clear_selected_prim_paths()
