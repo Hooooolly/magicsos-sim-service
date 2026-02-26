@@ -2598,6 +2598,7 @@ def _extract_world_config(
     robot_prim_path: str,
     table_prim_path: str,
     object_prim_path: str | None,
+    include_object: bool = True,
 ) -> Any:
     """Build Curobo WorldConfig from current scene obstacles.
 
@@ -2608,7 +2609,7 @@ def _extract_world_config(
     from curobo.geom.types import WorldConfig
 
     only_paths: list[str] = [table_prim_path]
-    if object_prim_path:
+    if object_prim_path and include_object:
         only_paths.append(object_prim_path)
     try:
         return (
@@ -2704,6 +2705,7 @@ def _update_curobo_world(
     robot_prim_path: str,
     table_prim_path: str,
     object_prim_path: str | None,
+    include_object: bool = True,
 ) -> None:
     """Refresh collision world from the current USD stage."""
     world_cfg = _extract_world_config(
@@ -2711,6 +2713,7 @@ def _update_curobo_world(
         robot_prim_path,
         table_prim_path,
         object_prim_path,
+        include_object=include_object,
     )
     curobo_state["motion_gen"].world_coll_checker.load_collision_model(
         world_cfg, env_idx=0,
@@ -2796,17 +2799,23 @@ def _execute_curobo_trajectory(
     record_fn: Any,
     timeout_fn: Any,
     stop_event: Any = None,
-) -> None:
+    reach_check_fn: Any = None,
+    early_halt_after: int = 4,
+) -> bool:
     """Step through a Curobo-planned ``[T, 7]`` trajectory one tick at a time.
 
     Uses a wider rate-limit (0.08 rad/step) than the default IK path because
     the Curobo trajectory is already smooth (``interpolation_dt=0.03``).
+
+    When *reach_check_fn* is provided it is called after each step (once past
+    *early_halt_after* steps). It must return ``True`` when the reach gate is
+    satisfied. The function returns ``True`` if reach was detected early.
     """
     for i in range(trajectory.shape[0]):
         if timeout_fn():
-            return
+            return False
         if stop_event is not None and stop_event.is_set():
-            return
+            return False
         arm = np.clip(trajectory[i], FRANKA_ARM_LOWER, FRANKA_ARM_UPPER)
         arm_cmd, gr_cmd = _step_toward_joint_targets(
             franka, arm, gripper_target, max_arm_step=0.08,
@@ -2814,6 +2823,15 @@ def _execute_curobo_trajectory(
         _set_joint_targets(franka, arm_cmd, gr_cmd, physics_control=True)
         world.step(render=True)
         record_fn(arm_target=arm, gripper_target=gripper_target)
+        if reach_check_fn is not None and i >= early_halt_after:
+            if reach_check_fn():
+                LOG.info(
+                    "Curobo trajectory early halt at step %d/%d (reach gate satisfied)",
+                    i + 1,
+                    trajectory.shape[0],
+                )
+                return True
+    return False
 
 
 def _make_pick_place_waypoints_ik(
@@ -3901,6 +3919,7 @@ def _run_pick_place_episode(
                     _update_curobo_world(
                         curobo_state, stage, robot_prim_path,
                         table_prim_path, object_prim_path,
+                        include_object=False,
                     )
                 except Exception as exc:
                     LOG.warning("Curobo world update failed: %s", exc)
@@ -3929,14 +3948,45 @@ def _run_pick_place_episode(
                         "collect: attempt %d Curobo trajectory %d steps",
                         attempt, curobo_traj.shape[0],
                     )
-                    _execute_curobo_trajectory(
+                    def _curobo_reach_check() -> bool:
+                        m = _compute_grasp_metrics(
+                            franka=franka,
+                            stage=stage,
+                            eef_prim_path=eef_prim_path,
+                            get_prim_at_path=get_prim_at_path,
+                            usd=usd,
+                            usd_geom=usd_geom,
+                            object_prim_path=object_prim_path,
+                            table_top_z=table_top_z,
+                            object_height=float(z_targets["object_height"]),
+                            finger_left_prim_path=finger_left_prim_path,
+                            finger_right_prim_path=finger_right_prim_path,
+                            current_target=current_grasp_target,
+                            tip_mid_offset_in_hand=annotation_tip_mid_offset_hand,
+                        )
+                        return _verify_reach_before_close(m)
+
+                    curobo_early_reach_halt = _execute_curobo_trajectory(
                         franka, world, curobo_traj, GRIPPER_OPEN,
                         record_fn=_record_frame,
                         timeout_fn=_timeout_triggered,
                         stop_event=stop_event,
+                        reach_check_fn=_curobo_reach_check,
                     )
-                    # Execute remaining DOWN_PICK -> CLOSE via rate-limited stepping
-                    if dp_idx < close_idx:
+                    if stopped:
+                        break
+                    # If reach gate was satisfied mid-trajectory, preserve that pose:
+                    # skip the synthetic DOWN_PICK -> CLOSE tail to avoid over-driving
+                    # toward the original DOWN_PICK waypoint before close hold.
+                    if curobo_early_reach_halt:
+                        LOG.info(
+                            "collect: attempt %d Curobo early-close active; "
+                            "skip DOWN_PICK tail and close from halted pose",
+                            attempt,
+                        )
+                    # Otherwise, execute remaining DOWN_PICK -> CLOSE via
+                    # existing rate-limited stepping.
+                    elif dp_idx < close_idx:
                         tail = list(zip(
                             waypoints[dp_idx:close_idx],
                             waypoints[dp_idx + 1 : close_idx + 1],
@@ -3978,6 +4028,8 @@ def _run_pick_place_episode(
         # or max steps reached.  Handles large IK jumps that exceed the
         # rate-limited step budget of the segment phase.
         close_arm_pre = waypoints[close_idx][1]
+        if _pick_phase_handled:
+            close_arm_pre = _to_numpy(franka.get_joint_positions())[:7].astype(np.float32)
         for settle_step in range(SETTLE_MAX_STEPS):
             if _timeout_triggered():
                 break
@@ -4038,6 +4090,8 @@ def _run_pick_place_episode(
 
         if CLOSE_HOLD_STEPS > 0:
             close_arm = waypoints[close_idx][1]
+            if _pick_phase_handled:
+                close_arm = _to_numpy(franka.get_joint_positions())[:7].astype(np.float32)
             for _ in range(CLOSE_HOLD_STEPS):
                 if _timeout_triggered():
                     break
