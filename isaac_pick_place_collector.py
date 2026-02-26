@@ -104,9 +104,7 @@ IK_WAYPOINT_NOISE_RAD = float(np.clip(IK_WAYPOINT_NOISE_RAD, 0.0, 0.03))
 _EARLY_HALT_RAW = str(os.environ.get("COLLECT_ENABLE_EARLY_REACH_HALT", "1")).strip().lower()
 ENABLE_EARLY_REACH_HALT = _EARLY_HALT_RAW not in {"0", "false", "no", "off"}
 
-_PLANNER_BACKEND_RAW = os.environ.get("COLLECT_PLANNER_BACKEND", "curobo").strip().lower()
-PLANNER_BACKEND = _PLANNER_BACKEND_RAW if _PLANNER_BACKEND_RAW in {"ik", "curobo"} else "ik"
-LOG.info("collect: PLANNER_BACKEND=%s (raw=%r)", PLANNER_BACKEND, _PLANNER_BACKEND_RAW)
+LOG.info("collect: planner backend = curobo (hardcoded, IK path removed)")
 _VERBOSE_DEBUG_RAW = str(os.environ.get("COLLECT_VERBOSE_DEBUG", "1")).strip().lower()
 COLLECT_VERBOSE_DEBUG = _VERBOSE_DEBUG_RAW not in {"0", "false", "no", "off"}
 LOG.info("collect: COLLECT_VERBOSE_DEBUG=%s (raw=%r)", COLLECT_VERBOSE_DEBUG, _VERBOSE_DEBUG_RAW)
@@ -3396,7 +3394,7 @@ def _run_pick_place_episode(
             "reach_thresh(eef=%.3f,eef_xy=%.3f,tip=%.3f,tip_xy=%.3f,tip_dz=%.3f) "
             "close_thresh(width=%.4f,eef=%.3f,eef_xy=%.3f)",
             episode_index + 1,
-            PLANNER_BACKEND,
+            "curobo",
             int(steps_per_segment),
             REACH_BEFORE_CLOSE_MAX_OBJECT_EEF_DISTANCE,
             REACH_BEFORE_CLOSE_MAX_OBJECT_EEF_XY_DISTANCE,
@@ -3422,6 +3420,7 @@ def _run_pick_place_episode(
         wrist_cam_path=getattr(cameras.get("cam_wrist"), "prim_path", None),
     )
     current_grasp_target: dict[str, Any] | None = None
+    annotation_tip_mid_offset_hand: np.ndarray | None = None
 
     def _current_arm_target() -> np.ndarray:
         joints = _to_numpy(franka.get_joint_positions())
@@ -3442,14 +3441,47 @@ def _run_pick_place_episode(
             obj_pos_dbg, _ = _get_object_tracking_pose(stage, object_prim_path, usd, usd_geom)
             eef_pos_dbg, _ = _get_eef_pose(stage, eef_prim_path, get_prim_at_path, usd, usd_geom)
             target_pos_dbg = None
+            target_quat_dbg = None
             if current_grasp_target is not None:
                 target_pos_dbg = _to_numpy(current_grasp_target.get("target_pos"), dtype=np.float32).reshape(-1)
+                target_quat_dbg = _to_numpy(current_grasp_target.get("target_quat"), dtype=np.float32).reshape(-1)
                 if target_pos_dbg.size < 3 or not np.all(np.isfinite(target_pos_dbg[:3])):
                     target_pos_dbg = None
+                if target_quat_dbg.size < 4 or not np.all(np.isfinite(target_quat_dbg[:4])):
+                    target_quat_dbg = None
+
+            tip_mid_pos_dbg = None
+            target_tip_mid_pos_dbg = None
+            if finger_left_prim_path and finger_right_prim_path:
+                left_pos_dbg, _ = _get_prim_world_pose(stage, finger_left_prim_path, usd, usd_geom)
+                right_pos_dbg, _ = _get_prim_world_pose(stage, finger_right_prim_path, usd, usd_geom)
+                if np.all(np.isfinite(left_pos_dbg[:3])) and np.all(np.isfinite(right_pos_dbg[:3])):
+                    tip_mid_pos_dbg = (0.5 * (left_pos_dbg[:3] + right_pos_dbg[:3])).astype(np.float32)
+                    if target_pos_dbg is not None:
+                        target_tip_mid_pos_dbg = target_pos_dbg[:3].astype(np.float32, copy=True)
+                        if (
+                            current_grasp_target
+                            and current_grasp_target.get("source") == "annotation"
+                            and bool(current_grasp_target.get("annotation_tip_mid_to_hand_converted", False))
+                            and annotation_tip_mid_offset_hand is not None
+                            and target_quat_dbg is not None
+                        ):
+                            try:
+                                off = _to_numpy(annotation_tip_mid_offset_hand, dtype=np.float32).reshape(-1)
+                                if off.size >= 3 and np.all(np.isfinite(off[:3])):
+                                    tgt_q = _normalize_quat_wxyz(target_quat_dbg[:4])
+                                    target_tip_mid_pos_dbg = (
+                                        target_pos_dbg[:3].astype(np.float32)
+                                        + (_quat_to_rot_wxyz(tgt_q) @ off[:3]).astype(np.float32)
+                                    ).astype(np.float32, copy=False)
+                            except Exception:
+                                target_tip_mid_pos_dbg = target_pos_dbg[:3].astype(np.float32, copy=True)
+
             if target_pos_dbg is None:
                 LOG.info(
                     "collect-step: episode=%d attempt=%d frame=%d "
-                    "object_world=(%.4f, %.4f, %.4f) eef_world=(%.4f, %.4f, %.4f) target_world=(none)",
+                    "object_world=(%.4f, %.4f, %.4f) eef_world=(%.4f, %.4f, %.4f) "
+                    "tip_mid_world=(%s) target_world=(none)",
                     episode_index + 1,
                     int(attempt_used),
                     int(frame_id),
@@ -3459,12 +3491,49 @@ def _run_pick_place_episode(
                     float(eef_pos_dbg[0]),
                     float(eef_pos_dbg[1]),
                     float(eef_pos_dbg[2]),
+                    (
+                        "none"
+                        if tip_mid_pos_dbg is None
+                        else f"{float(tip_mid_pos_dbg[0]):.4f},{float(tip_mid_pos_dbg[1]):.4f},{float(tip_mid_pos_dbg[2]):.4f}"
+                    ),
                 )
                 return
+            obj_to_target = target_pos_dbg[:3].astype(np.float32) - obj_pos_dbg[:3].astype(np.float32)
+            eef_to_target = target_pos_dbg[:3].astype(np.float32) - eef_pos_dbg[:3].astype(np.float32)
+            hand_to_target_norm = float(np.linalg.norm(eef_to_target))
+            obj_to_target_norm = float(np.linalg.norm(obj_to_target))
+            eef_to_obj_norm = float(np.linalg.norm(obj_pos_dbg[:3].astype(np.float32) - eef_pos_dbg[:3].astype(np.float32)))
+
+            tip_mid_world_str = "none"
+            target_tip_mid_world_str = "none"
+            tip_mid_to_obj_norm_str = "nan"
+            tip_mid_vec_str = "nan,nan,nan"
+            tip_mid_norm_str = "nan"
+            if tip_mid_pos_dbg is not None:
+                tip_mid_world_str = (
+                    f"{float(tip_mid_pos_dbg[0]):.4f},{float(tip_mid_pos_dbg[1]):.4f},{float(tip_mid_pos_dbg[2]):.4f}"
+                )
+                tip_to_obj = obj_pos_dbg[:3].astype(np.float32) - tip_mid_pos_dbg[:3].astype(np.float32)
+                tip_mid_to_obj_norm_str = f"{float(np.linalg.norm(tip_to_obj)):.4f}"
+            if target_tip_mid_pos_dbg is not None:
+                target_tip_mid_world_str = (
+                    f"{float(target_tip_mid_pos_dbg[0]):.4f},{float(target_tip_mid_pos_dbg[1]):.4f},{float(target_tip_mid_pos_dbg[2]):.4f}"
+                )
+            if tip_mid_pos_dbg is not None and target_tip_mid_pos_dbg is not None:
+                tip_to_target = target_tip_mid_pos_dbg[:3].astype(np.float32) - tip_mid_pos_dbg[:3].astype(np.float32)
+                tip_mid_vec_str = (
+                    f"{float(tip_to_target[0]):.4f},{float(tip_to_target[1]):.4f},{float(tip_to_target[2]):.4f}"
+                )
+                tip_mid_norm_str = f"{float(np.linalg.norm(tip_to_target)):.4f}"
             LOG.info(
                 "collect-step: episode=%d attempt=%d frame=%d "
                 "object_world=(%.4f, %.4f, %.4f) eef_world=(%.4f, %.4f, %.4f) "
-                "target_world=(%.4f, %.4f, %.4f)",
+                "target_world=(%.4f, %.4f, %.4f) "
+                "obj_to_target=(%.4f, %.4f, %.4f;norm=%.4f) "
+                "eef_to_target=(%.4f, %.4f, %.4f;norm=%.4f) "
+                "eef_to_obj_norm=%.4f "
+                "tip_mid_world=(%s) target_tip_mid_world=(%s) "
+                "tip_mid_to_obj_norm=%s tip_mid_to_target=(%s;norm=%s)",
                 episode_index + 1,
                 int(attempt_used),
                 int(frame_id),
@@ -3477,6 +3546,20 @@ def _run_pick_place_episode(
                 float(target_pos_dbg[0]),
                 float(target_pos_dbg[1]),
                 float(target_pos_dbg[2]),
+                float(obj_to_target[0]),
+                float(obj_to_target[1]),
+                float(obj_to_target[2]),
+                obj_to_target_norm,
+                float(eef_to_target[0]),
+                float(eef_to_target[1]),
+                float(eef_to_target[2]),
+                hand_to_target_norm,
+                eef_to_obj_norm,
+                tip_mid_world_str,
+                target_tip_mid_world_str,
+                tip_mid_to_obj_norm_str,
+                tip_mid_vec_str,
+                tip_mid_norm_str,
             )
         except Exception as exc:
             LOG.debug("collect-step: episode=%d frame=%d logging failed: %s", episode_index + 1, frame_id, exc)
@@ -3678,6 +3761,12 @@ def _run_pick_place_episode(
         usd=usd,
         usd_geom=usd_geom,
     )
+    LOG.info(
+        "collect: kinematics frame summary eef_prim=%s finger_left=%s finger_right=%s",
+        eef_prim_path,
+        finger_left_prim_path,
+        finger_right_prim_path,
+    )
     if ANNOTATION_POSE_IS_TIP_MID_FRAME:
         if annotation_tip_mid_offset_hand is not None:
             LOG.info(
@@ -3877,15 +3966,12 @@ def _run_pick_place_episode(
             _record_frame(arm_target=cur_arm, gripper_target=GRIPPER_OPEN)
 
     # -- Curobo backend: lazy init (once per episode) -----------------------
-    curobo_state = None
-    if PLANNER_BACKEND == "curobo" and robot_prim_path and table_prim_path:
-        try:
-            curobo_state = _init_curobo_motion_gen(
-                stage, robot_prim_path, table_prim_path, object_prim_path,
-            )
-            LOG.info("collect: Curobo backend active")
-        except Exception as exc:
-            LOG.error("Curobo init failed, falling back to IK: %s", exc)
+    if not robot_prim_path or not table_prim_path:
+        raise RuntimeError("Curobo requires robot_prim_path and table_prim_path")
+    curobo_state = _init_curobo_motion_gen(
+        stage, robot_prim_path, table_prim_path, object_prim_path,
+    )
+    LOG.info("collect: Curobo backend active")
 
     def _log_attempt_world_debug(attempt: int, tag: str, target: dict[str, Any] | None) -> None:
         if not COLLECT_VERBOSE_DEBUG:
@@ -3894,10 +3980,14 @@ def _run_pick_place_episode(
             obj_pos_dbg, _ = _get_object_tracking_pose(stage, object_prim_path, usd, usd_geom)
             eef_pos_dbg, _ = _get_eef_pose(stage, eef_prim_path, get_prim_at_path, usd, usd_geom)
             target_pos_dbg = None
+            target_quat_dbg = None
             if target:
                 target_pos_dbg = _to_numpy(target.get("target_pos"), dtype=np.float32).reshape(-1)
+                target_quat_dbg = _to_numpy(target.get("target_quat"), dtype=np.float32).reshape(-1)
                 if target_pos_dbg.size < 3 or not np.all(np.isfinite(target_pos_dbg[:3])):
                     target_pos_dbg = None
+                if target_quat_dbg.size < 4 or not np.all(np.isfinite(target_quat_dbg[:4])):
+                    target_quat_dbg = None
             if target_pos_dbg is None:
                 LOG.info(
                     "collect-debug: attempt %d %s object_world=(%.4f, %.4f, %.4f) "
@@ -3912,14 +4002,55 @@ def _run_pick_place_episode(
                     float(eef_pos_dbg[2]),
                 )
                 return
+            tip_mid_pos_dbg = None
+            target_tip_mid_pos_dbg = None
+            if finger_left_prim_path and finger_right_prim_path:
+                left_pos_dbg, _ = _get_prim_world_pose(stage, finger_left_prim_path, usd, usd_geom)
+                right_pos_dbg, _ = _get_prim_world_pose(stage, finger_right_prim_path, usd, usd_geom)
+                if np.all(np.isfinite(left_pos_dbg[:3])) and np.all(np.isfinite(right_pos_dbg[:3])):
+                    tip_mid_pos_dbg = (0.5 * (left_pos_dbg[:3] + right_pos_dbg[:3])).astype(np.float32)
+                    target_tip_mid_pos_dbg = target_pos_dbg[:3].astype(np.float32, copy=True)
+                    if (
+                        target
+                        and target.get("source") == "annotation"
+                        and bool(target.get("annotation_tip_mid_to_hand_converted", False))
+                        and annotation_tip_mid_offset_hand is not None
+                        and target_quat_dbg is not None
+                    ):
+                        try:
+                            off = _to_numpy(annotation_tip_mid_offset_hand, dtype=np.float32).reshape(-1)
+                            if off.size >= 3 and np.all(np.isfinite(off[:3])):
+                                tgt_q = _normalize_quat_wxyz(target_quat_dbg[:4])
+                                target_tip_mid_pos_dbg = (
+                                    target_pos_dbg[:3].astype(np.float32)
+                                    + (_quat_to_rot_wxyz(tgt_q) @ off[:3]).astype(np.float32)
+                                ).astype(np.float32, copy=False)
+                        except Exception:
+                            target_tip_mid_pos_dbg = target_pos_dbg[:3].astype(np.float32, copy=True)
             obj_to_tgt = target_pos_dbg[:3] - obj_pos_dbg[:3]
             eef_to_tgt = target_pos_dbg[:3] - eef_pos_dbg[:3]
             eef_to_obj = obj_pos_dbg[:3] - eef_pos_dbg[:3]
+            tip_mid_world_str = "none"
+            target_tip_mid_world_str = "none"
+            tip_mid_to_target_norm_str = "nan"
+            if tip_mid_pos_dbg is not None:
+                tip_mid_world_str = (
+                    f"{float(tip_mid_pos_dbg[0]):.4f},{float(tip_mid_pos_dbg[1]):.4f},{float(tip_mid_pos_dbg[2]):.4f}"
+                )
+            if target_tip_mid_pos_dbg is not None:
+                target_tip_mid_world_str = (
+                    f"{float(target_tip_mid_pos_dbg[0]):.4f},{float(target_tip_mid_pos_dbg[1]):.4f},{float(target_tip_mid_pos_dbg[2]):.4f}"
+                )
+            if tip_mid_pos_dbg is not None and target_tip_mid_pos_dbg is not None:
+                tip_mid_to_target_norm_str = (
+                    f"{float(np.linalg.norm(target_tip_mid_pos_dbg[:3] - tip_mid_pos_dbg[:3])):.4f}"
+                )
             LOG.info(
                 "collect-debug: attempt %d %s object_world=(%.4f, %.4f, %.4f) "
                 "eef_world=(%.4f, %.4f, %.4f) target_world=(%.4f, %.4f, %.4f) "
                 "obj_to_target=(%.4f, %.4f, %.4f) eef_to_target=(%.4f, %.4f, %.4f) "
-                "eef_to_obj=(%.4f, %.4f, %.4f)",
+                "eef_to_obj=(%.4f, %.4f, %.4f) hand_to_target_norm=%.4f "
+                "tip_mid_world=(%s) target_tip_mid_world=(%s) tip_mid_to_target_norm=%s",
                 attempt,
                 tag,
                 float(obj_pos_dbg[0]),
@@ -3940,6 +4071,10 @@ def _run_pick_place_episode(
                 float(eef_to_obj[0]),
                 float(eef_to_obj[1]),
                 float(eef_to_obj[2]),
+                float(np.linalg.norm(eef_to_tgt)),
+                tip_mid_world_str,
+                target_tip_mid_world_str,
+                tip_mid_to_target_norm_str,
             )
         except Exception as exc:
             LOG.debug("collect-debug: attempt %d %s logging failed: %s", attempt, tag, exc)
@@ -4068,7 +4203,7 @@ def _run_pick_place_episode(
         LOG.info(
             "collect: attempt %d planner=%s source=%s pick=(%.4f, %.4f) place_hint=%s",
             attempt,
-            PLANNER_BACKEND,
+            "curobo",
             pick_source,
             pick_x,
             pick_y,
@@ -4177,9 +4312,8 @@ def _run_pick_place_episode(
         lift_transitions = list(zip(waypoints[close_idx:lift_idx], waypoints[close_idx + 1 : lift_idx + 1]))
         place_transitions = list(zip(waypoints[lift_idx:-1], waypoints[lift_idx + 1 :]))
 
-        # ---- Curobo path: full approach via _curobo_full_approach ---
-        _pick_phase_handled = False
-        if curobo_state is not None:
+        # ---- Curobo full approach ---
+        if True:
             down_xyz = np.array(
                 [last_pick_pos[0], last_pick_pos[1],
                  float(z_targets["pick_grasp_z"])],
@@ -4231,25 +4365,13 @@ def _run_pick_place_episode(
             if curobo_ok:
                 LOG.info("collect: attempt %d Curobo full_approach reached target", attempt)
             else:
-                LOG.warning("collect: attempt %d Curobo full_approach failed; IK fallback", attempt)
-            _pick_phase_handled = curobo_ok
-
-        # ---- IK path (default or Curobo not applicable) ----
-        if not _pick_phase_handled:
-            _execute_transitions(
-                pick_transitions,
-                live_target_z_by_waypoint=None,
-                enable_close_hold=False,
-            )
+                LOG.warning("collect: attempt %d Curobo full_approach failed; skipping attempt", attempt)
+                continue
         if stopped:
             break
 
-        # Convergence settle: step toward close pose until joints converge
-        # or max steps reached.  Handles large IK jumps that exceed the
-        # rate-limited step budget of the segment phase.
-        close_arm_pre = waypoints[close_idx][1]
-        if _pick_phase_handled:
-            close_arm_pre = _to_numpy(franka.get_joint_positions())[:7].astype(np.float32)
+        # Convergence settle: hold current pose open-gripper for a few steps.
+        close_arm_pre = _to_numpy(franka.get_joint_positions())[:7].astype(np.float32)
         for settle_step in range(SETTLE_MAX_STEPS):
             if _timeout_triggered():
                 break
@@ -4316,9 +4438,7 @@ def _run_pick_place_episode(
             continue
 
         if CLOSE_HOLD_STEPS > 0:
-            close_arm = waypoints[close_idx][1]
-            if _pick_phase_handled:
-                close_arm = _to_numpy(franka.get_joint_positions())[:7].astype(np.float32)
+            close_arm = _to_numpy(franka.get_joint_positions())[:7].astype(np.float32)
             for _ in range(CLOSE_HOLD_STEPS):
                 if _timeout_triggered():
                     break
