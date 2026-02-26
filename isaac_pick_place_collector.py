@@ -877,16 +877,12 @@ def _infer_annotation_position_scale(
 
         # Only correct large mismatches (MagicSim-style conservative threshold).
         if median_norm > mesh_radius * 3.0 or median_norm < mesh_radius / 3.0:
-            scale = float(np.clip(mesh_radius / median_norm, 0.05, 20.0))
-            # For small objects (< 3cm radius) inferred scale is unreliable -
-            # annotation authors rarely scale sub-3cm objects differently.
-            if mesh_radius < 0.03 and abs(scale - 1.0) > 0.3:
-                LOG.debug(
-                    "collect: annotation scale %.4f rejected for small object "
-                    "(mesh_radius=%.4f), using 1.0",
-                    scale, mesh_radius,
-                )
-                return 1.0
+            scale = float(np.clip(mesh_radius / median_norm, 0.005, 200.0))
+            LOG.info(
+                "collect: annotation scale inferred %.5f "
+                "(mesh_radius=%.4f, median_norm=%.4f, preset=%.4f)",
+                scale, mesh_radius, median_norm, preset,
+            )
             return scale
         return 1.0
     except Exception as exc:
@@ -3456,13 +3452,10 @@ def _run_pick_place_episode(
                 preset_pos_scale=hint_scale,
             )
             annotation_local_pos_scale = float(hint_scale * infer_scale)
-            if annotation_local_pos_scale < 0.1 or annotation_local_pos_scale > 10.0:
-                LOG.warning(
-                    "collect: annotation scale %.5f out of safe range "
-                    "(hint=%.4f infer=%.4f), clamping to 1.0",
-                    annotation_local_pos_scale, hint_scale, infer_scale,
-                )
-                annotation_local_pos_scale = 1.0
+            LOG.info(
+                "collect: annotation_local_pos_scale=%.5f (hint=%.4f * infer=%.4f)",
+                annotation_local_pos_scale, hint_scale, infer_scale,
+            )
             annotation_candidates, sanitize_report = _sanitize_annotation_candidates(
                 stage=stage,
                 object_prim_path=object_prim_path,
