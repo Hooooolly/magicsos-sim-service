@@ -2845,6 +2845,120 @@ def _execute_curobo_trajectory(
     return False
 
 
+def _curobo_full_approach(
+    curobo_state: dict,
+    franka: Any,
+    world: Any,
+    stage: Any,
+    robot_prim_path: str,
+    table_prim_path: str,
+    object_prim_path: str | None,
+    target_pos_world: np.ndarray,
+    target_quat_world: np.ndarray,
+    record_fn: Any,
+    timeout_fn: Any,
+    stop_event: Any = None,
+    reach_check_fn: Any = None,
+    pre_grasp_offset: float = 0.12,
+    usd: Any = None,
+    usd_geom: Any = None,
+) -> bool:
+    """Plan and execute a full approach trajectory via Curobo (two segments).
+
+    Segment 1: current joints -> pre-grasp (target + offset along approach axis).
+       Uses full collision world (table + object) to plan collision-free path.
+    Segment 2: pre-grasp -> down-pick (grasp pose on the object).
+       Removes object from collision world so the gripper can reach into the object.
+
+    Returns True if the arm successfully reached the grasp pose.
+    """
+    # Compute pre-grasp position: offset above the target along the approach direction.
+    # For top-down grasps (default), this is simply Z + offset.
+    rot = _quat_to_rot_wxyz(target_quat_world)
+    approach_dir = rot[:, 2].astype(np.float32)  # Z column = approach direction
+    norm = float(np.linalg.norm(approach_dir))
+    if norm < 1e-6:
+        approach_dir = np.array([0.0, 0.0, 1.0], dtype=np.float32)
+    else:
+        approach_dir = approach_dir / norm
+
+    pre_grasp_pos = target_pos_world[:3].astype(np.float32).copy()
+    pre_grasp_pos += pre_grasp_offset * approach_dir
+
+    robot_base_pos, robot_base_quat = _get_prim_world_pose(
+        stage, robot_prim_path, usd, usd_geom,
+    )
+
+    # --- Segment 1: current -> pre-grasp (WITH object in collision world) ---
+    try:
+        _update_curobo_world(
+            curobo_state, stage, robot_prim_path,
+            table_prim_path, object_prim_path,
+            include_object=True,
+        )
+    except Exception as exc:
+        LOG.warning("Curobo full_approach: world update (seg1) failed: %s", exc)
+
+    cur_q = _to_numpy(franka.get_joint_positions())[:7]
+    traj1 = _plan_curobo_segment(
+        curobo_state, cur_q, pre_grasp_pos, target_quat_world,
+        robot_base_pos, robot_base_quat,
+    )
+    if traj1 is None:
+        LOG.warning("Curobo full_approach: segment 1 (-> pre-grasp) plan failed")
+        return False
+
+    LOG.info("Curobo full_approach: segment 1 planned (%d steps)", traj1.shape[0])
+    _execute_curobo_trajectory(
+        franka, world, traj1, GRIPPER_OPEN,
+        record_fn=record_fn,
+        timeout_fn=timeout_fn,
+        stop_event=stop_event,
+    )
+    if timeout_fn() or (stop_event is not None and stop_event.is_set()):
+        return False
+
+    # Settle at pre-grasp (15 steps)
+    cur_q_settle = _to_numpy(franka.get_joint_positions())[:7].astype(np.float32)
+    for _ in range(15):
+        if timeout_fn():
+            break
+        arm_cmd, gr_cmd = _step_toward_joint_targets(franka, cur_q_settle, GRIPPER_OPEN)
+        _set_joint_targets(franka, arm_cmd, gr_cmd, physics_control=True)
+        world.step(render=True)
+        record_fn(arm_target=cur_q_settle, gripper_target=GRIPPER_OPEN)
+
+    # --- Segment 2: pre-grasp -> down-pick (WITHOUT object in collision world) ---
+    try:
+        _update_curobo_world(
+            curobo_state, stage, robot_prim_path,
+            table_prim_path, object_prim_path,
+            include_object=False,
+        )
+    except Exception as exc:
+        LOG.warning("Curobo full_approach: world update (seg2) failed: %s", exc)
+
+    cur_q = _to_numpy(franka.get_joint_positions())[:7]
+    traj2 = _plan_curobo_segment(
+        curobo_state, cur_q, target_pos_world, target_quat_world,
+        robot_base_pos, robot_base_quat,
+    )
+    if traj2 is None:
+        LOG.warning("Curobo full_approach: segment 2 (-> down-pick) plan failed")
+        return False
+
+    LOG.info("Curobo full_approach: segment 2 planned (%d steps)", traj2.shape[0])
+    reached = _execute_curobo_trajectory(
+        franka, world, traj2, GRIPPER_OPEN,
+        record_fn=record_fn,
+        timeout_fn=timeout_fn,
+        stop_event=stop_event,
+        reach_check_fn=reach_check_fn,
+        early_halt_after=4,
+    )
+    return reached
+
+
 def _make_pick_place_waypoints_ik(
     ik_solver: Any,
     pick_pos: tuple[float, float],
@@ -3371,7 +3485,10 @@ def _run_pick_place_episode(
                     object_prim_path,
                     sanitize_report,
                 )
-            allow_unsanitized_fallback = _read_bool_env("COLLECT_ALLOW_UNSANITIZED_ANNOTATION_FALLBACK", True)
+            allow_unsanitized_fallback = (
+                _read_bool_env("COLLECT_ALLOW_UNSANITIZED_ANNOTATION_FALLBACK", True)
+                and is_mug_target
+            )
             force_unsanitized_for_required_mug = bool(
                 require_mug_annotation and is_mug_target and loaded_annotation_candidates
             )
@@ -3388,6 +3505,13 @@ def _run_pick_place_episode(
                     annotation_path,
                     float(annotation_local_pos_scale),
                     fallback_reason,
+                )
+            elif not annotation_candidates and loaded_annotation_candidates and not is_mug_target:
+                LOG.info(
+                    "collect: sanitize dropped all %d candidates for non-mug object %s; "
+                    "proceeding without annotations (bbox/root fallback)",
+                    len(loaded_annotation_candidates),
+                    object_prim_path,
                 )
             if annotation_candidates:
                 LOG.info(
@@ -3902,135 +4026,62 @@ def _run_pick_place_episode(
         lift_transitions = list(zip(waypoints[close_idx:lift_idx], waypoints[close_idx + 1 : lift_idx + 1]))
         place_transitions = list(zip(waypoints[lift_idx:-1], waypoints[lift_idx + 1 :]))
 
-        # ---- Curobo path: replace PRE_GRASP -> DOWN_PICK with Curobo trajectory ---
+        # ---- Curobo path: full approach via _curobo_full_approach ---
         _pick_phase_handled = False
-        if curobo_state is not None and "PRE_GRASP" in names and "DOWN_PICK" in names:
-            pg_idx = names.index("PRE_GRASP")
-            dp_idx = names.index("DOWN_PICK")
-            if 0 < pg_idx < dp_idx < close_idx:
-                # Phase A: HOME -> ... -> PRE_GRASP via existing rate-limited stepping
-                pre_transitions = list(zip(waypoints[:pg_idx], waypoints[1 : pg_idx + 1]))
-                _execute_transitions(
-                    pre_transitions,
-                    live_target_z_by_waypoint=None,
-                    enable_close_hold=False,
-                )
-                if stopped:
-                    break
+        if curobo_state is not None:
+            down_xyz = np.array(
+                [last_pick_pos[0], last_pick_pos[1],
+                 float(z_targets["pick_grasp_z"])],
+                dtype=np.float32,
+            )
+            down_quat = (
+                ik_target_orientation
+                if ik_target_orientation is not None
+                else TOP_DOWN_FALLBACK_QUAT.copy()
+            )
 
-                # Settle at PRE_GRASP (20 steps)
-                pregrasp_arm = waypoints[pg_idx][1]
-                for _settle in range(20):
-                    if _timeout_triggered():
-                        break
-                    arm_cmd, gr_cmd = _step_toward_joint_targets(
-                        franka, pregrasp_arm, GRIPPER_OPEN,
-                    )
-                    _set_joint_targets(franka, arm_cmd, gr_cmd, physics_control=True)
-                    world.step(render=True)
-                    _record_frame(arm_target=pregrasp_arm, gripper_target=GRIPPER_OPEN)
-                if stopped:
-                    break
-
-                # Phase B: PRE_GRASP -> DOWN_PICK via Curobo
-                try:
-                    _update_curobo_world(
-                        curobo_state, stage, robot_prim_path,
-                        table_prim_path, object_prim_path,
-                        include_object=False,
-                    )
-                except Exception as exc:
-                    LOG.warning("Curobo world update failed: %s", exc)
-
-                robot_base_pos, robot_base_quat = _get_prim_world_pose(
-                    stage, robot_prim_path, usd, usd_geom,
+            def _curobo_reach_check() -> bool:
+                m = _compute_grasp_metrics(
+                    franka=franka,
+                    stage=stage,
+                    eef_prim_path=eef_prim_path,
+                    get_prim_at_path=get_prim_at_path,
+                    usd=usd,
+                    usd_geom=usd_geom,
+                    object_prim_path=object_prim_path,
+                    table_top_z=table_top_z,
+                    object_height=float(z_targets["object_height"]),
+                    finger_left_prim_path=finger_left_prim_path,
+                    finger_right_prim_path=finger_right_prim_path,
+                    current_target=current_grasp_target,
+                    tip_mid_offset_in_hand=annotation_tip_mid_offset_hand,
                 )
-                cur_q = _to_numpy(franka.get_joint_positions())[:7]
-                down_xyz = np.array(
-                    [last_pick_pos[0], last_pick_pos[1],
-                     float(z_targets["pick_grasp_z"])],
-                    dtype=np.float32,
-                )
-                down_quat = (
-                    ik_target_orientation
-                    if ik_target_orientation is not None
-                    else TOP_DOWN_FALLBACK_QUAT.copy()
-                )
+                return _verify_reach_before_close(m)
 
-                curobo_traj = _plan_curobo_segment(
-                    curobo_state, cur_q, down_xyz, down_quat,
-                    robot_base_pos, robot_base_quat,
-                )
-                if curobo_traj is not None:
-                    LOG.info(
-                        "collect: attempt %d Curobo trajectory %d steps",
-                        attempt, curobo_traj.shape[0],
-                    )
-                    def _curobo_reach_check() -> bool:
-                        m = _compute_grasp_metrics(
-                            franka=franka,
-                            stage=stage,
-                            eef_prim_path=eef_prim_path,
-                            get_prim_at_path=get_prim_at_path,
-                            usd=usd,
-                            usd_geom=usd_geom,
-                            object_prim_path=object_prim_path,
-                            table_top_z=table_top_z,
-                            object_height=float(z_targets["object_height"]),
-                            finger_left_prim_path=finger_left_prim_path,
-                            finger_right_prim_path=finger_right_prim_path,
-                            current_target=current_grasp_target,
-                            tip_mid_offset_in_hand=annotation_tip_mid_offset_hand,
-                        )
-                        return _verify_reach_before_close(m)
-
-                    curobo_early_reach_halt = _execute_curobo_trajectory(
-                        franka, world, curobo_traj, GRIPPER_OPEN,
-                        record_fn=_record_frame,
-                        timeout_fn=_timeout_triggered,
-                        stop_event=stop_event,
-                        reach_check_fn=_curobo_reach_check,
-                    )
-                    if stopped:
-                        break
-                    # If reach gate was satisfied mid-trajectory, preserve that pose:
-                    # skip the synthetic DOWN_PICK -> CLOSE tail to avoid over-driving
-                    # toward the original DOWN_PICK waypoint before close hold.
-                    if curobo_early_reach_halt:
-                        LOG.info(
-                            "collect: attempt %d Curobo early-close active; "
-                            "skip DOWN_PICK tail and close from halted pose",
-                            attempt,
-                        )
-                    # Otherwise, execute remaining DOWN_PICK -> CLOSE via
-                    # existing rate-limited stepping.
-                    elif dp_idx < close_idx:
-                        tail = list(zip(
-                            waypoints[dp_idx:close_idx],
-                            waypoints[dp_idx + 1 : close_idx + 1],
-                        ))
-                        _execute_transitions(
-                            tail,
-                            live_target_z_by_waypoint=None,
-                            enable_close_hold=False,
-                        )
-                    _pick_phase_handled = True
-                else:
-                    LOG.warning(
-                        "collect: attempt %d Curobo plan failed; IK fallback",
-                        attempt,
-                    )
-                    # Fall back: execute remaining PRE_GRASP -> CLOSE via IK path
-                    fallback = list(zip(
-                        waypoints[pg_idx:close_idx],
-                        waypoints[pg_idx + 1 : close_idx + 1],
-                    ))
-                    _execute_transitions(
-                        fallback,
-                        live_target_z_by_waypoint=None,
-                        enable_close_hold=False,
-                    )
-                    _pick_phase_handled = True
+            curobo_ok = _curobo_full_approach(
+                curobo_state=curobo_state,
+                franka=franka,
+                world=world,
+                stage=stage,
+                robot_prim_path=robot_prim_path,
+                table_prim_path=table_prim_path,
+                object_prim_path=object_prim_path,
+                target_pos_world=down_xyz,
+                target_quat_world=down_quat,
+                record_fn=_record_frame,
+                timeout_fn=_timeout_triggered,
+                stop_event=stop_event,
+                reach_check_fn=_curobo_reach_check,
+                usd=usd,
+                usd_geom=usd_geom,
+            )
+            if stopped:
+                break
+            if curobo_ok:
+                LOG.info("collect: attempt %d Curobo full_approach reached target", attempt)
+            else:
+                LOG.warning("collect: attempt %d Curobo full_approach failed; IK fallback", attempt)
+            _pick_phase_handled = curobo_ok
 
         # ---- IK path (default or Curobo not applicable) ----
         if not _pick_phase_handled:
