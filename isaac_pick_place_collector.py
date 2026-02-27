@@ -2628,6 +2628,7 @@ def _extract_world_config(
     table_prim_path: str,
     object_prim_path: str | None,
     include_object: bool = True,
+    object_world_pos: np.ndarray | None = None,
 ) -> Any:
     """Build Curobo WorldConfig from ground-truth bounding boxes.
 
@@ -2642,14 +2643,18 @@ def _extract_world_config(
     robot_pos, robot_quat = _get_prim_world_pose(stage, robot_prim_path, usd_mod, usd_geom_mod)
     rot_inv = _quat_to_rot_wxyz(robot_quat).T
 
-    def _bbox_to_cuboid(prim_path: str, name: str) -> Cuboid | None:
+    def _bbox_to_cuboid(prim_path: str, name: str,
+                        pos_override: np.ndarray | None = None) -> Cuboid | None:
         bbox = _compute_prim_bbox(stage, prim_path, usd_geom_mod)
         if bbox is None:
             LOG.warning("Curobo WorldConfig: bbox failed for %s", prim_path)
             return None
         mn, mx = bbox
-        center_world = 0.5 * (mn + mx)
         dims = (mx - mn).astype(np.float32)
+        if pos_override is not None:
+            center_world = pos_override.astype(np.float32)
+        else:
+            center_world = 0.5 * (mn + mx)
         # Transform center to robot base frame
         center_robot = (rot_inv @ (center_world - robot_pos[:3])).astype(np.float32)
         # pose = [x, y, z, qw, qx, qy, qz]
@@ -2673,7 +2678,8 @@ def _extract_world_config(
         cuboids.append(table_cub)
 
     if object_prim_path and include_object:
-        obj_cub = _bbox_to_cuboid(object_prim_path, "pick_object")
+        obj_cub = _bbox_to_cuboid(object_prim_path, "pick_object",
+                                  pos_override=object_world_pos)
         if obj_cub is not None:
             cuboids.append(obj_cub)
 
@@ -2767,6 +2773,7 @@ def _update_curobo_world(
     table_prim_path: str,
     object_prim_path: str | None,
     include_object: bool = True,
+    object_world_pos: np.ndarray | None = None,
 ) -> None:
     """Refresh collision world from the current USD stage."""
     import pxr.UsdGeom as _usd_geom_upd
@@ -2776,6 +2783,7 @@ def _update_curobo_world(
         table_prim_path,
         object_prim_path,
         include_object=include_object,
+        object_world_pos=object_world_pos,
     )
     curobo_state["motion_gen"].world_coll_checker.load_collision_model(
         world_cfg, env_idx=0,
@@ -2927,6 +2935,7 @@ def _curobo_full_approach(
     pre_grasp_offset: float = 0.12,
     usd: Any = None,
     usd_geom: Any = None,
+    object_world_pos: np.ndarray | None = None,
 ) -> bool:
     """Plan and execute a full approach trajectory via Curobo (two segments).
 
@@ -2960,6 +2969,7 @@ def _curobo_full_approach(
             curobo_state, stage, robot_prim_path,
             table_prim_path, object_prim_path,
             include_object=True,
+            object_world_pos=object_world_pos,
         )
     except Exception as exc:
         LOG.warning("Curobo full_approach: world update (seg1) failed: %s", exc)
@@ -4392,6 +4402,13 @@ def _run_pick_place_episode(
                 )
                 return _verify_reach_before_close(m)
 
+            # Object center for curobo collision cuboid (physics-driven,
+            # ComputeWorldBound returns stale origin)
+            _obj_center = np.array(
+                [last_pick_pos[0], last_pick_pos[1],
+                 float(table_top_z) + 0.5 * object_height],
+                dtype=np.float32,
+            )
             curobo_ok = _curobo_full_approach(
                 curobo_state=curobo_state,
                 franka=franka,
@@ -4408,6 +4425,7 @@ def _run_pick_place_episode(
                 reach_check_fn=_curobo_reach_check,
                 usd=usd,
                 usd_geom=usd_geom,
+                object_world_pos=_obj_center,
             )
             if stopped:
                 break
