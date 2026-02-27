@@ -2979,6 +2979,14 @@ def _curobo_full_approach(
     pre_grasp_pos = target_pos_world[:3].astype(np.float32).copy()
     pre_grasp_pos -= pre_grasp_offset * approach_dir
 
+    # Clamp pre-grasp Z above table surface to avoid collision with table cuboid.
+    _table_bbox = _compute_prim_bbox(stage, table_prim_path, usd_geom)
+    if _table_bbox is not None:
+        _table_top = float(_table_bbox[1][2])
+        _min_pre_grasp_z = _table_top + 0.03  # 3cm above table
+        if pre_grasp_pos[2] < _min_pre_grasp_z:
+            pre_grasp_pos[2] = _min_pre_grasp_z
+
     LOG.info(
         "Curobo full_approach: target_world=[%.4f,%.4f,%.4f] approach_dir=[%.4f,%.4f,%.4f] "
         "pre_grasp_world=[%.4f,%.4f,%.4f] offset=%.3f",
@@ -4477,6 +4485,30 @@ def _run_pick_place_episode(
                 usd_geom=usd_geom,
                 object_world_pos=_obj_center,
             )
+            if stopped:
+                break
+            # Top-down fallback: if annotation orientation fails, retry with vertical approach.
+            if not curobo_ok and not np.allclose(down_quat, TOP_DOWN_FALLBACK_QUAT, atol=0.05):
+                LOG.info("collect: attempt %d retrying Curobo with top-down fallback orientation", attempt)
+                td_quat = TOP_DOWN_FALLBACK_QUAT.copy()
+                curobo_ok = _curobo_full_approach(
+                    curobo_state=curobo_state,
+                    franka=franka,
+                    world=world,
+                    stage=stage,
+                    robot_prim_path=robot_prim_path,
+                    table_prim_path=table_prim_path,
+                    object_prim_path=object_prim_path,
+                    target_pos_world=down_xyz,
+                    target_quat_world=td_quat,
+                    record_fn=_record_frame,
+                    timeout_fn=_timeout_triggered,
+                    stop_event=stop_event,
+                    reach_check_fn=_curobo_reach_check,
+                    usd=usd,
+                    usd_geom=usd_geom,
+                    object_world_pos=_obj_center,
+                )
             if stopped:
                 break
             if curobo_ok:
