@@ -2004,15 +2004,18 @@ def _infer_table_workspace(
     usd_geom: Any,
     table_prim_path: Optional[str] = None,
 ) -> tuple[tuple[float, float], tuple[float, float], float, tuple[float, float]]:
+    # Try full table prim FIRST — sub-prims like /Top may have geometry
+    # at a different z than the actual table surface (e.g. bbox top_z=0.5
+    # when the real surface is at 0.77).
     table_candidates: list[str] = []
     if table_prim_path:
-        table_candidates.extend([f"{table_prim_path}/Top", table_prim_path])
+        table_candidates.extend([table_prim_path, f"{table_prim_path}/Top"])
     table_candidates.extend(
         [
-            "/World/Table/Top",
             "/World/Table",
-            f"{TABLE_PRIM_PATH}/Top",
+            "/World/Table/Top",
             TABLE_PRIM_PATH,
+            f"{TABLE_PRIM_PATH}/Top",
         ]
     )
 
@@ -2041,6 +2044,7 @@ def _infer_table_workspace(
         if x_max <= x_min or y_max <= y_min:
             continue
         center = ((x_min + x_max) * 0.5, (y_min + y_max) * 0.5)
+        LOG.info("_infer_table_workspace: using prim=%s top_z=%.4f bbox_z=(%.4f, %.4f)", p, top_z, float(mn[2]), float(mx[2]))
         return (x_min, x_max), (y_min, y_max), top_z, center
 
     # Fallback for generated scene defaults.
