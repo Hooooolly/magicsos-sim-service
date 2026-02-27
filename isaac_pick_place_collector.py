@@ -4305,6 +4305,16 @@ def _run_pick_place_episode(
             fallback_object_height=object_height,
         )
         object_height = float(z_targets["object_height"])
+        LOG.info(
+            "collect: attempt %d z_targets BEFORE clip: pick_grasp_z=%.4f pick_approach_z=%.4f "
+            "obj_h=%.4f table_top_z=%.4f annotation_target=%s",
+            attempt,
+            float(z_targets["pick_grasp_z"]),
+            float(z_targets["pick_approach_z"]),
+            float(z_targets["object_height"]),
+            float(table_top_z),
+            "NOT_NONE" if annotation_target is not None else "NONE",
+        )
         if annotation_target is not None:
             ann_z = float(annotation_target["target_pos"][2])
             min_z = float(table_top_z) + IK_PICK_MIN_CLEARANCE_FROM_TABLE
@@ -4313,6 +4323,13 @@ def _run_pick_place_episode(
             z_targets["pick_approach_z"] = max(
                 float(z_targets["pick_approach_z"]),
                 float(z_targets["pick_grasp_z"]) + 0.08,
+            )
+            LOG.info(
+                "collect: attempt %d z_targets AFTER clip: ann_z=%.4f min_z=%.4f max_z=%.4f "
+                "clipped_pick_grasp_z=%.4f pick_approach_z=%.4f",
+                attempt, ann_z, min_z, max_z,
+                float(z_targets["pick_grasp_z"]),
+                float(z_targets["pick_approach_z"]),
             )
             ik_target_orientation = _normalize_quat_wxyz(annotation_target["target_quat"])
         elif force_topdown_grasp:
@@ -4398,6 +4415,10 @@ def _run_pick_place_episode(
 
         # ---- Curobo full approach ---
         if True:
+            LOG.info(
+                "collect: attempt %d FINAL z_targets pick_grasp_z=%.4f before down_xyz",
+                attempt, float(z_targets["pick_grasp_z"]),
+            )
             down_xyz = np.array(
                 [last_pick_pos[0], last_pick_pos[1],
                  float(z_targets["pick_grasp_z"])],
