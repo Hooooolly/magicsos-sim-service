@@ -1442,6 +1442,20 @@ print("[interactive] Running warmup frames...")
 for _ in range(60):
     simulation_app.update()
 _restore_autosave_stage()
+
+# ── Pre-warm Curobo CUDA JIT inside this process ─────────────
+if os.environ.get("COLLECT_PLANNER_BACKEND", "").strip().lower() == "curobo":
+    def _curobo_jit_warmup():
+        """Import curobo modules to trigger CUDA JIT compilation so the
+        first collect doesn't waste 6+ minutes recompiling."""
+        try:
+            print("[interactive] Pre-warming curobo CUDA extensions (JIT) ...")
+            from curobo.wrap.reacher.motion_gen import MotionGen  # noqa: F401
+            print("[interactive] Curobo JIT warmup OK")
+        except Exception as exc:
+            print(f"[interactive] Curobo JIT warmup skipped: {exc}")
+    _curobo_jit_warmup()
+
 print(f"[interactive] Ready. WebRTC port={WEBRTC_PORT}, Kit API=8011, Bridge={BRIDGE_PORT}")
 
 # ── Main-thread command processor ────────────────────────────

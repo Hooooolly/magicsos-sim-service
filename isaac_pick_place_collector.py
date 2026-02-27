@@ -2621,35 +2621,63 @@ _CUROBO_STATE: dict | None = None
 
 
 def _extract_world_config(
-    usd_help: Any,
+    stage: Any,
+    usd_geom: Any,
     robot_prim_path: str,
     table_prim_path: str,
     object_prim_path: str | None,
     include_object: bool = True,
 ) -> Any:
-    """Build Curobo WorldConfig from current scene obstacles.
+    """Build Curobo WorldConfig from ground-truth bounding boxes.
 
-    ``reference_prim_path=robot_prim_path`` transforms all obstacle
-    positions into the robot base frame so that Curobo planning targets
-    (also in robot base frame) are consistent.
+    Uses cuboid primitives instead of mesh extraction for reliability.
+    All positions are transformed into the robot base frame.
     """
-    from curobo.geom.types import WorldConfig
+    from curobo.geom.types import Cuboid, WorldConfig
 
-    only_paths: list[str] = [table_prim_path]
-    if object_prim_path and include_object:
-        only_paths.append(object_prim_path)
-    try:
-        return (
-            usd_help.get_obstacles_from_stage(
-                only_paths=only_paths,
-                reference_prim_path=robot_prim_path,
-                ignore_substring=[robot_prim_path],
-            )
-            .get_collision_check_world()
+    import pxr.Usd as usd_mod
+    import pxr.UsdGeom as usd_geom_mod
+
+    robot_pos, robot_quat = _get_prim_world_pose(stage, robot_prim_path, usd_mod, usd_geom_mod)
+    rot_inv = _quat_to_rot_wxyz(robot_quat).T
+
+    def _bbox_to_cuboid(prim_path: str, name: str) -> Cuboid | None:
+        bbox = _compute_prim_bbox(stage, prim_path, usd_geom_mod)
+        if bbox is None:
+            LOG.warning("Curobo WorldConfig: bbox failed for %s", prim_path)
+            return None
+        mn, mx = bbox
+        center_world = 0.5 * (mn + mx)
+        dims = (mx - mn).astype(np.float32)
+        # Transform center to robot base frame
+        center_robot = (rot_inv @ (center_world - robot_pos[:3])).astype(np.float32)
+        # pose = [x, y, z, qw, qx, qy, qz]
+        pose = [float(center_robot[0]), float(center_robot[1]), float(center_robot[2]),
+                1.0, 0.0, 0.0, 0.0]
+        LOG.info(
+            "Curobo cuboid '%s': center_world=[%.3f,%.3f,%.3f] center_robot=[%.3f,%.3f,%.3f] dims=[%.3f,%.3f,%.3f]",
+            name, center_world[0], center_world[1], center_world[2],
+            center_robot[0], center_robot[1], center_robot[2],
+            dims[0], dims[1], dims[2],
         )
-    except Exception as exc:
-        LOG.warning("Curobo WorldConfig extraction failed: %s; using empty world", exc)
-        return WorldConfig()
+        return Cuboid(
+            name=name,
+            pose=pose,
+            dims=[float(dims[0]), float(dims[1]), float(dims[2])],
+        )
+
+    cuboids: list[Cuboid] = []
+    table_cub = _bbox_to_cuboid(table_prim_path, "table")
+    if table_cub is not None:
+        cuboids.append(table_cub)
+
+    if object_prim_path and include_object:
+        obj_cub = _bbox_to_cuboid(object_prim_path, "pick_object")
+        if obj_cub is not None:
+            cuboids.append(obj_cub)
+
+    LOG.info("Curobo WorldConfig: %d cuboid(s) built from ground-truth bbox", len(cuboids))
+    return WorldConfig(cuboid=cuboids)
 
 
 def _init_curobo_motion_gen(
@@ -2692,28 +2720,31 @@ def _init_curobo_motion_gen(
     if robot_yaml is None:
         raise RuntimeError("Curobo: no usable Franka robot YAML found")
 
+    import pxr.UsdGeom as _usd_geom_init
     usd_help = UsdHelper()
     usd_help.load_stage(stage)
     world_cfg = _extract_world_config(
-        usd_help, robot_prim_path, table_prim_path, object_prim_path,
+        stage, _usd_geom_init, robot_prim_path, table_prim_path, object_prim_path,
     )
 
     mg_cfg = MotionGenConfig.load_from_robot_config(
         robot_yaml["robot_cfg"],
         [world_cfg],
         tensor_args,
-        collision_checker_type=CollisionCheckerType.MESH,
+        collision_checker_type=CollisionCheckerType.PRIMITIVE,
         use_cuda_graph=False,
         interpolation_dt=0.03,
-        collision_cache={"mesh": 10},
-        collision_activation_distance=0.015,
+        collision_cache={"obb": 10, "mesh": 2},
+        collision_activation_distance=0.005,
         maximum_trajectory_dt=0.25,
         n_collision_envs=1,
     )
     motion_gen = MotionGen(mg_cfg)
+    motion_gen.warmup(warmup_js_trajopt=False)
 
     plan_config = MotionGenPlanConfig(
-        enable_graph=False,
+        enable_graph=True,
+        enable_graph_attempt=3,
         max_attempts=16,
         enable_finetune_trajopt=True,
     )
@@ -2737,8 +2768,9 @@ def _update_curobo_world(
     include_object: bool = True,
 ) -> None:
     """Refresh collision world from the current USD stage."""
+    import pxr.UsdGeom as _usd_geom_upd
     world_cfg = _extract_world_config(
-        curobo_state["usd_help"],
+        stage, _usd_geom_upd,
         robot_prim_path,
         table_prim_path,
         object_prim_path,
@@ -2806,6 +2838,13 @@ def _plan_curobo_segment(
         quaternion=ta.to_device(quat_r.tolist()).view(1, 4),
     )
 
+    LOG.info(
+        "Curobo plan_single: target_robot pos=[%.4f, %.4f, %.4f] quat=[%.4f, %.4f, %.4f, %.4f]  joints=%s",
+        pos_r[0], pos_r[1], pos_r[2],
+        quat_r[0], quat_r[1], quat_r[2], quat_r[3],
+        np.array2string(current_joints_7[:7], precision=3, separator=", "),
+    )
+
     try:
         result = mg.plan_single(cur_js, goal, curobo_state["plan_config"].clone())
     except Exception as exc:
@@ -2813,7 +2852,14 @@ def _plan_curobo_segment(
         return None
 
     if result.success is None or not result.success.item():
-        LOG.warning("Curobo plan_single returned success=False")
+        # Extract diagnostic details from result
+        _vq = getattr(result, "valid_query", None)
+        _opt_dt = getattr(result, "optimized_dt", None)
+        _status = getattr(result, "status", None)
+        LOG.warning(
+            "Curobo plan_single FAILED: valid_query=%s optimized_dt=%s status=%s",
+            _vq, _opt_dt, _status,
+        )
         return None
 
     traj = mg.get_full_js(result.get_interpolated_plan())

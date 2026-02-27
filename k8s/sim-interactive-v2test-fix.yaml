@@ -1,0 +1,172 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: sim-interactive-v2test-fix
+  namespace: embodied
+  labels:
+    app: sim-interactive-v2test-fix
+    app.kubernetes.io/component: interactive-sim
+    app.kubernetes.io/name: sim-interactive-v2test-fix
+    platform.magics.ai/embodied: "true"
+    platform.magics.ai/gpu-index: "3"
+spec:
+  hostNetwork: true
+  nodeName: node1
+  restartPolicy: Never
+  containers:
+  - name: isaac-sim
+    image: humerlsl/magicphysics:v2
+    imagePullPolicy: IfNotPresent
+    securityContext:
+      runAsUser: 0
+      runAsGroup: 0
+    command: ["/bin/bash", "-c"]
+    args:
+    - |
+      echo "[startup] $(date) Cleaning up stale NVIDIA .so stubs..."
+      # Remove empty driver stubs that conflict with the host's driver version
+      DRIVER_VER=$(cat /proc/driver/nvidia/version 2>/dev/null | grep -oP 'Kernel Module  \K[0-9.]+' || echo "")
+      if [ -n "$DRIVER_VER" ]; then
+        for f in /usr/lib/x86_64-linux-gnu/libnvidia-rtcore.so.*; do
+          case "$f" in *"$DRIVER_VER") continue;; esac
+          if [ -f "$f" ] && [ ! -s "$f" ]; then
+            echo "[startup] Removing empty stub: $f"
+            rm -f "$f"
+          fi
+        done
+      fi
+
+      # ---- Use image's own CUDA 12.8 (matches PyTorch 2.7+cu128) ----
+      export CUDA_HOME=/usr/local/cuda
+      export PATH=/isaac-sim/kit/python/bin:$CUDA_HOME/bin:$PATH
+      echo "[startup] $(date) CUDA: $(nvcc --version 2>&1 | tail -1 || echo 'not found')"
+
+      # ---- Install Python deps ----
+      /isaac-sim/python.sh -m pip install -q flask pandas pyarrow imageio imageio-ffmpeg tqdm 2>/dev/null || true
+      /isaac-sim/python.sh -m pip install -q ninja warp-lang yourdfpy trimesh 2>/dev/null || true
+
+      # ---- Remove pre-compiled curobo .so if present (incompatible with this PyTorch) ----
+      for f in /sim-service/curobo/curobolib/*_cu.cpython-*.so; do
+        if [ -f "$f" ]; then
+          echo "[startup] Removing incompatible: $(basename $f)"
+          rm -f "$f"
+        fi
+      done
+
+      # ---- JIT-compile curobo CUDA extensions for PyTorch 2.7+cu128 ----
+      echo "[startup] $(date) JIT-compiling curobo CUDA extensions (takes ~7 min)..."
+      export TORCH_CUDA_ARCH_LIST="${TORCH_CUDA_ARCH_LIST:-7.5}"
+      /isaac-sim/python.sh - <<'PY'
+      import os
+      os.environ['PATH'] = '/isaac-sim/kit/python/bin:' + os.environ.get('PATH', '')
+      os.environ.setdefault("TORCH_CUDA_ARCH_LIST", "7.5")
+      os.environ.setdefault("CUDA_HOME", "/usr/local/cuda")
+      try:
+          from curobo.wrap.reacher.motion_gen import MotionGen
+          print('[startup] Curobo MotionGen import OK')
+      except Exception as exc:
+          print(f"[startup] WARNING Curobo MotionGen unavailable: {exc}")
+      try:
+          from curobo.geom.sdf.world import CollisionCheckerType
+          print('[startup] Curobo CollisionCheckerType import OK')
+      except Exception as exc:
+          print(f"[startup] WARNING: {exc}")
+      PY
+      echo "[startup] $(date) Curobo setup complete."
+      echo "[startup] $(date) Launching Isaac Sim..."
+      exec /isaac-sim/python.sh -u /sim-service/run_interactive.py
+    env:
+    - name: PYTHONUNBUFFERED
+      value: "1"
+    - name: LIVESTREAM
+      value: "2"
+    - name: ACCEPT_EULA
+      value: "Y"
+    - name: PRIVACY_CONSENT
+      value: "Y"
+    - name: CUDA_VISIBLE_DEVICES
+      value: "0"
+    - name: HEALTH_PORT
+      value: "6903"
+    - name: BRIDGE_PORT
+      value: "6803"
+    - name: WEBRTC_PORT
+      value: "49203"
+    - name: KIT_API_PORT
+      value: "8114"
+    - name: MEDIA_PORT
+      value: "48103"
+    - name: ISAACSIM_PATH
+      value: /isaac-sim
+    - name: PYTHONPATH
+      value: /sim-service
+    - name: EMBODIED_DATASETS_ROOT
+      value: /data/embodied/datasets
+    - name: COLLECT_PLANNER_BACKEND
+      value: curobo
+    - name: COLLECT_VERBOSE_DEBUG
+      value: "1"
+    - name: COLLECT_STEP_WORLD_LOG
+      value: "1"
+    - name: SIM_SCENE_AUTO_LIFT
+      value: "1"
+    - name: TORCH_CUDA_ARCH_LIST
+      value: "7.5"
+    ports:
+    - containerPort: 6903
+      hostPort: 6903
+      name: http
+      protocol: TCP
+    - containerPort: 6803
+      hostPort: 6803
+      name: bridge-api
+      protocol: TCP
+    - containerPort: 8114
+      hostPort: 8114
+      name: kit-api
+      protocol: TCP
+    - containerPort: 49203
+      hostPort: 49203
+      name: webrtc-signal
+      protocol: TCP
+    - containerPort: 48103
+      hostPort: 48103
+      name: media-udp
+      protocol: UDP
+    resources:
+      requests:
+        memory: "8Gi"
+        nvidia.com/gpu: "1"
+      limits:
+        memory: "32Gi"
+        nvidia.com/gpu: "1"
+    volumeMounts:
+    - name: sim-service-code
+      mountPath: /sim-service
+    - name: data-storage
+      mountPath: /data
+    - name: scenesmith-data
+      mountPath: /scenesmith
+    - name: dshm
+      mountPath: /dev/shm
+    - name: embodied-shared
+      mountPath: /data/embodied
+  volumes:
+  - name: sim-service-code
+    hostPath:
+      path: /home/magics/sim-service
+      type: Directory
+  - name: data-storage
+    hostPath:
+      path: /data
+  - name: scenesmith-data
+    hostPath:
+      path: /home/magics/rlinf-workspace/scenesmith
+      type: Directory
+  - name: dshm
+    emptyDir:
+      medium: Memory
+      sizeLimit: 16Gi
+  - name: embodied-shared
+    persistentVolumeClaim:
+      claimName: embodied-nfs-pvc
