@@ -1245,7 +1245,7 @@ def _select_annotation_grasp_target(
             ad_norm = float(np.linalg.norm(approach_dir))
             if ad_norm > 1e-6:
                 approach_dir = approach_dir / ad_norm
-            pre_grasp_z = z + _PRE_GRASP_OFFSET * float(approach_dir[2])
+            pre_grasp_z = z - _PRE_GRASP_OFFSET * float(approach_dir[2])
             if pre_grasp_z < float(table_top_z) - 0.01:
                 return False
         return True
@@ -2962,8 +2962,8 @@ def _curobo_full_approach(
 
     Returns True if the arm successfully reached the grasp pose.
     """
-    # Compute pre-grasp position: offset above the target along the approach direction.
-    # For top-down grasps (default), this is simply Z + offset.
+    # Compute pre-grasp position: retract from the target OPPOSITE to approach direction.
+    # For top-down grasps (approach_dir=[0,0,-1]), this raises Z by offset.
     rot = _quat_to_rot_wxyz(target_quat_world)
     approach_dir = rot[:, 2].astype(np.float32)  # Z column = approach direction
     norm = float(np.linalg.norm(approach_dir))
@@ -2973,7 +2973,16 @@ def _curobo_full_approach(
         approach_dir = approach_dir / norm
 
     pre_grasp_pos = target_pos_world[:3].astype(np.float32).copy()
-    pre_grasp_pos += pre_grasp_offset * approach_dir
+    pre_grasp_pos -= pre_grasp_offset * approach_dir
+
+    LOG.info(
+        "Curobo full_approach: target_world=[%.4f,%.4f,%.4f] approach_dir=[%.4f,%.4f,%.4f] "
+        "pre_grasp_world=[%.4f,%.4f,%.4f] offset=%.3f",
+        target_pos_world[0], target_pos_world[1], target_pos_world[2],
+        approach_dir[0], approach_dir[1], approach_dir[2],
+        pre_grasp_pos[0], pre_grasp_pos[1], pre_grasp_pos[2],
+        pre_grasp_offset,
+    )
 
     robot_base_pos, robot_base_quat = _get_prim_world_pose(
         stage, robot_prim_path, usd, usd_geom,
