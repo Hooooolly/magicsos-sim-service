@@ -2648,6 +2648,7 @@ def _extract_world_config(
     table_prim_path: str,
     object_prim_path: str | None,
     include_object: bool = True,
+    include_table: bool = True,
     object_world_pos: np.ndarray | None = None,
 ) -> Any:
     """Build Curobo WorldConfig from ground-truth bounding boxes.
@@ -2693,9 +2694,10 @@ def _extract_world_config(
         )
 
     cuboids: list[Cuboid] = []
-    table_cub = _bbox_to_cuboid(table_prim_path, "table")
-    if table_cub is not None:
-        cuboids.append(table_cub)
+    if include_table:
+        table_cub = _bbox_to_cuboid(table_prim_path, "table")
+        if table_cub is not None:
+            cuboids.append(table_cub)
 
     if object_prim_path and include_object:
         obj_cub = _bbox_to_cuboid(object_prim_path, "pick_object",
@@ -2793,6 +2795,7 @@ def _update_curobo_world(
     table_prim_path: str,
     object_prim_path: str | None,
     include_object: bool = True,
+    include_table: bool = True,
     object_world_pos: np.ndarray | None = None,
 ) -> None:
     """Refresh collision world from the current USD stage."""
@@ -2803,6 +2806,7 @@ def _update_curobo_world(
         table_prim_path,
         object_prim_path,
         include_object=include_object,
+        include_table=include_table,
         object_world_pos=object_world_pos,
     )
     curobo_state["motion_gen"].world_coll_checker.load_collision_model(
@@ -3040,12 +3044,17 @@ def _curobo_full_approach(
         world.step(render=True)
         record_fn(arm_target=cur_q_settle, gripper_target=GRIPPER_OPEN)
 
-    # --- Segment 2: pre-grasp -> down-pick (WITHOUT object in collision world) ---
+    # --- Segment 2: pre-grasp -> down-pick (no object, no table collision) ---
+    # Table collision is removed because the gripper fingers extend ~4cm below
+    # the EEF frame. At pick_grasp_z (table + 1cm), the fingers would collide
+    # with the table cuboid. The pre-grasp → grasp motion is only ~12cm so
+    # removing the table is safe.
     try:
         _update_curobo_world(
             curobo_state, stage, robot_prim_path,
             table_prim_path, object_prim_path,
             include_object=False,
+            include_table=False,
         )
     except Exception as exc:
         LOG.warning("Curobo full_approach: world update (seg2) failed: %s", exc)
