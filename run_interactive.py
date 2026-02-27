@@ -1771,6 +1771,9 @@ def _run_pending_collection():
             f"timeout={episode_timeout_sec}s, output={output_dir}, targets={target_objects}"
         )
 
+        import importlib
+        import isaac_pick_place_collector as _ipc_mod
+        importlib.reload(_ipc_mod)
         from isaac_pick_place_collector import run_collection_in_process
 
         collect_kwargs = {
