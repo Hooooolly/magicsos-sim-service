@@ -1948,7 +1948,8 @@ def _compute_prim_bbox(stage: Any, prim_path: str, usd_geom: Any) -> Optional[tu
     if not prim or not prim.IsValid():
         return None
     try:
-        cache = usd_geom.BBoxCache(0, ["default", "render"])
+        import pxr.Usd as _usd_bbox
+        cache = usd_geom.BBoxCache(_usd_bbox.TimeCode.Default(), ["default", "render"])
         rng = cache.ComputeWorldBound(prim).GetRange()
         mn = np.array([float(rng.GetMin()[0]), float(rng.GetMin()[1]), float(rng.GetMin()[2])], dtype=np.float32)
         mx = np.array([float(rng.GetMax()[0]), float(rng.GetMax()[1]), float(rng.GetMax()[2])], dtype=np.float32)
