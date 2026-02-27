@@ -1214,6 +1214,8 @@ def _select_annotation_grasp_target(
 
     workspace_margin = 0.04
 
+    _PRE_GRASP_OFFSET = 0.12  # must match _curobo_full_approach default
+
     def _target_in_workspace(target: dict[str, Any]) -> bool:
         pos = _to_numpy(target.get("target_pos"), dtype=np.float32).reshape(-1)
         if pos.size < 3 or not np.all(np.isfinite(pos[:3])):
@@ -1231,6 +1233,20 @@ def _select_annotation_grasp_target(
             return False
         if table_top_z is not None and np.isfinite(float(table_top_z)):
             if z < float(table_top_z) - 0.03:
+                return False
+        # Reject candidates whose pre-grasp position would be inside the table.
+        # pre_grasp = target + offset * approach_dir (Z-column of orientation).
+        # If approach_dir points downward, the pre-grasp ends up below the target,
+        # potentially inside the table collision cuboid — Curobo will IK_FAIL.
+        tq = _to_numpy(target.get("target_quat"), dtype=np.float32).reshape(-1)
+        if tq.size >= 4 and np.all(np.isfinite(tq[:4])) and table_top_z is not None:
+            rot = _quat_to_rot_wxyz(_normalize_quat_wxyz(tq))
+            approach_dir = rot[:, 2].astype(np.float32)
+            ad_norm = float(np.linalg.norm(approach_dir))
+            if ad_norm > 1e-6:
+                approach_dir = approach_dir / ad_norm
+            pre_grasp_z = z + _PRE_GRASP_OFFSET * float(approach_dir[2])
+            if pre_grasp_z < float(table_top_z) - 0.01:
                 return False
         return True
 
