@@ -1221,6 +1221,19 @@ def scene_load():
     return _enqueue_cmd("scene_load", usd_path=usd_path)
 
 
+@bridge.route("/scene/save", methods=["POST"])
+def scene_save():
+    data = flask_request.get_json(silent=True) or {}
+    name = (data.get("name") or "").strip()
+    if not name:
+        return jsonify({"error": "name required"}), 400
+    safe_name = "".join(c if c.isalnum() or c in "-_ " else "_" for c in name)[:60].strip()
+    ts = int(time.time())
+    output_dir = os.path.join("/data", "sim_scenes")
+    output_path = os.path.join(output_dir, f"{safe_name}_{ts}.usda")
+    return _enqueue_cmd("scene_save", output_path=output_path, output_dir=output_dir)
+
+
 @bridge.route("/scene/info", methods=["GET"])
 def scene_info():
     stage = _get_stage()
@@ -1518,6 +1531,23 @@ def _process_commands():
                             _save_autosave_stage("scene_load")
                             print(f"[interactive] Scene loaded: {usd_path}")
                             cmd["result"] = {"success": True, "scene": usd_path}
+
+            elif cmd_type == "scene_save":
+                stage = _get_stage()
+                if not stage:
+                    cmd["error"] = "No stage loaded"
+                else:
+                    out_dir = cmd["output_dir"]
+                    out_path = cmd["output_path"]
+                    os.makedirs(out_dir, exist_ok=True)
+                    root_layer = stage.GetRootLayer()
+                    if root_layer is None:
+                        cmd["error"] = "No root layer"
+                    elif bool(root_layer.Export(out_path)):
+                        print(f"[interactive] Scene saved: {out_path}")
+                        cmd["result"] = {"success": True, "usd_path": out_path}
+                    else:
+                        cmd["error"] = f"USD export failed: {out_path}"
 
             elif cmd_type == "robot_spawn":
                 stage = _get_stage()
