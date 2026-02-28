@@ -168,7 +168,7 @@ AUTOSAVE_ENABLED = os.environ.get("SIM_AUTOSAVE_ENABLED", "0").strip() != "0"
 AUTOSAVE_DIR = os.path.join("/data", "sim_sessions", SIM_SESSION_NAME)
 AUTOSAVE_STAGE_PATH = os.path.join(AUTOSAVE_DIR, "last_stage.usda")
 AUTOSAVE_META_PATH = os.path.join(AUTOSAVE_DIR, "last_stage_meta.json")
-EMBODIED_DATASETS_ROOT = os.environ.get("EMBODIED_DATASETS_ROOT", "/data/embodied/datasets")
+EMBODIED_DATASETS_ROOT = os.environ.get("EMBODIED_DATASETS_ROOT", "/data/embodied/dataset/sim")
 LEGACY_COLLECT_OUTPUT_DIRS = {
     "/data/collections/latest",
     "/data/embodied/datasets/sim_collect_latest",
@@ -1772,6 +1772,8 @@ def _run_pending_collection():
         )
 
         import importlib
+        import lerobot_writer as _lrw_mod
+        importlib.reload(_lrw_mod)
         import isaac_pick_place_collector as _ipc_mod
         importlib.reload(_ipc_mod)
         from isaac_pick_place_collector import run_collection_in_process
