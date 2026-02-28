@@ -34,7 +34,7 @@ from lerobot_writer import SimLeRobotWriter
 
 LOG = logging.getLogger("isaac-pick-place-collector")
 
-_CODE_VERSION = "2026-02-28T07"
+_CODE_VERSION = "2026-02-28T08"
 print(f"[RELOAD] isaac_pick_place_collector loaded: version={_CODE_VERSION}", flush=True)
 
 STATE_DIM = 23
@@ -4804,9 +4804,9 @@ def _run_pick_place_episode(
             close_arm = _to_numpy(franka.get_joint_positions())[:7].astype(np.float32)
             _close_ramp_steps = max(int(GRIPPER_OPEN / 0.002), 1)  # ~20 steps
             _stall_count = 0
-            _RESIST_THRESHOLD = 0.002  # per-finger: 2mm gap actual→target = blocked by object
+            _RESIST_THRESHOLD = 0.004  # per-finger: 4mm gap actual→target = blocked (PD lag ~2-3mm)
             _RESIST_PATIENCE = 3  # resistance for 3 consecutive steps → confirmed contact
-            _MIN_CLOSE_STEP = 10  # skip early steps (PD still ramping up)
+            _MIN_CLOSE_STEP = 15  # skip early steps; at step 15 target=0.01 < ball radius 0.014
             _hold_gr_target = float(GRIPPER_CLOSED)
             for _cs in range(CLOSE_HOLD_STEPS):
                 if _timeout_triggered():
