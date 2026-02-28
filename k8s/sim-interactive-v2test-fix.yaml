@@ -101,7 +101,7 @@ spec:
     - name: PYTHONPATH
       value: /sim-service
     - name: EMBODIED_DATASETS_ROOT
-      value: /data/embodied/datasets
+      value: /data/embodied/dataset/sim
     - name: COLLECT_PLANNER_BACKEND
       value: curobo
     - name: COLLECT_VERBOSE_DEBUG
