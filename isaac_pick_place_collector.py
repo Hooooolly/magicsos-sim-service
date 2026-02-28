@@ -34,7 +34,7 @@ from lerobot_writer import SimLeRobotWriter
 
 LOG = logging.getLogger("isaac-pick-place-collector")
 
-_CODE_VERSION = "2026-02-28T03"
+_CODE_VERSION = "2026-02-28T04"
 print(f"[RELOAD] isaac_pick_place_collector loaded: version={_CODE_VERSION}", flush=True)
 
 STATE_DIM = 23
@@ -4803,10 +4803,10 @@ def _run_pick_place_episode(
             print(f"[CLOSE] attempt={attempt} ENTERING close_hold steps={CLOSE_HOLD_STEPS} version={_CODE_VERSION}", flush=True)
             close_arm = _to_numpy(franka.get_joint_positions())[:7].astype(np.float32)
             _close_ramp_steps = max(int(GRIPPER_OPEN / 0.002), 1)  # ~20 steps
-            _prev_gw = float(GRIPPER_OPEN) * 2.0  # initial sentinel
             _stall_count = 0
-            _STALL_THRESHOLD = 0.0005  # finger movement < 0.5mm = stalled on object
-            _STALL_PATIENCE = 3  # stall for 3 consecutive steps → stop closing
+            _RESIST_THRESHOLD = 0.002  # per-finger: 2mm gap actual→target = blocked by object
+            _RESIST_PATIENCE = 3  # resistance for 3 consecutive steps → confirmed contact
+            _MIN_CLOSE_STEP = 10  # skip early steps (PD still ramping up)
             _hold_gr_target = float(GRIPPER_CLOSED)
             for _cs in range(CLOSE_HOLD_STEPS):
                 if _timeout_triggered():
@@ -4825,17 +4825,21 @@ def _run_pick_place_episode(
                 _set_joint_targets(franka, arm_cmd, _gr_target, physics_control=True)
                 world.step(render=True)
                 _record_frame(arm_target=close_arm, gripper_target=_gr_target)
-                # Check actual finger width for contact detection
+                # Contact detection: compare actual finger width vs commanded target.
+                # When fingers hit an object, actual stays wide while target goes to 0.
+                # Resistance = actual_per_finger - target_per_finger (positive = blocked).
                 _cur_joints = _to_numpy(franka.get_joint_positions())
                 _cur_gw = float(_cur_joints[7] + _cur_joints[8]) if _cur_joints.size >= 9 else -1.0
-                if _cur_gw > 0 and abs(_prev_gw - _cur_gw) < _STALL_THRESHOLD and _cs >= 5:
-                    _stall_count += 1
-                    if _stall_count == _STALL_PATIENCE:
-                        _hold_gr_target = _cur_gw  # hold at contact width, don't squeeze further
-                        print(f"[CLOSE] attempt={attempt} contact detected at step={_cs} width={_cur_gw:.4f} → hold at {_hold_gr_target:.4f}", flush=True)
-                else:
-                    _stall_count = 0
-                _prev_gw = _cur_gw
+                if _cur_gw > 0 and _cs >= _MIN_CLOSE_STEP:
+                    _per_finger_avg = _cur_gw / 2.0
+                    _residual = _per_finger_avg - _gr_target
+                    if _residual > _RESIST_THRESHOLD:
+                        _stall_count += 1
+                        if _stall_count == _RESIST_PATIENCE:
+                            _hold_gr_target = _cur_gw
+                            print(f"[CLOSE] attempt={attempt} contact detected at step={_cs} width={_cur_gw:.4f} residual={_residual:.4f} → hold at {_hold_gr_target:.4f}", flush=True)
+                    else:
+                        _stall_count = 0
             _close_joints = _to_numpy(franka.get_joint_positions())
             _close_gw = float(_close_joints[7] + _close_joints[8]) if _close_joints.size >= 9 else -1.0
             print(
