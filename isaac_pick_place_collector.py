@@ -31,6 +31,9 @@ from lerobot_writer import SimLeRobotWriter
 
 LOG = logging.getLogger("isaac-pick-place-collector")
 
+_CODE_VERSION = "2026-02-28T01"
+print(f"[RELOAD] isaac_pick_place_collector loaded: version={_CODE_VERSION}", flush=True)
+
 STATE_DIM = 23
 ACTION_DIM = 8
 FPS = 30
@@ -132,7 +135,7 @@ REACH_BEFORE_CLOSE_MAX_OBJECT_TIP_MID_XY_DISTANCE = 0.022
 REACH_BEFORE_CLOSE_MAX_ABS_TIP_MID_Z_DELTA = 0.03
 _REACH_REQUIRE_TIP_MID_RAW = str(os.environ.get("COLLECT_REACH_REQUIRE_TIP_MID", "0")).strip().lower()
 REACH_REQUIRE_TIP_MID = _REACH_REQUIRE_TIP_MID_RAW in {"1", "true", "yes", "on"}
-CLOSE_HOLD_STEPS = 8
+CLOSE_HOLD_STEPS = 40
 try:
     PRE_CLOSE_SETTLE_STEPS = int(os.environ.get("COLLECT_PRE_CLOSE_SETTLE_STEPS", "18"))
 except Exception:
@@ -143,6 +146,7 @@ PRE_CLOSE_SETTLE_STEPS = int(np.clip(PRE_CLOSE_SETTLE_STEPS, 0, 120))
 SETTLE_MAX_STEPS = 120
 SETTLE_CONVERGENCE_RAD = 0.02
 VERIFY_CLOSE_MIN_GRIPPER_WIDTH = 0.0025
+VERIFY_CLOSE_MAX_GRIPPER_WIDTH = 0.065
 VERIFY_CLOSE_MAX_OBJECT_EEF_DISTANCE = 0.25
 VERIFY_CLOSE_MAX_OBJECT_EEF_XY_DISTANCE = 0.08
 VERIFY_RETRIEVAL_MIN_LIFT = 0.008
@@ -2705,6 +2709,15 @@ def _extract_world_config(
         if obj_cub is not None:
             cuboids.append(obj_cub)
 
+    # Curobo crashes with "Primitive Collision has no obstacles" when the cuboid
+    # list is empty.  Add a tiny dummy cuboid far below the workspace.
+    if not cuboids:
+        cuboids.append(Cuboid(
+            name="dummy",
+            pose=[0.0, 0.0, -5.0, 1.0, 0.0, 0.0, 0.0],
+            dims=[0.01, 0.01, 0.01],
+        ))
+
     LOG.info("Curobo WorldConfig: %d cuboid(s) built from ground-truth bbox", len(cuboids))
     return WorldConfig(cuboid=cuboids)
 
@@ -2909,15 +2922,15 @@ def _execute_curobo_trajectory(
     stop_event: Any = None,
     reach_check_fn: Any = None,
     early_halt_after: int = 4,
+    teleport: bool = True,
+    steps_per_wp: int = 1,
+    settle_steps: int = 20,
 ) -> bool:
-    """Step through a Curobo-planned ``[T, 7]`` trajectory one tick at a time.
+    """Step through a Curobo-planned ``[T, 7]`` trajectory.
 
-    Uses a wider rate-limit (0.08 rad/step) than the default IK path because
-    the Curobo trajectory is already smooth (``interpolation_dt=0.03``).
-
-    When *reach_check_fn* is provided it is called after each step (once past
-    *early_halt_after* steps). It must return ``True`` when the reach gate is
-    satisfied. The function returns ``True`` if reach was detected early.
+    When *teleport=True* (default), directly sets joint positions each waypoint
+    (fast, ignores physics collision).  When *teleport=False*, uses PD control
+    only — slower but respects physics collision (prevents table clipping).
     """
     for i in range(trajectory.shape[0]):
         if timeout_fn():
@@ -2925,20 +2938,26 @@ def _execute_curobo_trajectory(
         if stop_event is not None and stop_event.is_set():
             return False
         arm = np.clip(trajectory[i], FRANKA_ARM_LOWER, FRANKA_ARM_UPPER)
-        arm_cmd, gr_cmd = _step_toward_joint_targets(
-            franka, arm, gripper_target, max_arm_step=0.08,
-        )
-        _set_joint_targets(franka, arm_cmd, gr_cmd, physics_control=True)
-        world.step(render=True)
+        if teleport:
+            _set_joint_targets(franka, arm, gripper_target, physics_control=False)
+        _set_joint_targets(franka, arm, gripper_target, physics_control=True)
+        for _s in range(steps_per_wp):
+            world.step(render=True)
         record_fn(arm_target=arm, gripper_target=gripper_target)
-        if reach_check_fn is not None and i >= early_halt_after:
-            if reach_check_fn():
-                LOG.info(
-                    "Curobo trajectory early halt at step %d/%d (reach gate satisfied)",
-                    i + 1,
-                    trajectory.shape[0],
-                )
-                return True
+
+    # Settle at final waypoint — check reach here
+    last_arm = np.clip(trajectory[-1], FRANKA_ARM_LOWER, FRANKA_ARM_UPPER)
+    for j in range(settle_steps):
+        if timeout_fn():
+            return False
+        if stop_event is not None and stop_event.is_set():
+            return False
+        _set_joint_targets(franka, last_arm, gripper_target, physics_control=True)
+        world.step(render=True)
+        record_fn(arm_target=last_arm, gripper_target=gripper_target)
+        if reach_check_fn is not None and reach_check_fn():
+            LOG.info("Curobo trajectory settle reached at step %d/%d", j + 1, settle_steps)
+            return True
     return False
 
 
@@ -2979,6 +2998,14 @@ def _curobo_full_approach(
         approach_dir = np.array([0.0, 0.0, 1.0], dtype=np.float32)
     else:
         approach_dir = approach_dir / norm
+
+    # Offset target Z from TCP (fingertip midpoint) to panda_hand (Curobo EEF).
+    # down_xyz XY is already in panda_hand frame (from annotation), but Z
+    # (pick_grasp_z) represents where the TCP should be.  The panda_hand Z
+    # differs by the projection of the TCP offset onto the world Z axis.
+    _TCP_Z_OFFSET = 0.1034  # panda_hand → fingertip midpoint along gripper local Z
+    target_pos_world = target_pos_world.astype(np.float32).copy()
+    target_pos_world[2] -= _TCP_Z_OFFSET * float(approach_dir[2])
 
     pre_grasp_pos = target_pos_world[:3].astype(np.float32).copy()
     pre_grasp_pos -= pre_grasp_offset * approach_dir
@@ -3034,15 +3061,14 @@ def _curobo_full_approach(
     if timeout_fn() or (stop_event is not None and stop_event.is_set()):
         return False
 
-    # Settle at pre-grasp (15 steps)
-    cur_q_settle = _to_numpy(franka.get_joint_positions())[:7].astype(np.float32)
-    for _ in range(15):
+    # Settle at pre-grasp: PD-based so contacts stabilize after teleport.
+    traj1_final = np.clip(traj1[-1], FRANKA_ARM_LOWER, FRANKA_ARM_UPPER)
+    for settle_i in range(10):
         if timeout_fn():
             break
-        arm_cmd, gr_cmd = _step_toward_joint_targets(franka, cur_q_settle, GRIPPER_OPEN)
-        _set_joint_targets(franka, arm_cmd, gr_cmd, physics_control=True)
+        _set_joint_targets(franka, traj1_final, GRIPPER_OPEN, physics_control=True)
         world.step(render=True)
-        record_fn(arm_target=cur_q_settle, gripper_target=GRIPPER_OPEN)
+        record_fn(arm_target=traj1_final, gripper_target=GRIPPER_OPEN)
 
     # --- Segment 2: pre-grasp -> down-pick (no object, no table collision) ---
     # Table collision is removed because the gripper fingers extend ~4cm below
@@ -3076,6 +3102,8 @@ def _curobo_full_approach(
         stop_event=stop_event,
         reach_check_fn=reach_check_fn,
         early_halt_after=4,
+        teleport=True,
+        settle_steps=30,
     )
     return reached
 
@@ -3396,8 +3424,10 @@ def _verify_after_close(metrics: dict[str, float]) -> bool:
         object_key="object_eef_xy_distance",
         target_key="target_eef_xy_distance",
     )
+    gw = metrics.get("gripper_width", 0.0)
     return bool(
-        metrics.get("gripper_width", 0.0) >= VERIFY_CLOSE_MIN_GRIPPER_WIDTH
+        gw >= VERIFY_CLOSE_MIN_GRIPPER_WIDTH
+        and gw <= VERIFY_CLOSE_MAX_GRIPPER_WIDTH
         and eef_dist <= VERIFY_CLOSE_MAX_OBJECT_EEF_DISTANCE
         and eef_xy <= VERIFY_CLOSE_MAX_OBJECT_EEF_XY_DISTANCE
     )
@@ -3558,10 +3588,13 @@ def _run_pick_place_episode(
             tip_mid_pos_dbg = None
             target_tip_mid_pos_dbg = None
             if finger_left_prim_path and finger_right_prim_path:
-                left_pos_dbg, _ = _get_prim_world_pose(stage, finger_left_prim_path, usd, usd_geom)
-                right_pos_dbg, _ = _get_prim_world_pose(stage, finger_right_prim_path, usd, usd_geom)
+                left_pos_dbg, left_quat_dbg = _get_prim_world_pose(stage, finger_left_prim_path, usd, usd_geom)
+                right_pos_dbg, right_quat_dbg = _get_prim_world_pose(stage, finger_right_prim_path, usd, usd_geom)
                 if np.all(np.isfinite(left_pos_dbg[:3])) and np.all(np.isfinite(right_pos_dbg[:3])):
-                    tip_mid_pos_dbg = (0.5 * (left_pos_dbg[:3] + right_pos_dbg[:3])).astype(np.float32)
+                    _FT_EXT_DBG = 0.046
+                    _left_tip_dbg = left_pos_dbg[:3] + _quat_to_rot_wxyz(left_quat_dbg)[:, 2] * _FT_EXT_DBG
+                    _right_tip_dbg = right_pos_dbg[:3] + _quat_to_rot_wxyz(right_quat_dbg)[:, 2] * _FT_EXT_DBG
+                    tip_mid_pos_dbg = (0.5 * (_left_tip_dbg + _right_tip_dbg)).astype(np.float32)
                     if target_pos_dbg is not None:
                         target_tip_mid_pos_dbg = target_pos_dbg[:3].astype(np.float32, copy=True)
                         if (
@@ -4110,10 +4143,13 @@ def _run_pick_place_episode(
             tip_mid_pos_dbg = None
             target_tip_mid_pos_dbg = None
             if finger_left_prim_path and finger_right_prim_path:
-                left_pos_dbg, _ = _get_prim_world_pose(stage, finger_left_prim_path, usd, usd_geom)
-                right_pos_dbg, _ = _get_prim_world_pose(stage, finger_right_prim_path, usd, usd_geom)
+                left_pos_dbg, left_quat_dbg = _get_prim_world_pose(stage, finger_left_prim_path, usd, usd_geom)
+                right_pos_dbg, right_quat_dbg = _get_prim_world_pose(stage, finger_right_prim_path, usd, usd_geom)
                 if np.all(np.isfinite(left_pos_dbg[:3])) and np.all(np.isfinite(right_pos_dbg[:3])):
-                    tip_mid_pos_dbg = (0.5 * (left_pos_dbg[:3] + right_pos_dbg[:3])).astype(np.float32)
+                    _FT_EXT_DBG = 0.046
+                    _left_tip_dbg = left_pos_dbg[:3] + _quat_to_rot_wxyz(left_quat_dbg)[:, 2] * _FT_EXT_DBG
+                    _right_tip_dbg = right_pos_dbg[:3] + _quat_to_rot_wxyz(right_quat_dbg)[:, 2] * _FT_EXT_DBG
+                    tip_mid_pos_dbg = (0.5 * (_left_tip_dbg + _right_tip_dbg)).astype(np.float32)
                     target_tip_mid_pos_dbg = target_pos_dbg[:3].astype(np.float32, copy=True)
                     if (
                         target
@@ -4338,9 +4374,17 @@ def _run_pick_place_episode(
         )
         if annotation_target is not None:
             ann_z = float(annotation_target["target_pos"][2])
+            # ann_z is in panda_hand frame (after TCP→panda_hand conversion).
+            # Convert back to TCP Z so that _curobo_full_approach can re-offset
+            # correctly for whatever orientation it ends up using (annotation or
+            # top-down fallback).  TCP_z = panda_hand_z + TCP_OFFSET * approach_dir_z.
+            _ann_quat = _normalize_quat_wxyz(annotation_target["target_quat"])
+            _ann_approach_dir_z = float(_quat_to_rot_wxyz(_ann_quat)[:, 2][2])
+            _TCP_Z_OFFSET = 0.1034
+            ann_tcp_z = ann_z + _TCP_Z_OFFSET * _ann_approach_dir_z
             min_z = float(table_top_z) + IK_PICK_MIN_CLEARANCE_FROM_TABLE
             max_z = max(min_z + 0.01, float(z_targets["pick_approach_z"]) - 0.04)
-            z_targets["pick_grasp_z"] = float(np.clip(ann_z, min_z, max_z))
+            z_targets["pick_grasp_z"] = float(np.clip(ann_tcp_z, min_z, max_z))
             z_targets["pick_approach_z"] = max(
                 float(z_targets["pick_approach_z"]),
                 float(z_targets["pick_grasp_z"]) + 0.08,
@@ -4497,8 +4541,15 @@ def _run_pick_place_episode(
             if stopped:
                 break
             # Top-down fallback: if annotation orientation fails, retry with vertical approach.
+            # For top-down, use the object center XY (not the annotation's side-approach
+            # panda_hand XY, which can be 10+ cm offset from the object).
             if not curobo_ok and not np.allclose(down_quat, TOP_DOWN_FALLBACK_QUAT, atol=0.05):
                 LOG.info("collect: attempt %d retrying Curobo with top-down fallback orientation", attempt)
+                _obj_pos_td, _ = _get_prim_world_pose(stage, object_prim_path, usd, usd_geom)
+                td_xyz = np.array(
+                    [float(_obj_pos_td[0]), float(_obj_pos_td[1]), down_xyz[2]],
+                    dtype=np.float32,
+                )
                 td_quat = TOP_DOWN_FALLBACK_QUAT.copy()
                 curobo_ok = _curobo_full_approach(
                     curobo_state=curobo_state,
@@ -4508,7 +4559,7 @@ def _run_pick_place_episode(
                     robot_prim_path=robot_prim_path,
                     table_prim_path=table_prim_path,
                     object_prim_path=object_prim_path,
-                    target_pos_world=down_xyz,
+                    target_pos_world=td_xyz,
                     target_quat_world=td_quat,
                     record_fn=_record_frame,
                     timeout_fn=_timeout_triggered,
@@ -4596,14 +4647,48 @@ def _run_pick_place_episode(
             continue
 
         if CLOSE_HOLD_STEPS > 0:
+            print(f"[CLOSE] attempt={attempt} ENTERING close_hold steps={CLOSE_HOLD_STEPS} version={_CODE_VERSION}", flush=True)
             close_arm = _to_numpy(franka.get_joint_positions())[:7].astype(np.float32)
-            for _ in range(CLOSE_HOLD_STEPS):
+            _close_ramp_steps = max(int(GRIPPER_OPEN / 0.002), 1)  # ~20 steps
+            _prev_gw = float(GRIPPER_OPEN) * 2.0  # initial sentinel
+            _stall_count = 0
+            _STALL_THRESHOLD = 0.0005  # finger movement < 0.5mm = stalled on object
+            _STALL_PATIENCE = 3  # stall for 3 consecutive steps → stop closing
+            _hold_gr_target = float(GRIPPER_CLOSED)
+            for _cs in range(CLOSE_HOLD_STEPS):
                 if _timeout_triggered():
                     break
-                arm_cmd, gr_cmd = _step_toward_joint_targets(franka, close_arm, GRIPPER_CLOSED)
-                _set_joint_targets(franka, arm_cmd, gr_cmd, physics_control=True)
+                # Gradual teleport close: ramp gripper target from OPEN→CLOSED
+                # over ~20 steps, then hold closed for the remainder.
+                _gr_frac = min(1.0, float(_cs + 1) / float(_close_ramp_steps))
+                _gr_target = float(GRIPPER_OPEN * (1.0 - _gr_frac) + GRIPPER_CLOSED * _gr_frac)
+                # If we detected contact, hold at the stalled width instead of pushing to 0
+                if _stall_count >= _STALL_PATIENCE:
+                    _gr_target = _hold_gr_target
+                arm_cmd, _ = _step_toward_joint_targets(franka, close_arm, _gr_target)
+                _set_joint_targets(franka, arm_cmd, _gr_target, physics_control=False)
+                _set_joint_targets(franka, arm_cmd, _gr_target, physics_control=True)
                 world.step(render=True)
-                _record_frame(arm_target=close_arm, gripper_target=GRIPPER_CLOSED)
+                _record_frame(arm_target=close_arm, gripper_target=_gr_target)
+                # Check actual finger width for contact detection
+                _cur_joints = _to_numpy(franka.get_joint_positions())
+                _cur_gw = float(_cur_joints[7] + _cur_joints[8]) if _cur_joints.size >= 9 else -1.0
+                if _cur_gw > 0 and abs(_prev_gw - _cur_gw) < _STALL_THRESHOLD and _cs >= 5:
+                    _stall_count += 1
+                    if _stall_count == _STALL_PATIENCE:
+                        _hold_gr_target = _cur_gw  # hold at contact width, don't squeeze further
+                        print(f"[CLOSE] attempt={attempt} contact detected at step={_cs} width={_cur_gw:.4f} → hold at {_hold_gr_target:.4f}", flush=True)
+                else:
+                    _stall_count = 0
+                _prev_gw = _cur_gw
+            _close_joints = _to_numpy(franka.get_joint_positions())
+            _close_gw = float(_close_joints[7] + _close_joints[8]) if _close_joints.size >= 9 else -1.0
+            print(
+                f"[CLOSE] attempt={attempt} after {CLOSE_HOLD_STEPS} steps: "
+                f"width={_close_gw:.4f} (f7={float(_close_joints[7]) if _close_joints.size >= 8 else -1:.4f} "
+                f"f8={float(_close_joints[8]) if _close_joints.size >= 9 else -1:.4f})",
+                flush=True,
+            )
         if stopped:
             break
 
@@ -4623,14 +4708,21 @@ def _run_pick_place_episode(
             tip_mid_offset_in_hand=annotation_tip_mid_offset_hand,
         )
         close_ok = _verify_after_close(close_metrics)
+        _gw_close = close_metrics.get("gripper_width", -1.0)
+        print(
+            f"[CLOSE_VERIFY] attempt={attempt} ok={close_ok} gripper_width={_gw_close:.4f} "
+            f"eef_dist={close_metrics.get('object_eef_distance', -1):.4f}",
+            flush=True,
+        )
         if not close_ok:
             LOG.warning(
                 "collect: grasp retry %d/%d close_verify failed metrics=%s "
-                "thresholds={width>=%.4f,eef<=%.3f,eef_xy<=%.3f}",
+                "thresholds={width>=%.4f,width<=%.4f,eef<=%.3f,eef_xy<=%.3f}",
                 attempt,
                 GRASP_MAX_ATTEMPTS,
                 close_metrics,
                 VERIFY_CLOSE_MIN_GRIPPER_WIDTH,
+                VERIFY_CLOSE_MAX_GRIPPER_WIDTH,
                 VERIFY_CLOSE_MAX_OBJECT_EEF_DISTANCE,
                 VERIFY_CLOSE_MAX_OBJECT_EEF_XY_DISTANCE,
             )
@@ -4646,7 +4738,31 @@ def _run_pick_place_episode(
                 break
             continue
 
-        _execute_transitions(lift_transitions)
+        # Patch lift: start from current arm (Curobo-reached) and lift to
+        # an IK-solved target above the current EEF.  The original
+        # lift_transitions use IK-planned joints that can be in a
+        # completely different configuration from the Curobo endpoint.
+        _lift_current_arm = _to_numpy(franka.get_joint_positions())[:7].astype(np.float32)
+        _lift_eef_pos, _lift_eef_quat = _get_eef_pose(
+            stage, eef_prim_path, get_prim_at_path, usd, usd_geom,
+        )
+        _lift_target_pos = _lift_eef_pos.copy()
+        _lift_target_pos[2] = float(z_targets["pick_approach_z"])
+        _lift_arm = None
+        if ik_solver is not None:
+            _lift_arm = _solve_ik_arm_target(
+                ik_solver, _lift_target_pos,
+                target_orientation=ik_target_orientation,
+            )
+            if _lift_arm is None and ik_target_orientation is not None:
+                _lift_arm = _solve_ik_arm_target(ik_solver, _lift_target_pos)
+        if _lift_arm is None:
+            _lift_arm = waypoints[lift_idx][1]
+        _patched_lift = [
+            (("CLOSE", _lift_current_arm, GRIPPER_CLOSED),
+             ("LIFT", _lift_arm, GRIPPER_CLOSED)),
+        ]
+        _execute_transitions(_patched_lift)
         if stopped:
             break
 
@@ -5335,6 +5451,7 @@ def run_collection_in_process(
     episode_timeout_sec = max(0.0, float(episode_timeout_sec))
 
     os.makedirs(output_dir, exist_ok=True)
+    print(f"[COLLECT_START] code_version={_CODE_VERSION} CLOSE_HOLD_STEPS={CLOSE_HOLD_STEPS}", flush=True)
 
     rng = np.random.default_rng(seed)
     if scene_mode in {"auto", "reuse", "existing", "patch", "preserve"}:
