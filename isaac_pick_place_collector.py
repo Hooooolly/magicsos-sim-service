@@ -34,7 +34,7 @@ from lerobot_writer import SimLeRobotWriter
 
 LOG = logging.getLogger("isaac-pick-place-collector")
 
-_CODE_VERSION = "2026-02-28T06"
+_CODE_VERSION = "2026-02-28T07"
 print(f"[RELOAD] isaac_pick_place_collector loaded: version={_CODE_VERSION}", flush=True)
 
 STATE_DIM = 23
@@ -4827,10 +4827,10 @@ def _run_pick_place_episode(
                 _record_frame(arm_target=close_arm, gripper_target=_gr_target)
                 # Contact detection: compare actual finger width vs commanded target.
                 # When fingers hit an object, actual stays wide while target goes to 0.
-                # Resistance = actual_per_finger - target_per_finger (positive = blocked).
+                # Once contact confirmed, hold permanently (no re-checking).
                 _cur_joints = _to_numpy(franka.get_joint_positions())
                 _cur_gw = float(_cur_joints[7] + _cur_joints[8]) if _cur_joints.size >= 9 else -1.0
-                if _cur_gw > 0 and _cs >= _MIN_CLOSE_STEP:
+                if _stall_count < _RESIST_PATIENCE and _cur_gw > 0 and _cs >= _MIN_CLOSE_STEP:
                     _per_finger_avg = _cur_gw / 2.0
                     _residual = _per_finger_avg - _gr_target
                     if _residual > _RESIST_THRESHOLD:
