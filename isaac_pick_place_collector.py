@@ -34,7 +34,7 @@ from lerobot_writer import SimLeRobotWriter
 
 LOG = logging.getLogger("isaac-pick-place-collector")
 
-_CODE_VERSION = "2026-02-28T04"
+_CODE_VERSION = "2026-02-28T05"
 print(f"[RELOAD] isaac_pick_place_collector loaded: version={_CODE_VERSION}", flush=True)
 
 STATE_DIM = 23
@@ -4816,7 +4816,7 @@ def _run_pick_place_episode(
                 _gr_frac = min(1.0, float(_cs + 1) / float(_close_ramp_steps))
                 _gr_target = float(GRIPPER_OPEN * (1.0 - _gr_frac) + GRIPPER_CLOSED * _gr_frac)
                 # If we detected contact, hold at the stalled width instead of pushing to 0
-                if _stall_count >= _STALL_PATIENCE:
+                if _stall_count >= _RESIST_PATIENCE:
                     _gr_target = _hold_gr_target
                 arm_cmd, _ = _step_toward_joint_targets(franka, close_arm, _gr_target)
                 # PD control only — no teleport (physics_control=False).
