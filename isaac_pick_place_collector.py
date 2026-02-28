@@ -4815,7 +4815,9 @@ def _run_pick_place_episode(
                 if _stall_count >= _STALL_PATIENCE:
                     _gr_target = _hold_gr_target
                 arm_cmd, _ = _step_toward_joint_targets(franka, close_arm, _gr_target)
-                _set_joint_targets(franka, arm_cmd, _gr_target, physics_control=False)
+                # PD control only — no teleport (physics_control=False).
+                # Teleport bypasses physics and punches fingers through the ball.
+                # PD lets fingers stall on contact so stall detection works.
                 _set_joint_targets(franka, arm_cmd, _gr_target, physics_control=True)
                 world.step(render=True)
                 _record_frame(arm_target=close_arm, gripper_target=_gr_target)
