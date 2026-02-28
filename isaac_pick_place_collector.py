@@ -27,11 +27,14 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
+import importlib as _importlib
+import lerobot_writer as _lrw_mod
+_importlib.reload(_lrw_mod)
 from lerobot_writer import SimLeRobotWriter
 
 LOG = logging.getLogger("isaac-pick-place-collector")
 
-_CODE_VERSION = "2026-02-28T02"
+_CODE_VERSION = "2026-02-28T03"
 print(f"[RELOAD] isaac_pick_place_collector loaded: version={_CODE_VERSION}", flush=True)
 
 STATE_DIM = 23
@@ -4631,10 +4634,11 @@ def _run_pick_place_episode(
                     if _timeout_triggered() or (stop_event is not None and stop_event.is_set()):
                         break
                     if annotation_target is not None:
-                        _mark_annotation_pose_failed(
-                            annotation_failed_pose_cache_key,
-                            annotation_target["index"],
-                            attempt, "curobo_seg1_fail",
+                        _record_failed_annotation_target(
+                            cache_key=annotation_failed_pose_cache_key,
+                            target=annotation_target,
+                            reason="curobo_seg1_fail",
+                            attempt=attempt,
                         )
                     _alt = _select_annotation_grasp_target(
                         stage=stage,
