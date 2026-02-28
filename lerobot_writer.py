@@ -116,6 +116,7 @@ class SimLeRobotWriter:
         episode_index: int,
         length: int,
         task: str = "grasp object",
+        success: bool = False,
     ) -> None:
         """Flush video buffers for this episode and record metadata."""
         chunk = episode_index // 1000
@@ -132,6 +133,7 @@ class SimLeRobotWriter:
                 "length": length,
                 "task": task,
                 "task_index": 0,
+                "success": success,
                 "video_chunk_index": chunk,
                 "video_file_index": 0,
                 "data_chunk_index": chunk,
@@ -266,12 +268,16 @@ class SimLeRobotWriter:
             }
         features.update(self.extra_features)
 
+        successful = sum(1 for ep in self.episode_info if ep.get("success"))
+        total_ep = len(self.episode_info)
         info = {
             "codebase_version": "v3.0",
             "robot_type": self.robot_type,
             "fps": self.fps,
-            "total_episodes": len(self.episode_info),
+            "total_episodes": total_ep,
             "total_frames": self.global_frame_idx,
+            "successful_episodes": successful,
+            "failed_episodes": total_ep - successful,
             "chunks_size": 1000,
             "data_path": "data/chunk-{chunk_index:03d}/file-{file_index:03d}.parquet",
             "video_path": "videos/{video_key}/chunk-{chunk_index:03d}/episode_{episode_index:05d}.mp4",

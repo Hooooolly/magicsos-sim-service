@@ -2777,7 +2777,7 @@ def _init_curobo_motion_gen(
         use_cuda_graph=False,
         interpolation_dt=0.03,
         collision_cache={"obb": 10, "mesh": 2},
-        collision_activation_distance=0.005,
+        collision_activation_distance=0.015,
         maximum_trajectory_dt=0.25,
         n_collision_envs=1,
     )
@@ -3032,6 +3032,8 @@ def _curobo_full_approach(
     )
 
     # --- Segment 1: current -> pre-grasp (WITH object in collision world) ---
+    # For side-approach grasps, split into 2 legs: HOME → high_point → pre_grasp.
+    # This avoids the large arc near the table that causes collision failures.
     try:
         _update_curobo_world(
             curobo_state, stage, robot_prim_path,
@@ -3043,26 +3045,106 @@ def _curobo_full_approach(
         LOG.warning("Curobo full_approach: world update (seg1) failed: %s", exc)
 
     cur_q = _to_numpy(franka.get_joint_positions())[:7]
-    traj1 = _plan_curobo_segment(
-        curobo_state, cur_q, pre_grasp_pos, target_quat_world,
-        robot_base_pos, robot_base_quat,
-    )
-    if traj1 is None:
-        LOG.warning("Curobo full_approach: segment 1 (-> pre-grasp) plan failed")
-        return False
 
-    LOG.info("Curobo full_approach: segment 1 planned (%d steps)", traj1.shape[0])
-    _execute_curobo_trajectory(
-        franka, world, traj1, GRIPPER_OPEN,
-        record_fn=record_fn,
-        timeout_fn=timeout_fn,
-        stop_event=stop_event,
-    )
-    if timeout_fn() or (stop_event is not None and stop_event.is_set()):
-        return False
+    # Decide whether to split segment 1: split when high_point is meaningfully above pre_grasp.
+    _high_z = (max(float(pre_grasp_pos[2]), _table_top + 0.15)
+               if _table_bbox is not None
+               else float(pre_grasp_pos[2]) + 0.10)
+    _SPLIT_THRESHOLD = 0.03
+    _do_split = (_high_z - float(pre_grasp_pos[2])) > _SPLIT_THRESHOLD
+
+    if _do_split:
+        high_point_pos = pre_grasp_pos.copy()
+        high_point_pos[2] = _high_z
+        LOG.info(
+            "Curobo full_approach: splitting seg1 — high_point z=%.4f, pre_grasp z=%.4f",
+            _high_z, float(pre_grasp_pos[2]),
+        )
+
+        # Seg 1a: current → high_point (with full collision)
+        traj1a = _plan_curobo_segment(
+            curobo_state, cur_q, high_point_pos, target_quat_world,
+            robot_base_pos, robot_base_quat,
+        )
+        if traj1a is None:
+            LOG.warning("Curobo full_approach: segment 1a (-> high_point) plan failed")
+            return False
+        LOG.info("Curobo full_approach: segment 1a planned (%d steps)", traj1a.shape[0])
+        _execute_curobo_trajectory(
+            franka, world, traj1a, GRIPPER_OPEN,
+            record_fn=record_fn,
+            timeout_fn=timeout_fn,
+            stop_event=stop_event,
+        )
+        if timeout_fn() or (stop_event is not None and stop_event.is_set()):
+            return False
+        # Brief settle at high_point
+        _hp_final = np.clip(traj1a[-1], FRANKA_ARM_LOWER, FRANKA_ARM_UPPER)
+        for _si in range(5):
+            if timeout_fn():
+                break
+            _set_joint_targets(franka, _hp_final, GRIPPER_OPEN, physics_control=True)
+            world.step(render=True)
+            record_fn(arm_target=_hp_final, gripper_target=GRIPPER_OPEN)
+
+        # Seg 1b: high_point → pre_grasp (with collision, fallback: no table)
+        cur_q = _to_numpy(franka.get_joint_positions())[:7]
+        traj1b = _plan_curobo_segment(
+            curobo_state, cur_q, pre_grasp_pos, target_quat_world,
+            robot_base_pos, robot_base_quat,
+        )
+        if traj1b is None:
+            # Fallback: remove table collision for the short descent
+            LOG.info("Curobo full_approach: seg 1b retrying without table collision")
+            try:
+                _update_curobo_world(
+                    curobo_state, stage, robot_prim_path,
+                    table_prim_path, object_prim_path,
+                    include_object=True,
+                    include_table=False,
+                    object_world_pos=object_world_pos,
+                )
+            except Exception as exc:
+                LOG.warning("Curobo full_approach: world update (seg1b no-table) failed: %s", exc)
+            cur_q = _to_numpy(franka.get_joint_positions())[:7]
+            traj1b = _plan_curobo_segment(
+                curobo_state, cur_q, pre_grasp_pos, target_quat_world,
+                robot_base_pos, robot_base_quat,
+            )
+        if traj1b is None:
+            LOG.warning("Curobo full_approach: segment 1b (-> pre_grasp) failed even without table")
+            return False
+        LOG.info("Curobo full_approach: segment 1b planned (%d steps)", traj1b.shape[0])
+        _execute_curobo_trajectory(
+            franka, world, traj1b, GRIPPER_OPEN,
+            record_fn=record_fn,
+            timeout_fn=timeout_fn,
+            stop_event=stop_event,
+        )
+        if timeout_fn() or (stop_event is not None and stop_event.is_set()):
+            return False
+        traj1_final = np.clip(traj1b[-1], FRANKA_ARM_LOWER, FRANKA_ARM_UPPER)
+    else:
+        # Single-segment path (top-down or pre_grasp already near table height)
+        traj1 = _plan_curobo_segment(
+            curobo_state, cur_q, pre_grasp_pos, target_quat_world,
+            robot_base_pos, robot_base_quat,
+        )
+        if traj1 is None:
+            LOG.warning("Curobo full_approach: segment 1 (-> pre-grasp) plan failed")
+            return False
+        LOG.info("Curobo full_approach: segment 1 planned (%d steps)", traj1.shape[0])
+        _execute_curobo_trajectory(
+            franka, world, traj1, GRIPPER_OPEN,
+            record_fn=record_fn,
+            timeout_fn=timeout_fn,
+            stop_event=stop_event,
+        )
+        if timeout_fn() or (stop_event is not None and stop_event.is_set()):
+            return False
+        traj1_final = np.clip(traj1[-1], FRANKA_ARM_LOWER, FRANKA_ARM_UPPER)
 
     # Settle at pre-grasp: PD-based so contacts stabilize after teleport.
-    traj1_final = np.clip(traj1[-1], FRANKA_ARM_LOWER, FRANKA_ARM_UPPER)
     for settle_i in range(10):
         if timeout_fn():
             break
@@ -4540,35 +4622,102 @@ def _run_pick_place_episode(
             )
             if stopped:
                 break
-            # Top-down fallback: if annotation orientation fails, retry with vertical approach.
-            # For top-down, use the object center XY (not the annotation's side-approach
-            # panda_hand XY, which can be 10+ cm offset from the object).
+            # Annotation pose cycling + top-down fallback.
+            # If annotation orientation fails Curobo, try up to 2 alternative annotation
+            # poses before falling back to top-down vertical approach.
             if not curobo_ok and not np.allclose(down_quat, TOP_DOWN_FALLBACK_QUAT, atol=0.05):
-                LOG.info("collect: attempt %d retrying Curobo with top-down fallback orientation", attempt)
-                _obj_pos_td, _ = _get_prim_world_pose(stage, object_prim_path, usd, usd_geom)
-                td_xyz = np.array(
-                    [float(_obj_pos_td[0]), float(_obj_pos_td[1]), down_xyz[2]],
-                    dtype=np.float32,
-                )
-                td_quat = TOP_DOWN_FALLBACK_QUAT.copy()
-                curobo_ok = _curobo_full_approach(
-                    curobo_state=curobo_state,
-                    franka=franka,
-                    world=world,
-                    stage=stage,
-                    robot_prim_path=robot_prim_path,
-                    table_prim_path=table_prim_path,
-                    object_prim_path=object_prim_path,
-                    target_pos_world=td_xyz,
-                    target_quat_world=td_quat,
-                    record_fn=_record_frame,
-                    timeout_fn=_timeout_triggered,
-                    stop_event=stop_event,
-                    reach_check_fn=_curobo_reach_check,
-                    usd=usd,
-                    usd_geom=usd_geom,
-                    object_world_pos=_obj_center,
-                )
+                _REPLAN_LIMIT = 2
+                for _rp in range(_REPLAN_LIMIT):
+                    if _timeout_triggered() or (stop_event is not None and stop_event.is_set()):
+                        break
+                    if annotation_target is not None:
+                        _mark_annotation_pose_failed(
+                            annotation_failed_pose_cache_key,
+                            annotation_target["index"],
+                            attempt, "curobo_seg1_fail",
+                        )
+                    _alt = _select_annotation_grasp_target(
+                        stage=stage,
+                        object_prim_path=object_prim_path,
+                        usd=usd,
+                        usd_geom=usd_geom,
+                        candidates=annotation_candidates,
+                        attempt_index=attempt + _rp + 1,
+                        ik_solver=ik_solver,
+                        table_x_range=table_x_range,
+                        table_y_range=table_y_range,
+                        table_top_z=table_top_z,
+                        failed_pose_ids=_get_failed_annotation_pose_ids(annotation_failed_pose_cache_key),
+                        tip_mid_offset_in_hand=annotation_tip_mid_offset_hand,
+                        annotation_pose_is_tip_mid_frame=ANNOTATION_POSE_IS_TIP_MID_FRAME,
+                        local_pos_scale=annotation_local_pos_scale,
+                    )
+                    if _alt is None:
+                        LOG.info("collect: attempt %d replan %d no more annotation candidates", attempt, _rp + 1)
+                        break
+                    _alt_quat = _normalize_quat_wxyz(_alt["target_quat"])
+                    _alt_approach_dir_z = float(_quat_to_rot_wxyz(_alt_quat)[:, 2][2])
+                    _alt_tcp_z = float(_alt["target_pos"][2]) + _TCP_Z_OFFSET * _alt_approach_dir_z
+                    _alt_z = float(np.clip(_alt_tcp_z, min_z, max_z))
+                    _alt_xyz = np.array(
+                        [float(_alt["target_pos"][0]), float(_alt["target_pos"][1]), _alt_z],
+                        dtype=np.float32,
+                    )
+                    LOG.info(
+                        "collect: attempt %d replan %d with alt annotation idx=%d z=%.4f",
+                        attempt, _rp + 1, _alt["index"], _alt_z,
+                    )
+                    curobo_ok = _curobo_full_approach(
+                        curobo_state=curobo_state,
+                        franka=franka,
+                        world=world,
+                        stage=stage,
+                        robot_prim_path=robot_prim_path,
+                        table_prim_path=table_prim_path,
+                        object_prim_path=object_prim_path,
+                        target_pos_world=_alt_xyz,
+                        target_quat_world=_alt_quat,
+                        record_fn=_record_frame,
+                        timeout_fn=_timeout_triggered,
+                        stop_event=stop_event,
+                        reach_check_fn=_curobo_reach_check,
+                        usd=usd,
+                        usd_geom=usd_geom,
+                        object_world_pos=_obj_center,
+                    )
+                    if curobo_ok:
+                        annotation_target = _alt
+                        down_quat = _alt_quat
+                        break
+
+                # Top-down fallback if all annotation replans failed.
+                # Use object center XY (not annotation's side-approach panda_hand XY).
+                if not curobo_ok:
+                    LOG.info("collect: attempt %d all annotation replans failed, top-down fallback", attempt)
+                    _obj_pos_td, _ = _get_prim_world_pose(stage, object_prim_path, usd, usd_geom)
+                    td_xyz = np.array(
+                        [float(_obj_pos_td[0]), float(_obj_pos_td[1]), down_xyz[2]],
+                        dtype=np.float32,
+                    )
+                    td_quat = TOP_DOWN_FALLBACK_QUAT.copy()
+                    curobo_ok = _curobo_full_approach(
+                        curobo_state=curobo_state,
+                        franka=franka,
+                        world=world,
+                        stage=stage,
+                        robot_prim_path=robot_prim_path,
+                        table_prim_path=table_prim_path,
+                        object_prim_path=object_prim_path,
+                        target_pos_world=td_xyz,
+                        target_quat_world=td_quat,
+                        record_fn=_record_frame,
+                        timeout_fn=_timeout_triggered,
+                        stop_event=stop_event,
+                        reach_check_fn=_curobo_reach_check,
+                        usd=usd,
+                        usd_geom=usd_geom,
+                        object_world_pos=_obj_center,
+                    )
             if stopped:
                 break
             if curobo_ok:
@@ -5530,6 +5679,7 @@ def run_collection_in_process(
                     episode_index=episode,
                     length=episode_frames,
                     task=task_name,
+                    success=episode_success,
                 )
                 LOG.info(
                     "Episode %d finished with %d frames in %.2fs",
