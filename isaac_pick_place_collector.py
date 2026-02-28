@@ -34,7 +34,7 @@ from lerobot_writer import SimLeRobotWriter
 
 LOG = logging.getLogger("isaac-pick-place-collector")
 
-_CODE_VERSION = "2026-02-28T08"
+_CODE_VERSION = "2026-02-28T09"
 print(f"[RELOAD] isaac_pick_place_collector loaded: version={_CODE_VERSION}", flush=True)
 
 STATE_DIM = 23
@@ -4799,6 +4799,7 @@ def _run_pick_place_episode(
                 break
             continue
 
+        _hold_gr_target = float(GRIPPER_CLOSED)  # default; updated by contact detection
         if CLOSE_HOLD_STEPS > 0:
             print(f"[CLOSE] attempt={attempt} ENTERING close_hold steps={CLOSE_HOLD_STEPS} version={_CODE_VERSION}", flush=True)
             close_arm = _to_numpy(franka.get_joint_positions())[:7].astype(np.float32)
@@ -4807,7 +4808,6 @@ def _run_pick_place_episode(
             _RESIST_THRESHOLD = 0.004  # per-finger: 4mm gap actual→target = blocked (PD lag ~2-3mm)
             _RESIST_PATIENCE = 3  # resistance for 3 consecutive steps → confirmed contact
             _MIN_CLOSE_STEP = 15  # skip early steps; at step 15 target=0.01 < ball radius 0.014
-            _hold_gr_target = float(GRIPPER_CLOSED)
             for _cs in range(CLOSE_HOLD_STEPS):
                 if _timeout_triggered():
                     break
@@ -4917,9 +4917,10 @@ def _run_pick_place_episode(
                 _lift_arm = _solve_ik_arm_target(ik_solver, _lift_target_pos)
         if _lift_arm is None:
             _lift_arm = waypoints[lift_idx][1]
+        _lift_gripper = _hold_gr_target if _hold_gr_target > 0.001 else float(GRIPPER_CLOSED)
         _patched_lift = [
-            (("CLOSE", _lift_current_arm, GRIPPER_CLOSED),
-             ("LIFT", _lift_arm, GRIPPER_CLOSED)),
+            (("CLOSE", _lift_current_arm, _lift_gripper),
+             ("LIFT", _lift_arm, _lift_gripper)),
         ]
         _execute_transitions(_patched_lift)
         if stopped:
