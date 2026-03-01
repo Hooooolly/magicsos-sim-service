@@ -3605,7 +3605,7 @@ def _run_pick_place_episode(
     robot_prim_path: str | None = None,
     table_prim_path: str | None = None,
 ) -> tuple[int, bool, bool]:
-    world.reset()
+    _safe_world_reset(world)
     for _ in range(10):
         world.step(render=True)
     if COLLECT_VERBOSE_DEBUG:
@@ -5190,7 +5190,7 @@ def _setup_pick_place_scene_template(
     world.scene.add(camera_high)
     world.scene.add(camera_wrist)
 
-    world.reset()
+    _safe_world_reset(world)
     for _ in range(30):
         world.step(render=True)
 
@@ -5274,31 +5274,27 @@ def _setup_pick_place_scene_template(
     }
 
 
-def _purge_expired_scene_prims(world: Any, stage: Any) -> None:
-    """Remove expired prim wrappers from world.scene to prevent world.reset() crash."""
+def _safe_world_reset(world: Any) -> None:
+    """Call world.reset() with recovery from expired prim wrappers.
+
+    After clear-scene + recreate, the scene registry may hold C++ prim
+    wrappers pointing to deleted (expired) prims even though new prims
+    exist at the same paths.  On first failure we nuke the registry and
+    retry once.
+    """
     try:
+        world.reset()
+    except RuntimeError as exc:
+        if "expired" not in str(exc).lower():
+            raise
+        LOG.warning("world.reset() hit expired prim — clearing scene registry and retrying: %s", exc)
         registry = getattr(world.scene, "_scene_registry", None)
-        if registry is None:
-            return
-        for attr_name in list(vars(registry)):
-            bucket = getattr(registry, attr_name, None)
-            if not isinstance(bucket, dict):
-                continue
-            stale = []
-            for name, wrapper in bucket.items():
-                prim_paths = getattr(wrapper, "_prim_paths", None) or []
-                if hasattr(wrapper, "prim_path"):
-                    prim_paths = [wrapper.prim_path]
-                for pp in prim_paths:
-                    p = stage.GetPrimAtPath(pp)
-                    if not p or not p.IsValid():
-                        stale.append(name)
-                        break
-            for name in stale:
-                del bucket[name]
-                LOG.info("purged expired scene prim: %s", name)
-    except Exception as exc:
-        LOG.warning("_purge_expired_scene_prims failed: %s", exc)
+        if registry is not None:
+            for attr_name in list(vars(registry)):
+                bucket = getattr(registry, attr_name, None)
+                if isinstance(bucket, dict):
+                    bucket.clear()
+        world.reset()
 
 
 def _setup_pick_place_scene_reuse_or_patch(
@@ -5541,11 +5537,7 @@ def _setup_pick_place_scene_reuse_or_patch(
     world.scene.add(camera_high)
     world.scene.add(camera_wrist)
 
-    # Purge expired prims from scene registry to avoid
-    # "Accessed invalid expired prim" crash on world.reset()
-    _purge_expired_scene_prims(world, stage)
-
-    world.reset()
+    _safe_world_reset(world)
     for _ in range(20):
         world.step(render=True)
 
