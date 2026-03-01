@@ -34,7 +34,7 @@ from lerobot_writer import SimLeRobotWriter
 
 LOG = logging.getLogger("isaac-pick-place-collector")
 
-_CODE_VERSION = "2026-02-28T11"
+_CODE_VERSION = "2026-02-28T12"
 print(f"[RELOAD] isaac_pick_place_collector loaded: version={_CODE_VERSION}", flush=True)
 
 STATE_DIM = 23
@@ -4918,10 +4918,15 @@ def _run_pick_place_episode(
                  _lift_z, _lift_z - float(_lift_eef_pos[2]))
 
         # Build multi-waypoint trajectory (Cartesian → IK at each waypoint)
+        # with IK continuity enforcement: reject solutions that jump > 0.5 rad
+        # from the previous waypoint (prevents elbow-flip / config switches
+        # that cause EEF to rocket upward instead of lifting smoothly).
         _N_LIFT_WP = 5
+        _IK_CONTINUITY_THRESHOLD = 0.5  # max rad change per waypoint
         _lift_wp_joints = [_lift_current_arm.copy()]
         _lift_start_z = float(_lift_eef_pos[2])
         _lift_delta_z = _lift_z - _lift_start_z
+        _ik_rejects = 0
         for _wi in range(1, _N_LIFT_WP + 1):
             _w_alpha = float(_wi) / float(_N_LIFT_WP)
             _w_pos = _lift_eef_pos.copy()
@@ -4933,17 +4938,31 @@ def _run_pick_place_episode(
                 )
                 if _w_arm is None and ik_target_orientation is not None:
                     _w_arm = _solve_ik_arm_target(ik_solver, _w_pos)
+            # Continuity check: reject large joint jumps
+            if _w_arm is not None:
+                _prev = _lift_wp_joints[-1]
+                _max_jump = float(np.max(np.abs(_w_arm - _prev)))
+                if _max_jump > _IK_CONTINUITY_THRESHOLD:
+                    LOG.info("lift wp %d: IK jump %.3f rad > %.1f threshold, using prev",
+                             _wi, _max_jump, _IK_CONTINUITY_THRESHOLD)
+                    _w_arm = None
+                    _ik_rejects += 1
             if _w_arm is None:
                 _w_arm = _lift_wp_joints[-1].copy()
             _lift_wp_joints.append(_w_arm)
-        LOG.info("lift: %d Cartesian waypoints, delta_z=%.4f per wp",
-                 _N_LIFT_WP, _lift_delta_z / _N_LIFT_WP)
+        LOG.info("lift: %d Cartesian waypoints, delta_z=%.4f per wp, ik_rejects=%d",
+                 _N_LIFT_WP, _lift_delta_z / _N_LIFT_WP, _ik_rejects)
 
         _lift_gripper = _hold_gr_target if _hold_gr_target > 0.001 else float(GRIPPER_CLOSED)
+        # Pre-lift settle: hold current position to let grip stabilize
+        _SETTLE_STEPS = 10
+        for _ss in range(_SETTLE_STEPS):
+            _set_joint_targets(franka, _lift_current_arm, _lift_gripper, physics_control=True)
+            world.step(render=True)
+            _record_frame(arm_target=_lift_current_arm, gripper_target=_lift_gripper)
         _lift_steps = steps_per_segment
         # Piecewise-linear interpolation between consecutive IK waypoints
         _wp_step = float(_lift_steps) / float(_N_LIFT_WP)
-        _ls_global = 0
         for _ls in range(_lift_steps):
             if _timeout_triggered():
                 break
