@@ -4705,6 +4705,8 @@ def _run_pick_place_episode(
                 else TOP_DOWN_FALLBACK_QUAT.copy()
             )
 
+            _reach_check_log_count = [0]
+
             def _curobo_reach_check() -> bool:
                 m = _compute_grasp_metrics(
                     franka=franka,
@@ -4721,7 +4723,19 @@ def _run_pick_place_episode(
                     current_target=current_grasp_target,
                     tip_mid_offset_in_hand=annotation_tip_mid_offset_hand,
                 )
-                return _verify_reach_before_close(m)
+                ok = _verify_reach_before_close(m)
+                _reach_check_log_count[0] += 1
+                if _reach_check_log_count[0] <= 3 or ok:
+                    LOG.info(
+                        "reach_check: eef_d=%.4f eef_xy=%.4f tip_d=%.4f tip_xy=%.4f tip_dz=%.4f ok=%s",
+                        m.get("target_eef_distance", m.get("object_eef_distance", -1)),
+                        m.get("target_eef_xy_distance", m.get("object_eef_xy_distance", -1)),
+                        m.get("target_tip_mid_distance", m.get("object_tip_mid_distance", -1)),
+                        m.get("target_tip_mid_xy_distance", m.get("object_tip_mid_xy_distance", -1)),
+                        m.get("target_tip_mid_z_delta", m.get("object_tip_mid_z_delta", -1)),
+                        ok,
+                    )
+                return ok
 
             # Read object ground-truth position from physics for Curobo
             # collision cuboid.  Always use the live position rather than
