@@ -8,7 +8,7 @@ metadata:
     app.kubernetes.io/component: interactive-sim
     app.kubernetes.io/name: sim-interactive-1
     platform.magics.ai/embodied: "true"
-    platform.magics.ai/gpu-index: "0"
+    platform.magics.ai/gpu-index: "5"
 spec:
   hostNetwork: true
   nodeName: node1
@@ -53,15 +53,15 @@ spec:
     - name: CUDA_VISIBLE_DEVICES
       value: "0"
     - name: HEALTH_PORT
-      value: "6901"
+      value: "6905"
     - name: BRIDGE_PORT
-      value: "6801"
+      value: "6805"
     - name: WEBRTC_PORT
-      value: "49201"
+      value: "49205"
     - name: KIT_API_PORT
-      value: "8112"
+      value: "8116"
     - name: MEDIA_PORT
-      value: "48101"
+      value: "48105"
     - name: ISAACSIM_PATH
       value: /isaac-sim
     - name: PYTHONPATH
@@ -79,24 +79,24 @@ spec:
     - name: CUDA_HOME
       value: /usr/local/cuda-11.8
     ports:
-    - containerPort: 6901
-      hostPort: 6901
+    - containerPort: 6905
+      hostPort: 6905
       name: http
       protocol: TCP
-    - containerPort: 6801
-      hostPort: 6801
+    - containerPort: 6805
+      hostPort: 6805
       name: bridge-api
       protocol: TCP
-    - containerPort: 8112
-      hostPort: 8112
+    - containerPort: 8116
+      hostPort: 8116
       name: kit-api
       protocol: TCP
-    - containerPort: 49201
-      hostPort: 49201
+    - containerPort: 49205
+      hostPort: 49205
       name: webrtc-signal
       protocol: TCP
-    - containerPort: 48101
-      hostPort: 48101
+    - containerPort: 48105
+      hostPort: 48105
       name: media-udp
       protocol: UDP
     resources:
