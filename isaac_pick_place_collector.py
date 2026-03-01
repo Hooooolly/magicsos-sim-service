@@ -34,7 +34,7 @@ from lerobot_writer import SimLeRobotWriter
 
 LOG = logging.getLogger("isaac-pick-place-collector")
 
-_CODE_VERSION = "2026-03-01T25d"
+_CODE_VERSION = "2026-03-01T25e"
 print(f"[RELOAD] isaac_pick_place_collector loaded: version={_CODE_VERSION}", flush=True)
 
 STATE_DIM = 23
@@ -3042,33 +3042,23 @@ def _execute_curobo_trajectory(
     teleport: bool = True,
     steps_per_wp: int = 1,
     settle_steps: int = 20,
-    pd_tail: int = 0,
 ) -> bool:
     """Step through a Curobo-planned ``[T, 7]`` trajectory.
 
     When *teleport=True* (default), directly sets joint positions each waypoint
     (fast, ignores physics collision).  When *teleport=False*, uses PD control
     only — slower but respects physics collision (prevents table clipping).
-
-    *pd_tail* — if >0 and teleport=True, the last *pd_tail* waypoints use
-    PD-only (no teleport).  This prevents finger overlap with the ball
-    during the final approach while keeping the bulk of the trajectory fast.
     """
-    n_wp = trajectory.shape[0]
-    pd_start = max(0, n_wp - pd_tail) if teleport and pd_tail > 0 else n_wp
-    for i in range(n_wp):
+    for i in range(trajectory.shape[0]):
         if timeout_fn():
             return False
         if stop_event is not None and stop_event.is_set():
             return False
         arm = np.clip(trajectory[i], FRANKA_ARM_LOWER, FRANKA_ARM_UPPER)
-        use_teleport = teleport and i < pd_start
-        if use_teleport:
+        if teleport:
             _set_joint_targets(franka, arm, gripper_target, physics_control=False)
         _set_joint_targets(franka, arm, gripper_target, physics_control=True)
-        # PD tail steps need more physics steps per waypoint for tracking
-        n_sub = steps_per_wp if use_teleport else max(steps_per_wp, 8)
-        for _s in range(n_sub):
+        for _s in range(steps_per_wp):
             world.step(render=True)
         record_fn(arm_target=arm, gripper_target=gripper_target)
 
@@ -3304,9 +3294,6 @@ def _curobo_full_approach(
         return False
 
     LOG.info("Curobo full_approach: segment 2 planned (%d steps)", traj2.shape[0])
-    # Hybrid approach: teleport most of the trajectory for speed, but use
-    # PD-only for the last 8 waypoints (~3cm) so fingers don't physically
-    # overlap with the ball and push it.
     reached = _execute_curobo_trajectory(
         franka, world, traj2, GRIPPER_OPEN,
         record_fn=record_fn,
@@ -3316,7 +3303,6 @@ def _curobo_full_approach(
         early_halt_after=4,
         teleport=True,
         settle_steps=30,
-        pd_tail=8,
     )
     return reached
 
@@ -4988,6 +4974,30 @@ def _run_pick_place_episode(
                 cache_key=annotation_failed_pose_cache_key,
                 target=current_grasp_target,
                 reason="reach_verify_failed",
+                attempt=attempt,
+            )
+            lift_arm = waypoints[lift_idx][1]
+            _prepare_replan_from_current(lift_arm=lift_arm)
+            if stopped:
+                break
+            continue
+
+        # Ball displacement check: if the ball moved significantly during
+        # teleport approach, the close will fail (gripper closes on air).
+        # Skip directly to the next annotation to save time.
+        _obj_now, _ = _get_prim_world_pose(stage, object_prim_path, usd, usd_geom)
+        _ball_drift = float(np.linalg.norm(_obj_now[:3] - _obj_center))
+        _BALL_DRIFT_THRESHOLD = 0.05  # 5cm
+        if _ball_drift > _BALL_DRIFT_THRESHOLD:
+            LOG.warning(
+                "collect: attempt %d ball displaced %.3fm (>%.2f) during approach, "
+                "skipping close",
+                attempt, _ball_drift, _BALL_DRIFT_THRESHOLD,
+            )
+            _record_failed_annotation_target(
+                cache_key=annotation_failed_pose_cache_key,
+                target=current_grasp_target,
+                reason="ball_displaced",
                 attempt=attempt,
             )
             lift_arm = waypoints[lift_idx][1]
