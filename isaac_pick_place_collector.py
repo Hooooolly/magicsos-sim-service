@@ -34,7 +34,7 @@ from lerobot_writer import SimLeRobotWriter
 
 LOG = logging.getLogger("isaac-pick-place-collector")
 
-_CODE_VERSION = "2026-03-01T25f"
+_CODE_VERSION = "2026-03-01T25g"
 print(f"[RELOAD] isaac_pick_place_collector loaded: version={_CODE_VERSION}", flush=True)
 
 STATE_DIM = 23
@@ -152,6 +152,7 @@ VERIFY_CLOSE_MIN_GRIPPER_WIDTH = 0.0025
 VERIFY_CLOSE_MAX_GRIPPER_WIDTH = 0.065
 VERIFY_CLOSE_MAX_OBJECT_EEF_DISTANCE = 0.25
 VERIFY_CLOSE_MAX_OBJECT_EEF_XY_DISTANCE = 0.08
+VERIFY_CLOSE_MAX_OBJECT_TIP_MID_XY_DISTANCE = 0.06
 VERIFY_RETRIEVAL_MIN_LIFT = 0.008
 VERIFY_RETRIEVAL_MAX_OBJECT_EEF_DISTANCE = 0.30
 ROBOT_REACH_RADIUS_X = 0.75
@@ -3651,12 +3652,21 @@ def _verify_after_close(metrics: dict[str, float]) -> bool:
         object_key="object_eef_xy_distance",
         target_key="target_eef_xy_distance",
     )
+    # For angled grasps the hand center (panda_hand) is offset from
+    # the ball in XY, but the fingertip midpoint stays close.
+    tip_mid_xy = _metric_min_object_target(
+        metrics,
+        object_key="object_tip_mid_xy_distance",
+        target_key="target_tip_mid_xy_distance",
+    )
+    xy_ok = (eef_xy <= VERIFY_CLOSE_MAX_OBJECT_EEF_XY_DISTANCE
+             or tip_mid_xy <= VERIFY_CLOSE_MAX_OBJECT_TIP_MID_XY_DISTANCE)
     gw = metrics.get("gripper_width", 0.0)
     return bool(
         gw >= VERIFY_CLOSE_MIN_GRIPPER_WIDTH
         and gw <= VERIFY_CLOSE_MAX_GRIPPER_WIDTH
         and eef_dist <= VERIFY_CLOSE_MAX_OBJECT_EEF_DISTANCE
-        and eef_xy <= VERIFY_CLOSE_MAX_OBJECT_EEF_XY_DISTANCE
+        and xy_ok
     )
 
 
@@ -5145,7 +5155,7 @@ def _run_pick_place_episode(
         if not close_ok:
             LOG.warning(
                 "collect: grasp retry %d/%d close_verify failed metrics=%s "
-                "thresholds={width>=%.4f,width<=%.4f,eef<=%.3f,eef_xy<=%.3f}",
+                "thresholds={width>=%.4f,width<=%.4f,eef<=%.3f,eef_xy<=%.3f,tip_xy<=%.3f}",
                 attempt,
                 GRASP_MAX_ATTEMPTS,
                 close_metrics,
@@ -5153,6 +5163,7 @@ def _run_pick_place_episode(
                 VERIFY_CLOSE_MAX_GRIPPER_WIDTH,
                 VERIFY_CLOSE_MAX_OBJECT_EEF_DISTANCE,
                 VERIFY_CLOSE_MAX_OBJECT_EEF_XY_DISTANCE,
+                VERIFY_CLOSE_MAX_OBJECT_TIP_MID_XY_DISTANCE,
             )
             _record_failed_annotation_target(
                 cache_key=annotation_failed_pose_cache_key,
