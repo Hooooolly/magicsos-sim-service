@@ -4824,10 +4824,15 @@ def _run_pick_place_episode(
                 # PD lets fingers stall on contact so stall detection works.
                 _set_joint_targets(franka, arm_cmd, _gr_target, physics_control=True)
                 world.step(render=True)
-                # Log ball ground truth every 5 steps
+                # Log ball + fingertip ground truth every 5 steps
                 if _cs % 5 == 0:
                     _ball_pos, _ = _get_prim_world_pose(stage, object_prim_path, usd, usd_geom)
-                    print(f"[CLOSE] step={_cs} ball_xyz=({_ball_pos[0]:.4f},{_ball_pos[1]:.4f},{_ball_pos[2]:.4f}) gr_target={_gr_target:.4f}", flush=True)
+                    _lf_pos, _lf_q = _get_prim_world_pose(stage, finger_left_prim_path, usd, usd_geom)
+                    _rf_pos, _rf_q = _get_prim_world_pose(stage, finger_right_prim_path, usd, usd_geom)
+                    _lt = _lf_pos[:3] + _quat_to_rot_wxyz(_lf_q)[:, 2] * 0.046
+                    _rt = _rf_pos[:3] + _quat_to_rot_wxyz(_rf_q)[:, 2] * 0.046
+                    _tm = 0.5 * (_lt + _rt)
+                    print(f"[CLOSE] step={_cs} ball=({_ball_pos[0]:.4f},{_ball_pos[1]:.4f},{_ball_pos[2]:.4f}) gr={_gr_target:.4f} Ltip=({_lt[0]:.4f},{_lt[1]:.4f},{_lt[2]:.4f}) Rtip=({_rt[0]:.4f},{_rt[1]:.4f},{_rt[2]:.4f}) mid=({_tm[0]:.4f},{_tm[1]:.4f},{_tm[2]:.4f})", flush=True)
                 _record_frame(arm_target=close_arm, gripper_target=_gr_target)
                 # Contact detection: compare actual finger width vs commanded target.
                 # When fingers hit an object, actual stays wide while target goes to 0.
@@ -4982,7 +4987,12 @@ def _run_pick_place_episode(
                 _lgw = float(_lj[7] + _lj[8]) if _lj.size >= 9 else -1.0
                 _eef_pos, _ = _get_eef_pose(stage, eef_prim_path, get_prim_at_path, usd, usd_geom)
                 _ti = int(float(_ls) / float(_lift_steps) * len(_lift_traj)) if _lift_traj is not None and len(_lift_traj) > 1 else -1
-                print(f"[LIFT] step={_ls}/{_lift_steps} ti={_ti} ball_z={_lb_pos[2]:.4f} eef_z={_eef_pos[2]:.4f} gw={_lgw:.4f} f7={float(_lj[7]):.4f} f8={float(_lj[8]):.4f} gr_cmd={_lift_gr_cmd:.4f}", flush=True)
+                _lf_pos, _lf_q = _get_prim_world_pose(stage, finger_left_prim_path, usd, usd_geom)
+                _rf_pos, _rf_q = _get_prim_world_pose(stage, finger_right_prim_path, usd, usd_geom)
+                _lt = _lf_pos[:3] + _quat_to_rot_wxyz(_lf_q)[:, 2] * 0.046
+                _rt = _rf_pos[:3] + _quat_to_rot_wxyz(_rf_q)[:, 2] * 0.046
+                _tm = 0.5 * (_lt + _rt)
+                print(f"[LIFT] step={_ls}/{_lift_steps} ti={_ti} ball=({_lb_pos[0]:.4f},{_lb_pos[1]:.4f},{_lb_pos[2]:.4f}) eef_z={_eef_pos[2]:.4f} gw={_lgw:.4f} gr_cmd={_lift_gr_cmd:.4f} Ltip=({_lt[0]:.4f},{_lt[1]:.4f},{_lt[2]:.4f}) Rtip=({_rt[0]:.4f},{_rt[1]:.4f},{_rt[2]:.4f}) mid=({_tm[0]:.4f},{_tm[1]:.4f},{_tm[2]:.4f})", flush=True)
         _ball_pos_after_lift, _ = _get_prim_world_pose(stage, object_prim_path, usd, usd_geom)
         print(f"[LIFT] final ball_xyz=({_ball_pos_after_lift[0]:.4f},{_ball_pos_after_lift[1]:.4f},{_ball_pos_after_lift[2]:.4f}) grip_target={_lift_gripper:.4f}", flush=True)
         if stopped:
