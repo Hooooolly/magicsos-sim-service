@@ -34,7 +34,7 @@ from lerobot_writer import SimLeRobotWriter
 
 LOG = logging.getLogger("isaac-pick-place-collector")
 
-_CODE_VERSION = "2026-03-01T25e"
+_CODE_VERSION = "2026-03-01T25f"
 print(f"[RELOAD] isaac_pick_place_collector loaded: version={_CODE_VERSION}", flush=True)
 
 STATE_DIM = 23
@@ -3294,29 +3294,28 @@ def _curobo_full_approach(
         return False
 
     LOG.info("Curobo full_approach: segment 2 planned (%d steps)", traj2.shape[0])
-    # Disable PhysX collision on the ball during seg2 teleport.  Teleport
-    # moves the fingers through the ball's volume; with collision enabled,
-    # the physics engine pushes the ball away.  Disabling collision lets
-    # the fingers pass through cleanly, then we re-enable before close.
-    _obj_collision_disabled = False
+    # Make ball kinematic during seg2 teleport.  Teleport moves the
+    # fingers through the ball; with a dynamic body, PhysX resolves the
+    # overlap by pushing the ball away.  Kinematic bodies ignore contact
+    # forces — ball stays in place while fingers pass through.  Collision
+    # stays enabled so ball keeps resting on the table.
+    _obj_was_kinematic = False
+    _rb_prim = None
     if object_prim_path:
         try:
             from pxr import UsdPhysics
-            _obj_prim = stage.GetPrimAtPath(object_prim_path)
-            if _obj_prim and _obj_prim.IsValid():
-                # Check child prims too (Body sub-prim may hold collision)
-                _collision_prims = []
-                for _cp in [_obj_prim] + list(_obj_prim.GetChildren()):
-                    if _cp.HasAPI(UsdPhysics.CollisionAPI):
-                        _collision_prims.append(_cp)
-                for _cp in _collision_prims:
-                    _col_api = UsdPhysics.CollisionAPI(_cp)
-                    _col_api.GetCollisionEnabledAttr().Set(False)
-                _obj_collision_disabled = len(_collision_prims) > 0
-                if _obj_collision_disabled:
-                    LOG.info("Curobo full_approach: disabled ball collision on %d prims", len(_collision_prims))
+            for _path in [object_prim_path, object_prim_path + "/Body"]:
+                _p = stage.GetPrimAtPath(_path)
+                if _p and _p.IsValid() and _p.HasAPI(UsdPhysics.RigidBodyAPI):
+                    _rb_api = UsdPhysics.RigidBodyAPI(_p)
+                    _ke_attr = _rb_api.GetKinematicEnabledAttr()
+                    _obj_was_kinematic = _ke_attr.Get() if _ke_attr.HasValue() else False
+                    _ke_attr.Set(True)
+                    _rb_prim = _p
+                    LOG.info("Curobo full_approach: set ball kinematic on %s", _path)
+                    break
         except Exception as exc:
-            LOG.warning("Curobo full_approach: failed to disable ball collision: %s", exc)
+            LOG.warning("Curobo full_approach: failed to set ball kinematic: %s", exc)
 
     reached = _execute_curobo_trajectory(
         franka, world, traj2, GRIPPER_OPEN,
@@ -3329,15 +3328,14 @@ def _curobo_full_approach(
         settle_steps=30,
     )
 
-    # Re-enable collision before close gate
-    if _obj_collision_disabled:
+    # Restore ball to dynamic before close gate
+    if _rb_prim is not None:
         try:
-            for _cp in _collision_prims:
-                _col_api = UsdPhysics.CollisionAPI(_cp)
-                _col_api.GetCollisionEnabledAttr().Set(True)
-            LOG.info("Curobo full_approach: re-enabled ball collision")
+            _rb_api = UsdPhysics.RigidBodyAPI(_rb_prim)
+            _rb_api.GetKinematicEnabledAttr().Set(_obj_was_kinematic)
+            LOG.info("Curobo full_approach: restored ball dynamic (kinematic=%s)", _obj_was_kinematic)
         except Exception as exc:
-            LOG.warning("Curobo full_approach: failed to re-enable ball collision: %s", exc)
+            LOG.warning("Curobo full_approach: failed to restore ball dynamic: %s", exc)
 
     return reached
 
