@@ -34,7 +34,7 @@ from lerobot_writer import SimLeRobotWriter
 
 LOG = logging.getLogger("isaac-pick-place-collector")
 
-_CODE_VERSION = "2026-02-28T13"
+_CODE_VERSION = "2026-02-28T14"
 print(f"[RELOAD] isaac_pick_place_collector loaded: version={_CODE_VERSION}", flush=True)
 
 STATE_DIM = 23
@@ -4931,12 +4931,16 @@ def _run_pick_place_episode(
         _robot_base_pos, _robot_base_quat = _get_prim_world_pose(
             stage, robot_prim_path, usd, usd_geom,
         )
-        # Remove object from collision world during lift (object is grasped)
+        # Remove object AND table from collision world during lift.
+        # Object is grasped.  Table must be removed because fingers at
+        # grasp position are at table surface → INVALID_START_STATE_WORLD_COLLISION.
+        # (Same as Curobo segment 2 does for the approach descent.)
         try:
             _update_curobo_world(
                 curobo_state, stage, robot_prim_path,
                 table_prim_path, object_prim_path,
                 include_object=False,
+                include_table=False,
             )
         except Exception:
             pass
