@@ -34,7 +34,7 @@ from lerobot_writer import SimLeRobotWriter
 
 LOG = logging.getLogger("isaac-pick-place-collector")
 
-_CODE_VERSION = "2026-03-01T25"
+_CODE_VERSION = "2026-03-01T25b"
 print(f"[RELOAD] isaac_pick_place_collector loaded: version={_CODE_VERSION}", flush=True)
 
 STATE_DIM = 23
@@ -3302,7 +3302,7 @@ def _curobo_full_approach(
         reach_check_fn=reach_check_fn,
         early_halt_after=4,
         teleport=False,   # PD-only: prevents overlap → ball displacement
-        steps_per_wp=3,   # enough physics steps for PD tracking each waypoint
+        steps_per_wp=10,  # PD needs ~10 steps to track each waypoint
         settle_steps=30,
     )
     return reached
