@@ -4911,7 +4911,17 @@ def _run_pick_place_episode(
             stage, eef_prim_path, get_prim_at_path, usd, usd_geom,
         )
         _lift_target_pos = _lift_eef_pos.copy()
-        _lift_target_pos[2] = float(z_targets["pick_approach_z"])
+        # Lift must go ABOVE current hand position.  pick_approach_z is
+        # a fingertip-level height, but the IK target frame is panda_hand
+        # which sits ~10cm above the fingertips.  Use the higher of:
+        #   (a) pick_approach_z  (pre-grasp approach height)
+        #   (b) current_hand_z + 5cm  (guaranteed upward lift)
+        _lift_z = max(float(z_targets["pick_approach_z"]),
+                      float(_lift_eef_pos[2]) + 0.05)
+        _lift_target_pos[2] = _lift_z
+        LOG.info("lift target: pick_approach_z=%.4f eef_z=%.4f → lift_z=%.4f (delta=+%.4f)",
+                 float(z_targets["pick_approach_z"]), float(_lift_eef_pos[2]),
+                 _lift_z, _lift_z - float(_lift_eef_pos[2]))
         _lift_arm = None
         if ik_solver is not None:
             _lift_arm = _solve_ik_arm_target(
