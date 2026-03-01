@@ -4934,11 +4934,13 @@ def _run_pick_place_episode(
             _set_joint_targets(franka, _lift_arm_cmd, _lift_gr_cmd, physics_control=True)
             world.step(render=True)
             _record_frame(arm_target=_lift_arm_t, gripper_target=_lift_gripper)
-            if _ls % 40 == 0 or _ls == _lift_steps - 1:
+            _log_this_step = (_ls < 10) or (_ls % 20 == 0) or (_ls == _lift_steps - 1)
+            if _log_this_step:
                 _lb_pos, _ = _get_prim_world_pose(stage, object_prim_path, usd, usd_geom)
                 _lj = _to_numpy(franka.get_joint_positions())
                 _lgw = float(_lj[7] + _lj[8]) if _lj.size >= 9 else -1.0
-                print(f"[LIFT] step={_ls}/{_lift_steps} ball_z={_lb_pos[2]:.4f} gw={_lgw:.4f} gr_cmd={_lift_gr_cmd:.4f}", flush=True)
+                _eef_pos, _ = _get_eef_pose(stage, eef_prim_path, get_prim_at_path, usd, usd_geom)
+                print(f"[LIFT] step={_ls}/{_lift_steps} ball_z={_lb_pos[2]:.4f} eef_z={_eef_pos[2]:.4f} gw={_lgw:.4f} f7={float(_lj[7]):.4f} f8={float(_lj[8]):.4f} gr_cmd={_lift_gr_cmd:.4f}", flush=True)
         _ball_pos_after_lift, _ = _get_prim_world_pose(stage, object_prim_path, usd, usd_geom)
         print(f"[LIFT] final ball_xyz=({_ball_pos_after_lift[0]:.4f},{_ball_pos_after_lift[1]:.4f},{_ball_pos_after_lift[2]:.4f}) grip_target={_lift_gripper:.4f}", flush=True)
         if stopped:
@@ -5407,16 +5409,29 @@ def _apply_finger_friction(stage: Any, robot_prim_path: str,
                 )
                 bound += 1
 
-        # Also apply friction to the grasped object (both surfaces matter).
+        # Also apply friction to the grasped object — but only if it has
+        # NO existing physics material binding (user may import objects
+        # with their own materials that we should not override).
         if object_prim_path:
             obj_prim = stage.GetPrimAtPath(object_prim_path)
             if obj_prim and obj_prim.IsValid():
-                for p in [obj_prim] + list(obj_prim.GetAllChildren()):
-                    UsdShade.MaterialBindingAPI.Apply(p)
-                    UsdShade.MaterialBindingAPI(p).Bind(
-                        mat_shade, UsdShade.Tokens.weakerThanDescendants, "physics"
-                    )
-                    bound += 1
+                _has_existing = False
+                try:
+                    _bind_api = UsdShade.MaterialBindingAPI(obj_prim)
+                    _existing = _bind_api.GetDirectBinding("physics")
+                    if _existing and _existing.GetMaterial():
+                        _has_existing = True
+                except Exception:
+                    pass
+                if _has_existing:
+                    LOG.info("object already has physics material — skipping friction override")
+                else:
+                    for p in [obj_prim] + list(obj_prim.GetAllChildren()):
+                        UsdShade.MaterialBindingAPI.Apply(p)
+                        UsdShade.MaterialBindingAPI(p).Bind(
+                            mat_shade, UsdShade.Tokens.weakerThanDescendants, "physics"
+                        )
+                        bound += 1
                 # Log object mass for diagnostics
                 if obj_prim.HasAPI(UsdPhysics.MassAPI):
                     mass_api = UsdPhysics.MassAPI(obj_prim)
