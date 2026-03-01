@@ -4824,6 +4824,10 @@ def _run_pick_place_episode(
                 # PD lets fingers stall on contact so stall detection works.
                 _set_joint_targets(franka, arm_cmd, _gr_target, physics_control=True)
                 world.step(render=True)
+                # Log ball ground truth every 5 steps
+                if _cs % 5 == 0:
+                    _ball_pos, _ = _get_prim_world_pose(stage, object_prim_path, usd, usd_geom)
+                    print(f"[CLOSE] step={_cs} ball_xyz=({_ball_pos[0]:.4f},{_ball_pos[1]:.4f},{_ball_pos[2]:.4f}) gr_target={_gr_target:.4f}", flush=True)
                 _record_frame(arm_target=close_arm, gripper_target=_gr_target)
                 # Contact detection: compare actual finger width vs commanded target.
                 # When fingers hit an object, actual stays wide while target goes to 0.
@@ -4836,7 +4840,7 @@ def _run_pick_place_episode(
                     if _residual > _RESIST_THRESHOLD:
                         _stall_count += 1
                         if _stall_count == _RESIST_PATIENCE:
-                            _SQUEEZE_OFFSET = 0.002  # 2mm inward from contact → grip force
+                            _SQUEEZE_OFFSET = 0.005  # 5mm inward from contact → firm grip force
                             _hold_gr_target = max(_per_finger_avg - _SQUEEZE_OFFSET, 0.0)
                             print(f"[CLOSE] attempt={attempt} contact at step={_cs} total_w={_cur_gw:.4f} per_finger={_per_finger_avg:.4f} residual={_residual:.4f} → hold={_hold_gr_target:.4f} (squeeze={_SQUEEZE_OFFSET})", flush=True)
                     else:
@@ -4924,6 +4928,8 @@ def _run_pick_place_episode(
              ("LIFT", _lift_arm, _lift_gripper)),
         ]
         _execute_transitions(_patched_lift)
+        _ball_pos_after_lift, _ = _get_prim_world_pose(stage, object_prim_path, usd, usd_geom)
+        print(f"[LIFT] ball_xyz=({_ball_pos_after_lift[0]:.4f},{_ball_pos_after_lift[1]:.4f},{_ball_pos_after_lift[2]:.4f}) grip_target={_lift_gripper:.4f}", flush=True)
         if stopped:
             break
 
@@ -5297,6 +5303,44 @@ def _safe_world_reset(world: Any) -> None:
         world.reset()
 
 
+def _apply_finger_friction(stage: Any, robot_prim_path: str) -> None:
+    """Apply high-friction physics material to Franka finger pads for stable grasping."""
+    from pxr import UsdShade, UsdPhysics, Gf
+    try:
+        mat_path = f"{robot_prim_path}/GripFrictionMaterial"
+        mat_prim = stage.GetPrimAtPath(mat_path)
+        if not mat_prim or not mat_prim.IsValid():
+            UsdShade.Material.Define(stage, mat_path)
+            mat_prim = stage.GetPrimAtPath(mat_path)
+        # Apply PhysicsMaterialAPI
+        if not mat_prim.HasAPI(UsdPhysics.MaterialAPI):
+            UsdPhysics.MaterialAPI.Apply(mat_prim)
+        phys_mat = UsdPhysics.MaterialAPI(mat_prim)
+        phys_mat.CreateStaticFrictionAttr().Set(2.0)
+        phys_mat.CreateDynamicFrictionAttr().Set(2.0)
+        phys_mat.CreateRestitutionAttr().Set(0.0)
+        # Bind to finger pad collision meshes
+        mat_shade = UsdShade.Material(mat_prim)
+        finger_pads = [
+            f"{robot_prim_path}/panda_leftfinger/collisions",
+            f"{robot_prim_path}/panda_rightfinger/collisions",
+            f"{robot_prim_path}/panda_leftfinger",
+            f"{robot_prim_path}/panda_rightfinger",
+        ]
+        bound = 0
+        for fp in finger_pads:
+            fp_prim = stage.GetPrimAtPath(fp)
+            if fp_prim and fp_prim.IsValid():
+                UsdShade.MaterialBindingAPI.Apply(fp_prim)
+                UsdShade.MaterialBindingAPI(fp_prim).Bind(
+                    mat_shade, UsdShade.Tokens.weakerThanDescendants, "physics"
+                )
+                bound += 1
+        LOG.info("finger friction: static=2.0 dynamic=2.0 bound to %d prims", bound)
+    except Exception as exc:
+        LOG.warning("_apply_finger_friction failed: %s", exc)
+
+
 def _setup_pick_place_scene_reuse_or_patch(
     world: Any,
     simulation_app: Any,
@@ -5380,6 +5424,7 @@ def _setup_pick_place_scene_reuse_or_patch(
     articulation_prim_path = _resolve_articulation_root_prim_path(stage, robot_prim_path, UsdPhysics)
     if not articulation_prim_path:
         raise RuntimeError(f"collect cannot find articulation root under {robot_prim_path}")
+    _apply_finger_friction(stage, robot_prim_path)
 
     table_x_range, table_y_range, table_top_z, work_center = _infer_table_workspace(
         stage,
