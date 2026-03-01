@@ -312,7 +312,12 @@ def _create_world(*, add_ground_plane: bool):
 
 
 def _recreate_world_for_open_stage(reason: str) -> bool:
-    """Rebuild World after open_stage(), which invalidates prior World handles."""
+    """Rebuild World after open_stage(), which invalidates prior World handles.
+
+    World is a singleton (inherits SimulationContext). Calling World()
+    returns the *same* instance, so we must manually clear the scene
+    registry to drop expired prim wrappers left over from clear-scene.
+    """
     global world, PHYSICS_RUNNING
     try:
         if world is not None:
@@ -320,6 +325,17 @@ def _recreate_world_for_open_stage(reason: str) -> bool:
                 world.stop()
             except Exception:
                 pass
+            # World() is singleton — clear stale scene registry before "recreate"
+            try:
+                registry = getattr(world.scene, "_scene_registry", None)
+                if registry is not None:
+                    for attr_name in list(vars(registry)):
+                        bucket = getattr(registry, attr_name, None)
+                        if isinstance(bucket, dict):
+                            bucket.clear()
+                    print(f"[world] cleared stale scene registry for {reason}")
+            except Exception as _reg_exc:
+                print(f"[world] WARNING: failed to clear scene registry: {_reg_exc}")
         world = _create_world(add_ground_plane=False)
         PHYSICS_RUNNING = False
         if isinstance(globals().get("_state"), dict):
