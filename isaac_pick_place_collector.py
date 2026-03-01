@@ -5365,40 +5365,68 @@ def _configure_finger_drives(stage: Any, robot_prim_path: str,
         LOG.info("finger drive %s AFTER: kp=%.0f kd=%.0f maxF=%.0f", jname, stiffness, damping, max_force)
 
 
-def _apply_finger_friction(stage: Any, robot_prim_path: str) -> None:
-    """Apply high-friction physics material to Franka finger pads for stable grasping."""
-    from pxr import UsdShade, UsdPhysics, Gf
+def _apply_finger_friction(stage: Any, robot_prim_path: str,
+                            object_prim_path: str | None = None) -> None:
+    """Apply high-friction physics material to finger collision shapes AND object.
+
+    Binds material to every descendant of the finger link prims that has
+    a CollisionAPI, ensuring PhysX actually sees the friction on the
+    contact surfaces (not just the parent link).  Also applies friction
+    to the grasped object for reliable bidirectional grip.
+    """
+    from pxr import UsdShade, UsdPhysics
     try:
         mat_path = f"{robot_prim_path}/GripFrictionMaterial"
         mat_prim = stage.GetPrimAtPath(mat_path)
         if not mat_prim or not mat_prim.IsValid():
             UsdShade.Material.Define(stage, mat_path)
             mat_prim = stage.GetPrimAtPath(mat_path)
-        # Apply PhysicsMaterialAPI
         if not mat_prim.HasAPI(UsdPhysics.MaterialAPI):
             UsdPhysics.MaterialAPI.Apply(mat_prim)
         phys_mat = UsdPhysics.MaterialAPI(mat_prim)
         phys_mat.CreateStaticFrictionAttr().Set(2.0)
         phys_mat.CreateDynamicFrictionAttr().Set(2.0)
         phys_mat.CreateRestitutionAttr().Set(0.0)
-        # Bind to finger pad collision meshes
         mat_shade = UsdShade.Material(mat_prim)
-        finger_pads = [
-            f"{robot_prim_path}/panda_leftfinger/collisions",
-            f"{robot_prim_path}/panda_rightfinger/collisions",
+
+        # Find ALL collision-shaped descendants of left/right finger prims.
+        finger_roots = [
             f"{robot_prim_path}/panda_leftfinger",
             f"{robot_prim_path}/panda_rightfinger",
         ]
         bound = 0
-        for fp in finger_pads:
-            fp_prim = stage.GetPrimAtPath(fp)
-            if fp_prim and fp_prim.IsValid():
-                UsdShade.MaterialBindingAPI.Apply(fp_prim)
-                UsdShade.MaterialBindingAPI(fp_prim).Bind(
+        for fr in finger_roots:
+            fr_prim = stage.GetPrimAtPath(fr)
+            if not fr_prim or not fr_prim.IsValid():
+                continue
+            # Bind to the finger link itself + all descendants
+            for p in [fr_prim] + list(fr_prim.GetAllChildren()):
+                UsdShade.MaterialBindingAPI.Apply(p)
+                UsdShade.MaterialBindingAPI(p).Bind(
                     mat_shade, UsdShade.Tokens.weakerThanDescendants, "physics"
                 )
                 bound += 1
-        LOG.info("finger friction: static=2.0 dynamic=2.0 bound to %d prims", bound)
+
+        # Also apply friction to the grasped object (both surfaces matter).
+        if object_prim_path:
+            obj_prim = stage.GetPrimAtPath(object_prim_path)
+            if obj_prim and obj_prim.IsValid():
+                for p in [obj_prim] + list(obj_prim.GetAllChildren()):
+                    UsdShade.MaterialBindingAPI.Apply(p)
+                    UsdShade.MaterialBindingAPI(p).Bind(
+                        mat_shade, UsdShade.Tokens.weakerThanDescendants, "physics"
+                    )
+                    bound += 1
+                # Log object mass for diagnostics
+                if obj_prim.HasAPI(UsdPhysics.MassAPI):
+                    mass_api = UsdPhysics.MassAPI(obj_prim)
+                    mass_val = mass_api.GetMassAttr().Get() if mass_api.GetMassAttr() else "N/A"
+                    density_val = mass_api.GetDensityAttr().Get() if mass_api.GetDensityAttr() else "N/A"
+                    LOG.info("object mass=%s density=%s path=%s", mass_val, density_val, object_prim_path)
+                else:
+                    LOG.info("object has no MassAPI, path=%s", object_prim_path)
+
+        LOG.info("finger+object friction: static=2.0 dynamic=2.0 bound to %d prims", bound)
     except Exception as exc:
         LOG.warning("_apply_finger_friction failed: %s", exc)
 
@@ -5486,7 +5514,7 @@ def _setup_pick_place_scene_reuse_or_patch(
     articulation_prim_path = _resolve_articulation_root_prim_path(stage, robot_prim_path, UsdPhysics)
     if not articulation_prim_path:
         raise RuntimeError(f"collect cannot find articulation root under {robot_prim_path}")
-    _apply_finger_friction(stage, robot_prim_path)
+    _apply_finger_friction(stage, robot_prim_path, object_prim_path=None)  # object resolved below
     _configure_finger_drives(stage, robot_prim_path)
 
     table_x_range, table_y_range, table_top_z, work_center = _infer_table_workspace(
@@ -5572,6 +5600,9 @@ def _setup_pick_place_scene_reuse_or_patch(
                     UsdPhysics.MeshCollisionAPI.Apply(p)
             except Exception:
                 pass
+
+    # Now that object is resolved, apply friction to it (and re-bind fingers with children).
+    _apply_finger_friction(stage, robot_prim_path, object_prim_path=object_prim_path)
 
     table_x_range, table_y_range, table_top_z, work_center = _infer_table_workspace(
         stage,
