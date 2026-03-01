@@ -34,7 +34,7 @@ from lerobot_writer import SimLeRobotWriter
 
 LOG = logging.getLogger("isaac-pick-place-collector")
 
-_CODE_VERSION = "2026-02-28T17"
+_CODE_VERSION = "2026-03-01T18"
 print(f"[RELOAD] isaac_pick_place_collector loaded: version={_CODE_VERSION}", flush=True)
 
 STATE_DIM = 23
@@ -716,6 +716,7 @@ def _load_grasp_pose_candidates(annotation_path: Path) -> tuple[list[dict[str, A
         "quat_order": quat_order,
         "position_scale_hint": float(pos_scale_hint),
         "source": str(metadata.get("source", "")),
+        "object_type": str(data.get("type", "")).strip().lower(),
     }
 
     def _append_pose(label: str, pose: Any, source: str) -> None:
@@ -1053,6 +1054,7 @@ def _select_annotation_grasp_target(
     tip_mid_offset_in_hand: np.ndarray | None = None,
     annotation_pose_is_tip_mid_frame: bool = ANNOTATION_POSE_IS_TIP_MID_FRAME,
     local_pos_scale: float = 1.0,
+    align_tip_mid_to_center: bool = False,
 ) -> Optional[dict[str, Any]]:
     if not candidates:
         return None
@@ -1064,20 +1066,35 @@ def _select_annotation_grasp_target(
             local_pos = (local_pos * float(local_pos_scale)).astype(np.float32, copy=False)
         local_quat = _normalize_quat_wxyz(_to_numpy(cand.get("local_quat"), dtype=np.float32))
         converted = False
-        if annotation_pose_is_tip_mid_frame and tip_mid_offset_in_hand is not None:
-            local_pos = _convert_tip_mid_local_pose_to_hand_local(
+        obj_pos, obj_quat = _get_prim_world_pose(stage, object_prim_path, usd, usd_geom)
+
+        if align_tip_mid_to_center and tip_mid_offset_in_hand is not None:
+            # MagicSim align mode: ignore annotation local_pos, keep only
+            # orientation.  Place hand so tip_mid lands at object center.
+            # hand_world = obj_center - R(world_quat) @ tip_mid_offset
+            target_quat = _transform_local_pose_to_world(
+                object_pos=obj_pos, object_quat=obj_quat,
+                local_pos=np.zeros(3, dtype=np.float32), local_quat=local_quat,
+            )[1]
+            offset_world = _quat_to_rot_wxyz(target_quat) @ _to_numpy(
+                tip_mid_offset_in_hand, dtype=np.float32
+            ).reshape(-1)[:3]
+            target_pos = (obj_pos[:3] - offset_world).astype(np.float32)
+            converted = True
+        else:
+            if annotation_pose_is_tip_mid_frame and tip_mid_offset_in_hand is not None:
+                local_pos = _convert_tip_mid_local_pose_to_hand_local(
+                    local_pos=local_pos,
+                    local_quat=local_quat,
+                    tip_mid_offset_in_hand=tip_mid_offset_in_hand,
+                )
+                converted = True
+            target_pos, target_quat = _transform_local_pose_to_world(
+                object_pos=obj_pos,
+                object_quat=obj_quat,
                 local_pos=local_pos,
                 local_quat=local_quat,
-                tip_mid_offset_in_hand=tip_mid_offset_in_hand,
             )
-            converted = True
-        obj_pos, obj_quat = _get_prim_world_pose(stage, object_prim_path, usd, usd_geom)
-        target_pos, target_quat = _transform_local_pose_to_world(
-            object_pos=obj_pos,
-            object_quat=obj_quat,
-            local_pos=local_pos,
-            local_quat=local_quat,
-        )
         return {
             "target_pos": target_pos.astype(np.float32),
             "target_quat": target_quat.astype(np.float32),
@@ -3984,6 +4001,16 @@ def _run_pick_place_episode(
         usd=usd,
         usd_geom=usd_geom,
     )
+    # MagicSim-style: for symmetric objects (ball, apple), ignore annotation position
+    # and align tip_mid directly to object center.  Only annotation orientation is kept.
+    _ALIGN_TIP_MID_TYPES = {"ball", "apple"}
+    _annotation_obj_type = str(annotation_meta.get("object_type", "")).strip().lower()
+    annotation_align_tip_mid = _annotation_obj_type in _ALIGN_TIP_MID_TYPES
+    if annotation_align_tip_mid:
+        LOG.info(
+            "collect: annotation_align_tip_mid_to_center ENABLED (object_type=%s)",
+            _annotation_obj_type,
+        )
     LOG.info(
         "collect: kinematics frame summary eef_prim=%s finger_left=%s finger_right=%s",
         eef_prim_path,
@@ -4327,6 +4354,7 @@ def _run_pick_place_episode(
             tip_mid_offset_in_hand=annotation_tip_mid_offset_hand,
             annotation_pose_is_tip_mid_frame=ANNOTATION_POSE_IS_TIP_MID_FRAME,
             local_pos_scale=annotation_local_pos_scale,
+            align_tip_mid_to_center=annotation_align_tip_mid,
         )
         if force_topdown_grasp and annotation_target is not None:
             annotation_target = None
@@ -4655,6 +4683,7 @@ def _run_pick_place_episode(
                         tip_mid_offset_in_hand=annotation_tip_mid_offset_hand,
                         annotation_pose_is_tip_mid_frame=ANNOTATION_POSE_IS_TIP_MID_FRAME,
                         local_pos_scale=annotation_local_pos_scale,
+                        align_tip_mid_to_center=annotation_align_tip_mid,
                     )
                     if _alt is None:
                         LOG.info("collect: attempt %d replan %d no more annotation candidates", attempt, _rp + 1)
