@@ -34,7 +34,7 @@ from lerobot_writer import SimLeRobotWriter
 
 LOG = logging.getLogger("isaac-pick-place-collector")
 
-_CODE_VERSION = "2026-03-01T21"
+_CODE_VERSION = "2026-03-01T22"
 print(f"[RELOAD] isaac_pick_place_collector loaded: version={_CODE_VERSION}", flush=True)
 
 STATE_DIM = 23
@@ -2033,15 +2033,32 @@ def _compute_prim_bbox(stage: Any, prim_path: str, usd_geom: Any) -> Optional[tu
             return mn, mx
 
         def _try_extent(p):
-            """Read raw extent + world transform for a single prim."""
+            """Read geometry extent + world transform for a single prim.
+
+            For UsdGeom.Cube prims the ``extent`` attribute defaults to
+            size=2.0 bounds ([(-1,-1,-1),(1,1,1)]) regardless of the
+            actual ``size`` attribute.  We read ``size`` directly and
+            compute the correct extent.
+            """
+            xf = usd_geom.Xformable(p)
+            wtf = xf.ComputeLocalToWorldTransform(tc)
+            # --- Cube: derive extent from 'size' attribute ---
+            if p.IsA(usd_geom.Cube):
+                cube_sc = usd_geom.Cube(p)
+                size_val = cube_sc.GetSizeAttr().Get(tc)
+                if size_val is None:
+                    size_val = 2.0  # USD default
+                half = float(size_val) / 2.0
+                lo = _gf_bbox.Vec3d(-half, -half, -half)
+                hi = _gf_bbox.Vec3d(half, half, half)
+                return _xform_extent_corners(lo, hi, wtf)
+            # --- Other geometry: read extent attribute ---
             ea = p.GetAttribute("extent")
             if not ea or not ea.HasValue():
                 return None
             ev = ea.Get(tc)
             if ev is None or len(ev) < 2:
                 return None
-            xf = usd_geom.Xformable(p)
-            wtf = xf.ComputeLocalToWorldTransform(tc)
             lo = _gf_bbox.Vec3d(float(ev[0][0]), float(ev[0][1]), float(ev[0][2]))
             hi = _gf_bbox.Vec3d(float(ev[1][0]), float(ev[1][1]), float(ev[1][2]))
             return _xform_extent_corners(lo, hi, wtf)
@@ -2795,6 +2812,12 @@ def _extract_world_config(
     if include_table:
         table_cub = _bbox_to_cuboid(table_prim_path, "table")
         if table_cub is not None:
+            # The robot sits ON the table so the table top coincides with
+            # the robot base (Z≈0 in robot frame).  Shift the cuboid
+            # downward so the collision_activation_distance (0.015 m)
+            # doesn't flag the robot base as colliding with the table.
+            _TABLE_COL_Z_OFFSET = -0.02
+            table_cub.pose[2] += _TABLE_COL_Z_OFFSET
             cuboids.append(table_cub)
 
     if object_prim_path and include_object:
