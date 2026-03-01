@@ -34,7 +34,7 @@ from lerobot_writer import SimLeRobotWriter
 
 LOG = logging.getLogger("isaac-pick-place-collector")
 
-_CODE_VERSION = "2026-03-01T20"
+_CODE_VERSION = "2026-03-01T21"
 print(f"[RELOAD] isaac_pick_place_collector loaded: version={_CODE_VERSION}", flush=True)
 
 STATE_DIM = 23
@@ -1658,13 +1658,19 @@ def _add_franka_reference(
     if franka_prim and franka_prim.IsValid():
         xf = usd_geom.Xformable(franka_prim)
         tx = None
+        orient_op = None
         for op in xf.GetOrderedXformOps():
             if op.GetOpName() == "xformOp:translate":
                 tx = op
-                break
+            elif op.GetOpName() == "xformOp:orient":
+                orient_op = op
         if tx is None:
             tx = xf.AddTranslateOp()
         tx.Set(gf.Vec3d(0.40, 0.00, 0.77))
+        # Rotate 180° about Z so the robot faces the table (−X direction).
+        if orient_op is None:
+            orient_op = xf.AddOrientOp()
+        orient_op.Set(gf.Quatd(0, 0, 0, 1))
     return prim_path
 
 
@@ -1986,10 +1992,15 @@ def _resolve_target_object_prim(
 def _compute_prim_bbox(stage: Any, prim_path: str, usd_geom: Any) -> Optional[tuple[np.ndarray, np.ndarray]]:
     """Compute world-space AABB for *prim_path*.
 
-    Uses ComputeLocalBound + ComputeLocalToWorldTransform instead of
-    ComputeWorldBound because the latter returns stale local-space
-    extents for FixedCuboid prims when the Fabric layer is active
-    (translate not applied to the bbox).
+    Strategy:
+      1. Read raw ``extent`` attribute (geometry space, no scale applied)
+         and transform its 8 corners via ComputeLocalToWorldTransform
+         (which includes scale + translate + ancestors).  This avoids
+         the double-scaling bug where ComputeLocalBound already bakes
+         scale into the extent and the world transform re-applies it.
+      2. For composed prims without ``extent`` (e.g. Xform groups),
+         traverse children that *do* have ``extent``, compute each
+         child's world AABB, and merge.
     """
     prim = stage.GetPrimAtPath(prim_path)
     if not prim or not prim.IsValid():
@@ -1998,36 +2009,67 @@ def _compute_prim_bbox(stage: Any, prim_path: str, usd_geom: Any) -> Optional[tu
         import pxr.Usd as _usd_bbox
         from pxr import Gf as _gf_bbox
         tc = _usd_bbox.TimeCode.Default()
-        cache = usd_geom.BBoxCache(tc, ["default", "render"])
-        local_bound = cache.ComputeLocalBound(prim)
-        local_rng = local_bound.GetRange()
-        if local_rng.IsEmpty():
-            return None
-        # World transform (reliable even when Fabric is active)
-        xf = usd_geom.Xformable(prim)
-        world_tf = xf.ComputeLocalToWorldTransform(tc)
-        # Transform 8 corners of local bbox to world space
-        lo = local_rng.GetMin()
-        hi = local_rng.GetMax()
-        corners = [
-            _gf_bbox.Vec3d(lo[0], lo[1], lo[2]),
-            _gf_bbox.Vec3d(hi[0], lo[1], lo[2]),
-            _gf_bbox.Vec3d(lo[0], hi[1], lo[2]),
-            _gf_bbox.Vec3d(lo[0], lo[1], hi[2]),
-            _gf_bbox.Vec3d(hi[0], hi[1], lo[2]),
-            _gf_bbox.Vec3d(hi[0], lo[1], hi[2]),
-            _gf_bbox.Vec3d(lo[0], hi[1], hi[2]),
-            _gf_bbox.Vec3d(hi[0], hi[1], hi[2]),
-        ]
-        world_pts = [world_tf.Transform(c) for c in corners]
-        xs = [float(p[0]) for p in world_pts]
-        ys = [float(p[1]) for p in world_pts]
-        zs = [float(p[2]) for p in world_pts]
-        mn = np.array([min(xs), min(ys), min(zs)], dtype=np.float32)
-        mx = np.array([max(xs), max(ys), max(zs)], dtype=np.float32)
-        if not np.all(np.isfinite(mn)) or not np.all(np.isfinite(mx)):
-            return None
-        return mn, mx
+
+        def _xform_extent_corners(lo, hi, tf):
+            """Transform 8 corners of an AABB by *tf* and return the world AABB."""
+            corners = [
+                _gf_bbox.Vec3d(lo[0], lo[1], lo[2]),
+                _gf_bbox.Vec3d(hi[0], lo[1], lo[2]),
+                _gf_bbox.Vec3d(lo[0], hi[1], lo[2]),
+                _gf_bbox.Vec3d(lo[0], lo[1], hi[2]),
+                _gf_bbox.Vec3d(hi[0], hi[1], lo[2]),
+                _gf_bbox.Vec3d(hi[0], lo[1], hi[2]),
+                _gf_bbox.Vec3d(lo[0], hi[1], hi[2]),
+                _gf_bbox.Vec3d(hi[0], hi[1], hi[2]),
+            ]
+            pts = [tf.Transform(c) for c in corners]
+            xs = [float(p[0]) for p in pts]
+            ys = [float(p[1]) for p in pts]
+            zs = [float(p[2]) for p in pts]
+            mn = np.array([min(xs), min(ys), min(zs)], dtype=np.float32)
+            mx = np.array([max(xs), max(ys), max(zs)], dtype=np.float32)
+            if not np.all(np.isfinite(mn)) or not np.all(np.isfinite(mx)):
+                return None
+            return mn, mx
+
+        def _try_extent(p):
+            """Read raw extent + world transform for a single prim."""
+            ea = p.GetAttribute("extent")
+            if not ea or not ea.HasValue():
+                return None
+            ev = ea.Get(tc)
+            if ev is None or len(ev) < 2:
+                return None
+            xf = usd_geom.Xformable(p)
+            wtf = xf.ComputeLocalToWorldTransform(tc)
+            lo = _gf_bbox.Vec3d(float(ev[0][0]), float(ev[0][1]), float(ev[0][2]))
+            hi = _gf_bbox.Vec3d(float(ev[1][0]), float(ev[1][1]), float(ev[1][2]))
+            return _xform_extent_corners(lo, hi, wtf)
+
+        # 1. Try the prim itself
+        result = _try_extent(prim)
+        if result is not None:
+            return result
+
+        # 2. Traverse descendants for composed prims
+        world_mn: Optional[np.ndarray] = None
+        world_mx: Optional[np.ndarray] = None
+        for child in _usd_bbox.PrimRange(prim):
+            if child.GetPath() == prim.GetPath():
+                continue
+            r = _try_extent(child)
+            if r is None:
+                continue
+            cmn, cmx = r
+            if world_mn is None:
+                world_mn, world_mx = cmn, cmx
+            else:
+                world_mn = np.minimum(world_mn, cmn)
+                world_mx = np.maximum(world_mx, cmx)
+
+        if world_mn is not None:
+            return world_mn, world_mx
+        return None
     except Exception:
         return None
 
