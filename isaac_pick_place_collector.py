@@ -4840,7 +4840,7 @@ def _run_pick_place_episode(
                     if _residual > _RESIST_THRESHOLD:
                         _stall_count += 1
                         if _stall_count == _RESIST_PATIENCE:
-                            _SQUEEZE_OFFSET = 0.005  # 5mm inward from contact → firm grip force
+                            _SQUEEZE_OFFSET = 0.008  # 8mm inward from contact → firm grip force
                             _hold_gr_target = max(_per_finger_avg - _SQUEEZE_OFFSET, 0.0)
                             print(f"[CLOSE] attempt={attempt} contact at step={_cs} total_w={_cur_gw:.4f} per_finger={_per_finger_avg:.4f} residual={_residual:.4f} → hold={_hold_gr_target:.4f} (squeeze={_SQUEEZE_OFFSET})", flush=True)
                     else:
@@ -4923,13 +4923,24 @@ def _run_pick_place_episode(
         if _lift_arm is None:
             _lift_arm = waypoints[lift_idx][1]
         _lift_gripper = _hold_gr_target if _hold_gr_target > 0.001 else float(GRIPPER_CLOSED)
-        _patched_lift = [
-            (("CLOSE", _lift_current_arm, _lift_gripper),
-             ("LIFT", _lift_arm, _lift_gripper)),
-        ]
-        _execute_transitions(_patched_lift)
+        # Inline lift loop (instead of _execute_transitions) for per-step ball logging.
+        _lift_steps = steps_per_segment
+        for _ls in range(_lift_steps):
+            if _timeout_triggered():
+                break
+            _lift_alpha = float(_ls + 1) / float(_lift_steps)
+            _lift_arm_t = ((1.0 - _lift_alpha) * _lift_current_arm + _lift_alpha * _lift_arm).astype(np.float32)
+            _lift_arm_cmd, _lift_gr_cmd = _step_toward_joint_targets(franka, _lift_arm_t, _lift_gripper)
+            _set_joint_targets(franka, _lift_arm_cmd, _lift_gr_cmd, physics_control=True)
+            world.step(render=True)
+            _record_frame(arm_target=_lift_arm_t, gripper_target=_lift_gripper)
+            if _ls % 40 == 0 or _ls == _lift_steps - 1:
+                _lb_pos, _ = _get_prim_world_pose(stage, object_prim_path, usd, usd_geom)
+                _lj = _to_numpy(franka.get_joint_positions())
+                _lgw = float(_lj[7] + _lj[8]) if _lj.size >= 9 else -1.0
+                print(f"[LIFT] step={_ls}/{_lift_steps} ball_z={_lb_pos[2]:.4f} gw={_lgw:.4f} gr_cmd={_lift_gr_cmd:.4f}", flush=True)
         _ball_pos_after_lift, _ = _get_prim_world_pose(stage, object_prim_path, usd, usd_geom)
-        print(f"[LIFT] ball_xyz=({_ball_pos_after_lift[0]:.4f},{_ball_pos_after_lift[1]:.4f},{_ball_pos_after_lift[2]:.4f}) grip_target={_lift_gripper:.4f}", flush=True)
+        print(f"[LIFT] final ball_xyz=({_ball_pos_after_lift[0]:.4f},{_ball_pos_after_lift[1]:.4f},{_ball_pos_after_lift[2]:.4f}) grip_target={_lift_gripper:.4f}", flush=True)
         if stopped:
             break
 
@@ -5303,6 +5314,41 @@ def _safe_world_reset(world: Any) -> None:
         world.reset()
 
 
+def _configure_finger_drives(stage: Any, robot_prim_path: str,
+                              stiffness: float = 5000.0,
+                              damping: float = 200.0,
+                              max_force: float = 200.0) -> None:
+    """Set high drive stiffness on Franka finger joints for firm grasping.
+
+    Default Isaac Sim stiffness is often too low to hold objects during
+    dynamic lift motions.  MagicSim uses stiffness=2000; we use 5000 to
+    provide extra margin for small spherical objects.
+    """
+    from pxr import UsdPhysics as _UsdPhysics
+    finger_joints = [
+        f"{robot_prim_path}/panda_finger_joint1",
+        f"{robot_prim_path}/panda_finger_joint2",
+    ]
+    for jpath in finger_joints:
+        jprim = stage.GetPrimAtPath(jpath)
+        if not jprim or not jprim.IsValid():
+            LOG.warning("finger drive: joint prim %s not found", jpath)
+            continue
+        drive = _UsdPhysics.DriveAPI.Get(jprim, "linear")
+        if not drive:
+            _UsdPhysics.DriveAPI.Apply(jprim, "linear")
+            drive = _UsdPhysics.DriveAPI.Get(jprim, "linear")
+        old_kp = drive.GetStiffnessAttr().Get() if drive.GetStiffnessAttr() else "N/A"
+        old_kd = drive.GetDampingAttr().Get() if drive.GetDampingAttr() else "N/A"
+        old_mf = drive.GetMaxForceAttr().Get() if drive.GetMaxForceAttr() else "N/A"
+        jname = jpath.rsplit("/", 1)[-1]
+        LOG.info("finger drive %s BEFORE: kp=%s kd=%s maxF=%s", jname, old_kp, old_kd, old_mf)
+        drive.GetStiffnessAttr().Set(stiffness)
+        drive.GetDampingAttr().Set(damping)
+        drive.GetMaxForceAttr().Set(max_force)
+        LOG.info("finger drive %s AFTER: kp=%.0f kd=%.0f maxF=%.0f", jname, stiffness, damping, max_force)
+
+
 def _apply_finger_friction(stage: Any, robot_prim_path: str) -> None:
     """Apply high-friction physics material to Franka finger pads for stable grasping."""
     from pxr import UsdShade, UsdPhysics, Gf
@@ -5425,6 +5471,7 @@ def _setup_pick_place_scene_reuse_or_patch(
     if not articulation_prim_path:
         raise RuntimeError(f"collect cannot find articulation root under {robot_prim_path}")
     _apply_finger_friction(stage, robot_prim_path)
+    _configure_finger_drives(stage, robot_prim_path)
 
     table_x_range, table_y_range, table_top_z, work_center = _infer_table_workspace(
         stage,
