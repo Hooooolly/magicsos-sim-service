@@ -3294,6 +3294,30 @@ def _curobo_full_approach(
         return False
 
     LOG.info("Curobo full_approach: segment 2 planned (%d steps)", traj2.shape[0])
+    # Disable PhysX collision on the ball during seg2 teleport.  Teleport
+    # moves the fingers through the ball's volume; with collision enabled,
+    # the physics engine pushes the ball away.  Disabling collision lets
+    # the fingers pass through cleanly, then we re-enable before close.
+    _obj_collision_disabled = False
+    if object_prim_path:
+        try:
+            from pxr import UsdPhysics
+            _obj_prim = stage.GetPrimAtPath(object_prim_path)
+            if _obj_prim and _obj_prim.IsValid():
+                # Check child prims too (Body sub-prim may hold collision)
+                _collision_prims = []
+                for _cp in [_obj_prim] + list(_obj_prim.GetChildren()):
+                    if _cp.HasAPI(UsdPhysics.CollisionAPI):
+                        _collision_prims.append(_cp)
+                for _cp in _collision_prims:
+                    _col_api = UsdPhysics.CollisionAPI(_cp)
+                    _col_api.GetCollisionEnabledAttr().Set(False)
+                _obj_collision_disabled = len(_collision_prims) > 0
+                if _obj_collision_disabled:
+                    LOG.info("Curobo full_approach: disabled ball collision on %d prims", len(_collision_prims))
+        except Exception as exc:
+            LOG.warning("Curobo full_approach: failed to disable ball collision: %s", exc)
+
     reached = _execute_curobo_trajectory(
         franka, world, traj2, GRIPPER_OPEN,
         record_fn=record_fn,
@@ -3304,6 +3328,17 @@ def _curobo_full_approach(
         teleport=True,
         settle_steps=30,
     )
+
+    # Re-enable collision before close gate
+    if _obj_collision_disabled:
+        try:
+            for _cp in _collision_prims:
+                _col_api = UsdPhysics.CollisionAPI(_cp)
+                _col_api.GetCollisionEnabledAttr().Set(True)
+            LOG.info("Curobo full_approach: re-enabled ball collision")
+        except Exception as exc:
+            LOG.warning("Curobo full_approach: failed to re-enable ball collision: %s", exc)
+
     return reached
 
 
