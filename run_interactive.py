@@ -1668,7 +1668,20 @@ def _process_commands():
                 if _state["collecting"] or _collect_request is not None:
                     cmd["error"] = "Collection already running"
                 elif not _state["physics"]:
-                    cmd["error"] = "Physics must be running first (POST /physics/play)"
+                    # Auto-play physics instead of rejecting
+                    try:
+                        stage = _get_stage()
+                        if stage is not None:
+                            cleaned = _sanitize_franka_root_rigidbody(stage)
+                            if cleaned:
+                                print(f"[physics] removed accidental robot root RigidBodyAPI: {cleaned}")
+                        world.play()
+                        PHYSICS_RUNNING = True
+                        _state["physics"] = True
+                        print("[interactive] Physics auto-PLAY for collect")
+                    except Exception as _play_exc:
+                        cmd["error"] = f"Failed to auto-play physics: {_play_exc}"
+                        continue
                 else:
                     try:
                         num_episodes = int(cmd.get("num_episodes", 10))
