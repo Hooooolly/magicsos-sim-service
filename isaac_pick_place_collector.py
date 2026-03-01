@@ -34,7 +34,7 @@ from lerobot_writer import SimLeRobotWriter
 
 LOG = logging.getLogger("isaac-pick-place-collector")
 
-_CODE_VERSION = "2026-02-28T16"
+_CODE_VERSION = "2026-02-28T17"
 print(f"[RELOAD] isaac_pick_place_collector loaded: version={_CODE_VERSION}", flush=True)
 
 STATE_DIM = 23
@@ -4840,7 +4840,7 @@ def _run_pick_place_episode(
                     if _residual > _RESIST_THRESHOLD:
                         _stall_count += 1
                         if _stall_count == _RESIST_PATIENCE:
-                            _SQUEEZE_OFFSET = 0.003  # 3mm inward from contact → gentle grip
+                            _SQUEEZE_OFFSET = 0.001  # 1mm inward from contact → minimal squeeze
                             _hold_gr_target = max(_per_finger_avg - _SQUEEZE_OFFSET, 0.0)
                             print(f"[CLOSE] attempt={attempt} contact at step={_cs} total_w={_cur_gw:.4f} per_finger={_per_finger_avg:.4f} residual={_residual:.4f} → hold={_hold_gr_target:.4f} (squeeze={_SQUEEZE_OFFSET})", flush=True)
                     else:
