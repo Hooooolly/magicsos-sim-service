@@ -34,7 +34,7 @@ from lerobot_writer import SimLeRobotWriter
 
 LOG = logging.getLogger("isaac-pick-place-collector")
 
-_CODE_VERSION = "2026-02-28T10"
+_CODE_VERSION = "2026-02-28T11"
 print(f"[RELOAD] isaac_pick_place_collector loaded: version={_CODE_VERSION}", flush=True)
 
 STATE_DIM = 23
@@ -4902,44 +4902,56 @@ def _run_pick_place_episode(
                 break
             continue
 
-        # Patch lift: start from current arm (Curobo-reached) and lift to
-        # an IK-solved target above the current EEF.  The original
-        # lift_transitions use IK-planned joints that can be in a
-        # completely different configuration from the Curobo endpoint.
+        # Patch lift: multi-waypoint Cartesian lift.
+        # Single-shot joint interpolation creates curved EEF paths that
+        # DIP DOWNWARD in early steps (joint-space ≠ Cartesian-space),
+        # causing the ball to slip.  Instead, solve IK at multiple
+        # intermediate z heights and piecewise-interpolate.
         _lift_current_arm = _to_numpy(franka.get_joint_positions())[:7].astype(np.float32)
         _lift_eef_pos, _lift_eef_quat = _get_eef_pose(
             stage, eef_prim_path, get_prim_at_path, usd, usd_geom,
         )
-        _lift_target_pos = _lift_eef_pos.copy()
-        # Lift must go ABOVE current hand position.  pick_approach_z is
-        # a fingertip-level height, but the IK target frame is panda_hand
-        # which sits ~10cm above the fingertips.  Use the higher of:
-        #   (a) pick_approach_z  (pre-grasp approach height)
-        #   (b) current_hand_z + 5cm  (guaranteed upward lift)
         _lift_z = max(float(z_targets["pick_approach_z"]),
                       float(_lift_eef_pos[2]) + 0.05)
-        _lift_target_pos[2] = _lift_z
         LOG.info("lift target: pick_approach_z=%.4f eef_z=%.4f → lift_z=%.4f (delta=+%.4f)",
                  float(z_targets["pick_approach_z"]), float(_lift_eef_pos[2]),
                  _lift_z, _lift_z - float(_lift_eef_pos[2]))
-        _lift_arm = None
-        if ik_solver is not None:
-            _lift_arm = _solve_ik_arm_target(
-                ik_solver, _lift_target_pos,
-                target_orientation=ik_target_orientation,
-            )
-            if _lift_arm is None and ik_target_orientation is not None:
-                _lift_arm = _solve_ik_arm_target(ik_solver, _lift_target_pos)
-        if _lift_arm is None:
-            _lift_arm = waypoints[lift_idx][1]
+
+        # Build multi-waypoint trajectory (Cartesian → IK at each waypoint)
+        _N_LIFT_WP = 5
+        _lift_wp_joints = [_lift_current_arm.copy()]
+        _lift_start_z = float(_lift_eef_pos[2])
+        _lift_delta_z = _lift_z - _lift_start_z
+        for _wi in range(1, _N_LIFT_WP + 1):
+            _w_alpha = float(_wi) / float(_N_LIFT_WP)
+            _w_pos = _lift_eef_pos.copy()
+            _w_pos[2] = _lift_start_z + _w_alpha * _lift_delta_z
+            _w_arm = None
+            if ik_solver is not None:
+                _w_arm = _solve_ik_arm_target(
+                    ik_solver, _w_pos, target_orientation=ik_target_orientation,
+                )
+                if _w_arm is None and ik_target_orientation is not None:
+                    _w_arm = _solve_ik_arm_target(ik_solver, _w_pos)
+            if _w_arm is None:
+                _w_arm = _lift_wp_joints[-1].copy()
+            _lift_wp_joints.append(_w_arm)
+        LOG.info("lift: %d Cartesian waypoints, delta_z=%.4f per wp",
+                 _N_LIFT_WP, _lift_delta_z / _N_LIFT_WP)
+
         _lift_gripper = _hold_gr_target if _hold_gr_target > 0.001 else float(GRIPPER_CLOSED)
-        # Inline lift loop (instead of _execute_transitions) for per-step ball logging.
         _lift_steps = steps_per_segment
+        # Piecewise-linear interpolation between consecutive IK waypoints
+        _wp_step = float(_lift_steps) / float(_N_LIFT_WP)
+        _ls_global = 0
         for _ls in range(_lift_steps):
             if _timeout_triggered():
                 break
-            _lift_alpha = float(_ls + 1) / float(_lift_steps)
-            _lift_arm_t = ((1.0 - _lift_alpha) * _lift_current_arm + _lift_alpha * _lift_arm).astype(np.float32)
+            _seg_idx = min(int(float(_ls) / _wp_step), _N_LIFT_WP - 1)
+            _seg_progress = (float(_ls) - float(_seg_idx) * _wp_step) / _wp_step
+            _seg_progress = min(max(_seg_progress, 0.0), 1.0)
+            _lift_arm_t = ((1.0 - _seg_progress) * _lift_wp_joints[_seg_idx] +
+                           _seg_progress * _lift_wp_joints[_seg_idx + 1]).astype(np.float32)
             _lift_arm_cmd, _lift_gr_cmd = _step_toward_joint_targets(franka, _lift_arm_t, _lift_gripper)
             _set_joint_targets(franka, _lift_arm_cmd, _lift_gr_cmd, physics_control=True)
             world.step(render=True)
@@ -4950,7 +4962,7 @@ def _run_pick_place_episode(
                 _lj = _to_numpy(franka.get_joint_positions())
                 _lgw = float(_lj[7] + _lj[8]) if _lj.size >= 9 else -1.0
                 _eef_pos, _ = _get_eef_pose(stage, eef_prim_path, get_prim_at_path, usd, usd_geom)
-                print(f"[LIFT] step={_ls}/{_lift_steps} ball_z={_lb_pos[2]:.4f} eef_z={_eef_pos[2]:.4f} gw={_lgw:.4f} f7={float(_lj[7]):.4f} f8={float(_lj[8]):.4f} gr_cmd={_lift_gr_cmd:.4f}", flush=True)
+                print(f"[LIFT] step={_ls}/{_lift_steps} seg={_seg_idx} ball_z={_lb_pos[2]:.4f} eef_z={_eef_pos[2]:.4f} gw={_lgw:.4f} f7={float(_lj[7]):.4f} f8={float(_lj[8]):.4f} gr_cmd={_lift_gr_cmd:.4f}", flush=True)
         _ball_pos_after_lift, _ = _get_prim_world_pose(stage, object_prim_path, usd, usd_geom)
         print(f"[LIFT] final ball_xyz=({_ball_pos_after_lift[0]:.4f},{_ball_pos_after_lift[1]:.4f},{_ball_pos_after_lift[2]:.4f}) grip_target={_lift_gripper:.4f}", flush=True)
         if stopped:
@@ -5377,6 +5389,53 @@ def _configure_finger_drives(stage: Any, robot_prim_path: str,
         LOG.info("finger drive %s AFTER: kp=%.0f kd=%.0f maxF=%.0f", jname, stiffness, damping, max_force)
 
 
+def _configure_solver_iterations(stage: Any, articulation_prim_path: str,
+                                  franka: Any = None,
+                                  position_iterations: int = 128,
+                                  velocity_iterations: int = 128) -> None:
+    """Boost PhysX solver iterations for stable friction-based grasping.
+
+    cuRobo simple_stacking.py uses 124 iterations + TGS solver.
+    Default Isaac Sim uses ~16 iterations — insufficient for
+    friction contacts during dynamic lifting.
+    """
+    # 1. Articulation-level via Isaac Core API
+    if franka is not None:
+        try:
+            franka.set_solver_position_iteration_count(position_iterations)
+            franka.set_solver_velocity_iteration_count(velocity_iterations)
+            LOG.info("articulation solver API: pos=%d vel=%d", position_iterations, velocity_iterations)
+        except Exception as exc:
+            LOG.debug("set_solver_iteration via API failed: %s", exc)
+    # 2. Articulation-level via USD PhysxSchema
+    try:
+        from pxr import PhysxSchema
+        art_prim = stage.GetPrimAtPath(articulation_prim_path)
+        if art_prim and art_prim.IsValid():
+            if not art_prim.HasAPI(PhysxSchema.PhysxArticulationAPI):
+                PhysxSchema.PhysxArticulationAPI.Apply(art_prim)
+            art_api = PhysxSchema.PhysxArticulationAPI(art_prim)
+            art_api.CreateSolverPositionIterationCountAttr().Set(position_iterations)
+            art_api.CreateSolverVelocityIterationCountAttr().Set(velocity_iterations)
+            LOG.info("USD articulation solver: pos=%d vel=%d on %s",
+                     position_iterations, velocity_iterations, articulation_prim_path)
+    except Exception as exc:
+        LOG.warning("PhysxArticulationAPI solver config failed: %s", exc)
+    # 3. Scene-level: enable TGS solver for better friction handling
+    try:
+        from pxr import PhysxSchema
+        for prim in stage.Traverse():
+            if prim.GetTypeName() == "PhysicsScene":
+                if not prim.HasAPI(PhysxSchema.PhysxSceneAPI):
+                    PhysxSchema.PhysxSceneAPI.Apply(prim)
+                scene_api = PhysxSchema.PhysxSceneAPI(prim)
+                scene_api.CreateSolverTypeAttr().Set("TGS")
+                LOG.info("PhysicsScene TGS solver enabled at %s", prim.GetPath().pathString)
+                break
+    except Exception as exc:
+        LOG.warning("PhysxSceneAPI TGS config failed: %s", exc)
+
+
 def _apply_finger_friction(stage: Any, robot_prim_path: str,
                             object_prim_path: str | None = None) -> None:
     """Apply high-friction physics material to finger collision shapes AND object.
@@ -5711,6 +5770,7 @@ def _setup_pick_place_scene_reuse_or_patch(
         except Exception as exc:
             LOG.warning("Franka initialize() failed: %s", exc)
     _wait_articulation_ready(franka, world, steps=40)
+    _configure_solver_iterations(stage, articulation_prim_path, franka=franka)
     for cam in (camera_high, camera_wrist):
         if hasattr(cam, "initialize"):
             try:
