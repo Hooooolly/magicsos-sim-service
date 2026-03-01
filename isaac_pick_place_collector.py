@@ -34,7 +34,7 @@ from lerobot_writer import SimLeRobotWriter
 
 LOG = logging.getLogger("isaac-pick-place-collector")
 
-_CODE_VERSION = "2026-03-01T18"
+_CODE_VERSION = "2026-03-01T19"
 print(f"[RELOAD] isaac_pick_place_collector loaded: version={_CODE_VERSION}", flush=True)
 
 STATE_DIM = 23
@@ -4626,13 +4626,11 @@ def _run_pick_place_episode(
                 )
                 return _verify_reach_before_close(m)
 
-            # Object center for curobo collision cuboid (physics-driven,
-            # ComputeWorldBound returns stale origin)
-            _obj_center = np.array(
-                [last_pick_pos[0], last_pick_pos[1],
-                 float(table_top_z) + 0.5 * object_height],
-                dtype=np.float32,
-            )
+            # Read object ground-truth position from physics for Curobo
+            # collision cuboid.  Always use the live position rather than
+            # estimating from table_top_z which can be stale.
+            _obj_gt, _ = _get_prim_world_pose(stage, object_prim_path, usd, usd_geom)
+            _obj_center = _obj_gt[:3].copy()
             curobo_ok = _curobo_full_approach(
                 curobo_state=curobo_state,
                 franka=franka,
@@ -5613,6 +5611,14 @@ def _setup_pick_place_scene_reuse_or_patch(
             LOG.info("collect: missing table -> added %s", table_root)
     else:
         LOG.info("collect: reusing table at %s", table_root)
+
+    # Flush stage so BBoxCache can compute table geometry bounds before
+    # the first _infer_table_workspace call.  Without this the bbox
+    # returns local-space or empty bounds → wrong table_top_z → object
+    # gets placed on the ground instead of the table surface.
+    if table_added:
+        for _ in range(10):
+            simulation_app.update()
 
     robot_prim_path = _resolve_robot_prim(stage)
     if robot_prim_path is None:
