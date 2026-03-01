@@ -78,6 +78,8 @@ spec:
       value: "7.5"
     - name: CUDA_HOME
       value: /usr/local/cuda-11.8
+    - name: COLLECT_GRASP_POSE_PATH
+      value: /sim-service/grasp_poses/ball_012_grasp_pose.json
     ports:
     - containerPort: 6905
       hostPort: 6905
