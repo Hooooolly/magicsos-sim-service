@@ -5274,6 +5274,33 @@ def _setup_pick_place_scene_template(
     }
 
 
+def _purge_expired_scene_prims(world: Any, stage: Any) -> None:
+    """Remove expired prim wrappers from world.scene to prevent world.reset() crash."""
+    try:
+        registry = getattr(world.scene, "_scene_registry", None)
+        if registry is None:
+            return
+        for attr_name in list(vars(registry)):
+            bucket = getattr(registry, attr_name, None)
+            if not isinstance(bucket, dict):
+                continue
+            stale = []
+            for name, wrapper in bucket.items():
+                prim_paths = getattr(wrapper, "_prim_paths", None) or []
+                if hasattr(wrapper, "prim_path"):
+                    prim_paths = [wrapper.prim_path]
+                for pp in prim_paths:
+                    p = stage.GetPrimAtPath(pp)
+                    if not p or not p.IsValid():
+                        stale.append(name)
+                        break
+            for name in stale:
+                del bucket[name]
+                LOG.info("purged expired scene prim: %s", name)
+    except Exception as exc:
+        LOG.warning("_purge_expired_scene_prims failed: %s", exc)
+
+
 def _setup_pick_place_scene_reuse_or_patch(
     world: Any,
     simulation_app: Any,
@@ -5513,6 +5540,10 @@ def _setup_pick_place_scene_reuse_or_patch(
     )
     world.scene.add(camera_high)
     world.scene.add(camera_wrist)
+
+    # Purge expired prims from scene registry to avoid
+    # "Accessed invalid expired prim" crash on world.reset()
+    _purge_expired_scene_prims(world, stage)
 
     world.reset()
     for _ in range(20):
