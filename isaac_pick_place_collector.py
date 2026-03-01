@@ -34,7 +34,7 @@ from lerobot_writer import SimLeRobotWriter
 
 LOG = logging.getLogger("isaac-pick-place-collector")
 
-_CODE_VERSION = "2026-03-01T22"
+_CODE_VERSION = "2026-03-01T23"
 print(f"[RELOAD] isaac_pick_place_collector loaded: version={_CODE_VERSION}", flush=True)
 
 STATE_DIM = 23
@@ -4752,6 +4752,16 @@ def _run_pick_place_episode(
             # If annotation orientation fails Curobo, try up to 2 alternative annotation
             # poses before falling back to top-down vertical approach.
             if not curobo_ok and not np.allclose(down_quat, TOP_DOWN_FALLBACK_QUAT, atol=0.05):
+                # Return to HOME before replanning so Curobo start-state
+                # doesn't collide with the table cuboid.
+                for _h in range(40):
+                    if _timeout_triggered():
+                        break
+                    arm_cmd, gr_cmd = _step_toward_joint_targets(franka, HOME.copy(), GRIPPER_OPEN)
+                    _set_joint_targets(franka, arm_cmd, gr_cmd, physics_control=True)
+                    world.step(render=True)
+                    _record_frame(arm_target=HOME.copy(), gripper_target=GRIPPER_OPEN)
+
                 _REPLAN_LIMIT = 2
                 for _rp in range(_REPLAN_LIMIT):
                     if _timeout_triggered() or (stop_event is not None and stop_event.is_set()):
@@ -4969,7 +4979,7 @@ def _run_pick_place_episode(
                     if _residual > _RESIST_THRESHOLD:
                         _stall_count += 1
                         if _stall_count == _RESIST_PATIENCE:
-                            _SQUEEZE_OFFSET = 0.001  # 1mm inward from contact → minimal squeeze
+                            _SQUEEZE_OFFSET = 0.005  # 5mm inward from contact
                             _hold_gr_target = max(_per_finger_avg - _SQUEEZE_OFFSET, 0.0)
                             print(f"[CLOSE] attempt={attempt} contact at step={_cs} total_w={_cur_gw:.4f} per_finger={_per_finger_avg:.4f} residual={_residual:.4f} → hold={_hold_gr_target:.4f} (squeeze={_SQUEEZE_OFFSET})", flush=True)
                     else:
