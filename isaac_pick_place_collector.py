@@ -34,7 +34,7 @@ from lerobot_writer import SimLeRobotWriter
 
 LOG = logging.getLogger("isaac-pick-place-collector")
 
-_CODE_VERSION = "2026-02-28T12"
+_CODE_VERSION = "2026-02-28T13"
 print(f"[RELOAD] isaac_pick_place_collector loaded: version={_CODE_VERSION}", flush=True)
 
 STATE_DIM = 23
@@ -4902,11 +4902,10 @@ def _run_pick_place_episode(
                 break
             continue
 
-        # Patch lift: multi-waypoint Cartesian lift.
-        # Single-shot joint interpolation creates curved EEF paths that
-        # DIP DOWNWARD in early steps (joint-space ≠ Cartesian-space),
-        # causing the ball to slip.  Instead, solve IK at multiple
-        # intermediate z heights and piecewise-interpolate.
+        # Lift via Curobo planner — guarantees smooth joint trajectory
+        # from current config to target position above.  IK-based lift
+        # fails because IK returns solutions in different arm configs
+        # (3.5+ rad jumps), causing EEF to rocket upward or dip down.
         _lift_current_arm = _to_numpy(franka.get_joint_positions())[:7].astype(np.float32)
         _lift_eef_pos, _lift_eef_quat = _get_eef_pose(
             stage, eef_prim_path, get_prim_at_path, usd, usd_geom,
@@ -4917,42 +4916,6 @@ def _run_pick_place_episode(
                  float(z_targets["pick_approach_z"]), float(_lift_eef_pos[2]),
                  _lift_z, _lift_z - float(_lift_eef_pos[2]))
 
-        # Build multi-waypoint trajectory (Cartesian → IK at each waypoint)
-        # with IK continuity enforcement: reject solutions that jump > 0.5 rad
-        # from the previous waypoint (prevents elbow-flip / config switches
-        # that cause EEF to rocket upward instead of lifting smoothly).
-        _N_LIFT_WP = 5
-        _IK_CONTINUITY_THRESHOLD = 0.5  # max rad change per waypoint
-        _lift_wp_joints = [_lift_current_arm.copy()]
-        _lift_start_z = float(_lift_eef_pos[2])
-        _lift_delta_z = _lift_z - _lift_start_z
-        _ik_rejects = 0
-        for _wi in range(1, _N_LIFT_WP + 1):
-            _w_alpha = float(_wi) / float(_N_LIFT_WP)
-            _w_pos = _lift_eef_pos.copy()
-            _w_pos[2] = _lift_start_z + _w_alpha * _lift_delta_z
-            _w_arm = None
-            if ik_solver is not None:
-                _w_arm = _solve_ik_arm_target(
-                    ik_solver, _w_pos, target_orientation=ik_target_orientation,
-                )
-                if _w_arm is None and ik_target_orientation is not None:
-                    _w_arm = _solve_ik_arm_target(ik_solver, _w_pos)
-            # Continuity check: reject large joint jumps
-            if _w_arm is not None:
-                _prev = _lift_wp_joints[-1]
-                _max_jump = float(np.max(np.abs(_w_arm - _prev)))
-                if _max_jump > _IK_CONTINUITY_THRESHOLD:
-                    LOG.info("lift wp %d: IK jump %.3f rad > %.1f threshold, using prev",
-                             _wi, _max_jump, _IK_CONTINUITY_THRESHOLD)
-                    _w_arm = None
-                    _ik_rejects += 1
-            if _w_arm is None:
-                _w_arm = _lift_wp_joints[-1].copy()
-            _lift_wp_joints.append(_w_arm)
-        LOG.info("lift: %d Cartesian waypoints, delta_z=%.4f per wp, ik_rejects=%d",
-                 _N_LIFT_WP, _lift_delta_z / _N_LIFT_WP, _ik_rejects)
-
         _lift_gripper = _hold_gr_target if _hold_gr_target > 0.001 else float(GRIPPER_CLOSED)
         # Pre-lift settle: hold current position to let grip stabilize
         _SETTLE_STEPS = 10
@@ -4960,17 +4923,45 @@ def _run_pick_place_episode(
             _set_joint_targets(franka, _lift_current_arm, _lift_gripper, physics_control=True)
             world.step(render=True)
             _record_frame(arm_target=_lift_current_arm, gripper_target=_lift_gripper)
+
+        # Plan lift with Curobo (smooth trajectory, no config jumps)
+        _lift_target_pos = _lift_eef_pos.copy()
+        _lift_target_pos[2] = _lift_z
+        _lift_target_quat = ik_target_orientation.copy() if ik_target_orientation is not None else _lift_eef_quat.copy()
+        _robot_base_pos, _robot_base_quat = _get_prim_world_pose(
+            stage, robot_prim_path, usd, usd_geom,
+        )
+        # Remove object from collision world during lift (object is grasped)
+        try:
+            _update_curobo_world(
+                curobo_state, stage, robot_prim_path,
+                table_prim_path, object_prim_path,
+                include_object=False,
+            )
+        except Exception:
+            pass
+        _lift_traj = _plan_curobo_segment(
+            curobo_state, _lift_current_arm,
+            _lift_target_pos, _lift_target_quat,
+            _robot_base_pos, _robot_base_quat,
+        )
+        if _lift_traj is not None:
+            LOG.info("lift: Curobo planned %d waypoints", len(_lift_traj))
+        else:
+            LOG.warning("lift: Curobo plan failed, using hold-in-place fallback")
+
         _lift_steps = steps_per_segment
-        # Piecewise-linear interpolation between consecutive IK waypoints
-        _wp_step = float(_lift_steps) / float(_N_LIFT_WP)
         for _ls in range(_lift_steps):
             if _timeout_triggered():
                 break
-            _seg_idx = min(int(float(_ls) / _wp_step), _N_LIFT_WP - 1)
-            _seg_progress = (float(_ls) - float(_seg_idx) * _wp_step) / _wp_step
-            _seg_progress = min(max(_seg_progress, 0.0), 1.0)
-            _lift_arm_t = ((1.0 - _seg_progress) * _lift_wp_joints[_seg_idx] +
-                           _seg_progress * _lift_wp_joints[_seg_idx + 1]).astype(np.float32)
+            if _lift_traj is not None and len(_lift_traj) > 1:
+                # Map simulation step to trajectory index
+                _traj_idx = min(int(float(_ls) / float(_lift_steps) * len(_lift_traj)),
+                                len(_lift_traj) - 1)
+                _lift_arm_t = _lift_traj[_traj_idx]
+            else:
+                # Fallback: hold current position (no IK, no Curobo)
+                _lift_arm_t = _lift_current_arm
             _lift_arm_cmd, _lift_gr_cmd = _step_toward_joint_targets(franka, _lift_arm_t, _lift_gripper)
             _set_joint_targets(franka, _lift_arm_cmd, _lift_gr_cmd, physics_control=True)
             world.step(render=True)
@@ -4981,7 +4972,8 @@ def _run_pick_place_episode(
                 _lj = _to_numpy(franka.get_joint_positions())
                 _lgw = float(_lj[7] + _lj[8]) if _lj.size >= 9 else -1.0
                 _eef_pos, _ = _get_eef_pose(stage, eef_prim_path, get_prim_at_path, usd, usd_geom)
-                print(f"[LIFT] step={_ls}/{_lift_steps} seg={_seg_idx} ball_z={_lb_pos[2]:.4f} eef_z={_eef_pos[2]:.4f} gw={_lgw:.4f} f7={float(_lj[7]):.4f} f8={float(_lj[8]):.4f} gr_cmd={_lift_gr_cmd:.4f}", flush=True)
+                _ti = int(float(_ls) / float(_lift_steps) * len(_lift_traj)) if _lift_traj is not None and len(_lift_traj) > 1 else -1
+                print(f"[LIFT] step={_ls}/{_lift_steps} ti={_ti} ball_z={_lb_pos[2]:.4f} eef_z={_eef_pos[2]:.4f} gw={_lgw:.4f} f7={float(_lj[7]):.4f} f8={float(_lj[8]):.4f} gr_cmd={_lift_gr_cmd:.4f}", flush=True)
         _ball_pos_after_lift, _ = _get_prim_world_pose(stage, object_prim_path, usd, usd_geom)
         print(f"[LIFT] final ball_xyz=({_ball_pos_after_lift[0]:.4f},{_ball_pos_after_lift[1]:.4f},{_ball_pos_after_lift[2]:.4f}) grip_target={_lift_gripper:.4f}", flush=True)
         if stopped:
