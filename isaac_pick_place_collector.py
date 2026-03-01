@@ -34,7 +34,7 @@ from lerobot_writer import SimLeRobotWriter
 
 LOG = logging.getLogger("isaac-pick-place-collector")
 
-_CODE_VERSION = "2026-03-01T23"
+_CODE_VERSION = "2026-03-01T24"
 print(f"[RELOAD] isaac_pick_place_collector loaded: version={_CODE_VERSION}", flush=True)
 
 STATE_DIM = 23
@@ -4752,9 +4752,10 @@ def _run_pick_place_episode(
             # If annotation orientation fails Curobo, try up to 2 alternative annotation
             # poses before falling back to top-down vertical approach.
             if not curobo_ok and not np.allclose(down_quat, TOP_DOWN_FALLBACK_QUAT, atol=0.05):
-                # Return to HOME before replanning so Curobo start-state
-                # doesn't collide with the table cuboid.
-                for _h in range(40):
+                # Partial retract toward HOME before replanning so Curobo
+                # start-state clears the table collision zone, but stays close
+                # enough for an accurate short re-approach.
+                for _h in range(15):
                     if _timeout_triggered():
                         break
                     arm_cmd, gr_cmd = _step_toward_joint_targets(franka, HOME.copy(), GRIPPER_OPEN)
