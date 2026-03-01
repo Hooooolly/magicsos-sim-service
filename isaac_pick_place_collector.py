@@ -5315,14 +5315,15 @@ def _safe_world_reset(world: Any) -> None:
 
 
 def _configure_finger_drives(stage: Any, robot_prim_path: str,
-                              stiffness: float = 5000.0,
-                              damping: float = 200.0,
-                              max_force: float = 200.0) -> None:
-    """Set high drive stiffness on Franka finger joints for firm grasping.
+                              stiffness: float = 1000.0,
+                              damping: float = 100.0,
+                              max_force: float = 40.0) -> None:
+    """Set appropriate drive stiffness on Franka finger joints for grasping.
 
-    Default Isaac Sim stiffness is often too low to hold objects during
-    dynamic lift motions.  MagicSim uses stiffness=2000; we use 5000 to
-    provide extra margin for small spherical objects.
+    Default Isaac Sim 4.5.0 uses kp=400, maxForce=7.2N which is too weak
+    to hold objects during lift.  Too high (5000/200N) causes finger
+    penetration through objects.  1000/40N balances grip force with
+    physics solver stability.
     """
     from pxr import UsdPhysics as _UsdPhysics
     # Search for finger joint prims anywhere under the robot hierarchy.
