@@ -34,7 +34,7 @@ from lerobot_writer import SimLeRobotWriter
 
 LOG = logging.getLogger("isaac-pick-place-collector")
 
-_CODE_VERSION = "2026-02-28T14"
+_CODE_VERSION = "2026-02-28T15"
 print(f"[RELOAD] isaac_pick_place_collector loaded: version={_CODE_VERSION}", flush=True)
 
 STATE_DIM = 23
@@ -4966,7 +4966,12 @@ def _run_pick_place_episode(
             else:
                 # Fallback: hold current position (no IK, no Curobo)
                 _lift_arm_t = _lift_current_arm
-            _lift_arm_cmd, _lift_gr_cmd = _step_toward_joint_targets(franka, _lift_arm_t, _lift_gripper)
+            _lift_arm_cmd, _ = _step_toward_joint_targets(franka, _lift_arm_t, _lift_gripper)
+            # Bypass gripper rate-limiter during lift: command _lift_gripper directly.
+            # The rate-limiter reads the ACTUAL finger position (pushed open by ball)
+            # and caps the per-step delta, so gr_cmd chases the opening gripper
+            # instead of commanding full close force.
+            _lift_gr_cmd = _lift_gripper
             _set_joint_targets(franka, _lift_arm_cmd, _lift_gr_cmd, physics_control=True)
             world.step(render=True)
             _record_frame(arm_target=_lift_arm_t, gripper_target=_lift_gripper)
@@ -5354,15 +5359,14 @@ def _safe_world_reset(world: Any) -> None:
 
 
 def _configure_finger_drives(stage: Any, robot_prim_path: str,
-                              stiffness: float = 1000.0,
+                              stiffness: float = 2000.0,
                               damping: float = 100.0,
-                              max_force: float = 40.0) -> None:
+                              max_force: float = 200.0) -> None:
     """Set appropriate drive stiffness on Franka finger joints for grasping.
 
     Default Isaac Sim 4.5.0 uses kp=400, maxForce=7.2N which is too weak
-    to hold objects during lift.  Too high (5000/200N) causes finger
-    penetration through objects.  1000/40N balances grip force with
-    physics solver stability.
+    to hold objects during lift.  MagicSim uses kp=2000, effort=200N.
+    With 128 solver iterations + TGS enabled, high forces are stable.
     """
     from pxr import UsdPhysics as _UsdPhysics
     # Search for finger joint prims anywhere under the robot hierarchy.
