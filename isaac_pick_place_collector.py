@@ -34,7 +34,7 @@ from lerobot_writer import SimLeRobotWriter
 
 LOG = logging.getLogger("isaac-pick-place-collector")
 
-_CODE_VERSION = "2026-03-01T25g"
+_CODE_VERSION = "2026-03-01T25h"
 print(f"[RELOAD] isaac_pick_place_collector loaded: version={_CODE_VERSION}", flush=True)
 
 STATE_DIM = 23
@@ -3967,9 +3967,29 @@ def _run_pick_place_episode(
             rgb = _capture_rgb(cam_obj, CAMERA_RESOLUTION)
             writer.add_video_frame(cam_name, rgb)
         _log_step_world_debug(frame_id)
+        # Per-frame GT logging (T25h)
+        try:
+            _gt_obj = frame_extras.get("observation.object_pose_world", [0]*7)
+            _gt_tgt = frame_extras.get("observation.grasp_target_pose_world", [0]*7)
+            _gt_valid = frame_extras.get("observation.grasp_target_valid", False)
+            _gt_eef = (float(state[16]), float(state[17]), float(state[18]))
+            _gt_gw = float(state[14]) + float(state[15])
+            _gt_tgt_s = f"({_gt_tgt[0]:.4f},{_gt_tgt[1]:.4f},{_gt_tgt[2]:.4f})" if _gt_valid else "none"
+            print(
+                f"[GT] f={frame_id} a={_current_attempt} ph={_current_phase} "
+                f"ball=({_gt_obj[0]:.4f},{_gt_obj[1]:.4f},{_gt_obj[2]:.4f}) "
+                f"target={_gt_tgt_s} "
+                f"eef=({_gt_eef[0]:.4f},{_gt_eef[1]:.4f},{_gt_eef[2]:.4f}) "
+                f"gw={_gt_gw:.4f}",
+                flush=True,
+            )
+        except Exception:
+            pass
         frame_index = frame_id + 1
 
     frame_index = 0
+    _current_phase = "INIT"
+    _current_attempt = 0
     stopped = False
     place_pos: tuple[float, float] | None = None
     last_pick_pos: tuple[float, float] = (float(work_center[0]), float(work_center[1]))
@@ -4471,6 +4491,8 @@ def _run_pick_place_episode(
         if _timeout_triggered():
             break
         attempt_used = attempt
+        _current_attempt = attempt
+        _current_phase = "SELECT"
         if stop_event is not None and stop_event.is_set():
             stopped = True
             break
@@ -4816,6 +4838,7 @@ def _run_pick_place_episode(
                 except Exception:
                     pass
 
+            _current_phase = "APPROACH"
             curobo_ok = _curobo_full_approach(
                 curobo_state=curobo_state,
                 franka=franka,
@@ -4958,6 +4981,7 @@ def _run_pick_place_episode(
             break
 
         # Convergence settle: hold current pose open-gripper for a few steps.
+        _current_phase = "SETTLE"
         close_arm_pre = _to_numpy(franka.get_joint_positions())[:7].astype(np.float32)
         for settle_step in range(SETTLE_MAX_STEPS):
             if _timeout_triggered():
@@ -5035,6 +5059,7 @@ def _run_pick_place_episode(
                 attempt=attempt,
             )
             lift_arm = waypoints[lift_idx][1]
+            _current_phase = "REPLAN"
             _prepare_replan_from_current(lift_arm=lift_arm)
             if stopped:
                 break
@@ -5060,6 +5085,7 @@ def _run_pick_place_episode(
                 attempt=attempt,
             )
             lift_arm = waypoints[lift_idx][1]
+            _current_phase = "REPLAN"
             _prepare_replan_from_current(lift_arm=lift_arm)
             if stopped:
                 break
@@ -5067,6 +5093,7 @@ def _run_pick_place_episode(
 
         # Restore ball to dynamic before close gate — fingers can now
         # physically grip the ball.
+        _current_phase = "CLOSE"
         _restore_ball_dynamic()
         _hold_gr_target = float(GRIPPER_CLOSED)  # default; updated by contact detection
         if CLOSE_HOLD_STEPS > 0:
@@ -5172,6 +5199,7 @@ def _run_pick_place_episode(
                 attempt=attempt,
             )
             lift_arm = waypoints[lift_idx][1]
+            _current_phase = "REPLAN"
             _prepare_replan_from_current(lift_arm=lift_arm)
             if stopped:
                 break
@@ -5193,6 +5221,7 @@ def _run_pick_place_episode(
 
         _lift_gripper = _hold_gr_target if _hold_gr_target > 0.001 else float(GRIPPER_CLOSED)
         # Pre-lift settle: hold current position to let grip stabilize
+        _current_phase = "LIFT_SETTLE"
         _SETTLE_STEPS = 10
         for _ss in range(_SETTLE_STEPS):
             _set_joint_targets(franka, _lift_current_arm, _lift_gripper, physics_control=True)
@@ -5229,6 +5258,7 @@ def _run_pick_place_episode(
         else:
             LOG.warning("lift: Curobo plan failed, using hold-in-place fallback")
 
+        _current_phase = "LIFT"
         _lift_steps = steps_per_segment
         for _ls in range(_lift_steps):
             if _timeout_triggered():
@@ -5288,6 +5318,7 @@ def _run_pick_place_episode(
         if retrieval_ok:
             grasp_succeeded = True
             _clear_failed_annotation_pose_ids(annotation_failed_pose_cache_key)
+            _current_phase = "PLACE"
             _execute_transitions(place_transitions)
             break
 
@@ -5309,6 +5340,7 @@ def _run_pick_place_episode(
         )
 
         lift_arm = waypoints[lift_idx][1]
+        _current_phase = "REPLAN"
         _prepare_replan_from_current(lift_arm=lift_arm)
         if stopped:
             break
