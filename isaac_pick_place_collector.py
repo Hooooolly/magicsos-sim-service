@@ -34,7 +34,7 @@ from lerobot_writer import SimLeRobotWriter
 
 LOG = logging.getLogger("isaac-pick-place-collector")
 
-_CODE_VERSION = "2026-03-01T25b"
+_CODE_VERSION = "2026-03-01T25c"
 print(f"[RELOAD] isaac_pick_place_collector loaded: version={_CODE_VERSION}", flush=True)
 
 STATE_DIM = 23
@@ -3301,8 +3301,7 @@ def _curobo_full_approach(
         stop_event=stop_event,
         reach_check_fn=reach_check_fn,
         early_halt_after=4,
-        teleport=False,   # PD-only: prevents overlap → ball displacement
-        steps_per_wp=10,  # PD needs ~10 steps to track each waypoint
+        teleport=True,
         settle_steps=30,
     )
     return reached
@@ -4707,6 +4706,11 @@ def _run_pick_place_episode(
             )
 
             _reach_check_log_count = [0]
+            # Planned grasp target (set before approach, used in closure).
+            # Teleport-based approach may push the ball, so the live target
+            # shifts while the robot is still at the PLANNED position.
+            # Accept reach if EEF is close to EITHER live or planned target.
+            _planned_target = [down_xyz.copy()]
 
             def _curobo_reach_check() -> bool:
                 m = _compute_grasp_metrics(
@@ -4725,18 +4729,30 @@ def _run_pick_place_episode(
                     tip_mid_offset_in_hand=annotation_tip_mid_offset_hand,
                 )
                 ok = _verify_reach_before_close(m)
+                # Also check EEF distance to PLANNED target (teleport pushes
+                # ball, making live target inaccurate).
+                planned_ok = False
+                eef_pos, _ = _get_eef_pose(stage, eef_prim_path, get_prim_at_path, usd, usd_geom)
+                planned_d = _planned_target[0] - eef_pos[:3]
+                planned_dist = float(np.linalg.norm(planned_d))
+                planned_xy = float(np.linalg.norm(planned_d[:2]))
+                if (planned_dist <= REACH_BEFORE_CLOSE_MAX_OBJECT_EEF_DISTANCE
+                        and planned_xy <= REACH_BEFORE_CLOSE_MAX_OBJECT_EEF_XY_DISTANCE):
+                    planned_ok = True
+                final_ok = ok or planned_ok
                 _reach_check_log_count[0] += 1
-                if _reach_check_log_count[0] <= 3 or ok:
+                if _reach_check_log_count[0] <= 3 or final_ok:
                     LOG.info(
-                        "reach_check: eef_d=%.4f eef_xy=%.4f tip_d=%.4f tip_xy=%.4f tip_dz=%.4f ok=%s",
+                        "reach_check: eef_d=%.4f eef_xy=%.4f planned_d=%.4f planned_xy=%.4f "
+                        "tip_d=%.4f tip_dz=%.4f live_ok=%s planned_ok=%s ok=%s",
                         m.get("target_eef_distance", m.get("object_eef_distance", -1)),
                         m.get("target_eef_xy_distance", m.get("object_eef_xy_distance", -1)),
+                        planned_dist, planned_xy,
                         m.get("target_tip_mid_distance", m.get("object_tip_mid_distance", -1)),
-                        m.get("target_tip_mid_xy_distance", m.get("object_tip_mid_xy_distance", -1)),
                         m.get("target_tip_mid_z_delta", m.get("object_tip_mid_z_delta", -1)),
-                        ok,
+                        ok, planned_ok, final_ok,
                     )
-                return ok
+                return final_ok
 
             # Read object ground-truth position from physics for Curobo
             # collision cuboid.  Always use the live position rather than
@@ -4817,6 +4833,7 @@ def _run_pick_place_episode(
                         [float(_alt["target_pos"][0]), float(_alt["target_pos"][1]), _alt_z],
                         dtype=np.float32,
                     )
+                    _planned_target[0] = _alt_xyz.copy()
                     LOG.info(
                         "collect: attempt %d replan %d with alt annotation idx=%d z=%.4f",
                         attempt, _rp + 1, _alt["index"], _alt_z,
@@ -4853,6 +4870,7 @@ def _run_pick_place_episode(
                         [float(_obj_pos_td[0]), float(_obj_pos_td[1]), down_xyz[2]],
                         dtype=np.float32,
                     )
+                    _planned_target[0] = td_xyz.copy()
                     td_quat = TOP_DOWN_FALLBACK_QUAT.copy()
                     curobo_ok = _curobo_full_approach(
                         curobo_state=curobo_state,
@@ -4924,6 +4942,21 @@ def _run_pick_place_episode(
         )
         _log_attempt_world_debug(attempt, "pre_close_gate", current_grasp_target)
         reach_ok = _verify_reach_before_close(reach_metrics)
+        # Also accept if EEF is close to PLANNED target (ball may have
+        # shifted during teleport approach).
+        if not reach_ok:
+            eef_pos_settle, _ = _get_eef_pose(stage, eef_prim_path, get_prim_at_path, usd, usd_geom)
+            _pd = _planned_target[0] - eef_pos_settle[:3]
+            _pd_dist = float(np.linalg.norm(_pd))
+            _pd_xy = float(np.linalg.norm(_pd[:2]))
+            if (_pd_dist <= REACH_BEFORE_CLOSE_MAX_OBJECT_EEF_DISTANCE
+                    and _pd_xy <= REACH_BEFORE_CLOSE_MAX_OBJECT_EEF_XY_DISTANCE):
+                reach_ok = True
+                LOG.info(
+                    "collect: attempt %d post-settle reach_ok via planned target "
+                    "(planned_d=%.4f planned_xy=%.4f)",
+                    attempt, _pd_dist, _pd_xy,
+                )
         if not reach_ok:
             LOG.warning(
                 "collect: grasp retry %d/%d reach_before_close failed metrics=%s "
