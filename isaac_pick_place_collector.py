@@ -34,7 +34,7 @@ from lerobot_writer import SimLeRobotWriter
 
 LOG = logging.getLogger("isaac-pick-place-collector")
 
-_CODE_VERSION = "2026-03-01T25h"
+_CODE_VERSION = "2026-03-01T25i"
 print(f"[RELOAD] isaac_pick_place_collector loaded: version={_CODE_VERSION}", flush=True)
 
 STATE_DIM = 23
@@ -3295,29 +3295,9 @@ def _curobo_full_approach(
         return False
 
     LOG.info("Curobo full_approach: segment 2 planned (%d steps)", traj2.shape[0])
-    # Make ball kinematic during seg2 teleport.  Teleport moves the
-    # fingers through the ball; with a dynamic body, PhysX resolves the
-    # overlap by pushing the ball away.  Kinematic bodies ignore contact
-    # forces — ball stays in place while fingers pass through.  Collision
-    # stays enabled so ball keeps resting on the table.
-    _obj_was_kinematic = False
-    _rb_prim = None
-    if object_prim_path:
-        try:
-            from pxr import UsdPhysics
-            for _path in [object_prim_path, object_prim_path + "/Body"]:
-                _p = stage.GetPrimAtPath(_path)
-                if _p and _p.IsValid() and _p.HasAPI(UsdPhysics.RigidBodyAPI):
-                    _rb_api = UsdPhysics.RigidBodyAPI(_p)
-                    _ke_attr = _rb_api.GetKinematicEnabledAttr()
-                    _obj_was_kinematic = _ke_attr.Get() if _ke_attr.HasValue() else False
-                    _ke_attr.Set(True)
-                    _rb_prim = _p
-                    LOG.info("Curobo full_approach: set ball kinematic on %s", _path)
-                    break
-        except Exception as exc:
-            LOG.warning("Curobo full_approach: failed to set ball kinematic: %s", exc)
-
+    # T25i: seg2 uses PD control (teleport=False) so fingers physically
+    # avoid the ball.  No kinematic toggle needed — ball stays dynamic
+    # throughout the entire pick-place cycle.
     reached = _execute_curobo_trajectory(
         franka, world, traj2, GRIPPER_OPEN,
         record_fn=record_fn,
@@ -3325,13 +3305,9 @@ def _curobo_full_approach(
         stop_event=stop_event,
         reach_check_fn=reach_check_fn,
         early_halt_after=4,
-        teleport=True,
+        teleport=False,
         settle_steps=30,
     )
-
-    # NOTE: ball remains kinematic here — caller must restore to dynamic
-    # before close gate.  This prevents the settle phase from pushing the
-    # ball (fingers are still overlapping after teleport).
 
     return reached
 
@@ -3967,18 +3943,24 @@ def _run_pick_place_episode(
             rgb = _capture_rgb(cam_obj, CAMERA_RESOLUTION)
             writer.add_video_frame(cam_name, rgb)
         _log_step_world_debug(frame_id)
-        # Per-frame GT logging (T25h)
+        # Per-frame GT logging (T25i: full grasp pose + annotation idx)
         try:
             _gt_obj = frame_extras.get("observation.object_pose_world", [0]*7)
             _gt_tgt = frame_extras.get("observation.grasp_target_pose_world", [0]*7)
             _gt_valid = frame_extras.get("observation.grasp_target_valid", False)
             _gt_eef = (float(state[16]), float(state[17]), float(state[18]))
             _gt_gw = float(state[14]) + float(state[15])
-            _gt_tgt_s = f"({_gt_tgt[0]:.4f},{_gt_tgt[1]:.4f},{_gt_tgt[2]:.4f})" if _gt_valid else "none"
+            if _gt_valid:
+                _gt_tgt_s = (
+                    f"pos=({_gt_tgt[0]:.4f},{_gt_tgt[1]:.4f},{_gt_tgt[2]:.4f}) "
+                    f"quat=({_gt_tgt[3]:.4f},{_gt_tgt[4]:.4f},{_gt_tgt[5]:.4f},{_gt_tgt[6]:.4f})"
+                )
+            else:
+                _gt_tgt_s = "none"
             print(
-                f"[GT] f={frame_id} a={_current_attempt} ph={_current_phase} "
+                f"[GT] f={frame_id} a={_current_attempt} ph={_current_phase} ann={_current_ann_idx} "
                 f"ball=({_gt_obj[0]:.4f},{_gt_obj[1]:.4f},{_gt_obj[2]:.4f}) "
-                f"target={_gt_tgt_s} "
+                f"grasp=[{_gt_tgt_s}] "
                 f"eef=({_gt_eef[0]:.4f},{_gt_eef[1]:.4f},{_gt_eef[2]:.4f}) "
                 f"gw={_gt_gw:.4f}",
                 flush=True,
@@ -3990,6 +3972,7 @@ def _run_pick_place_episode(
     frame_index = 0
     _current_phase = "INIT"
     _current_attempt = 0
+    _current_ann_idx = "none"
     stopped = False
     place_pos: tuple[float, float] | None = None
     last_pick_pos: tuple[float, float] = (float(work_center[0]), float(work_center[1]))
@@ -4520,6 +4503,7 @@ def _run_pick_place_episode(
             raw_pick_y = float(annotation_target["target_pos"][1])
             pick_source = "annotation"
             current_grasp_target = annotation_target
+            _current_ann_idx = str(annotation_target.get("index", "na"))
             try:
                 obj_pos_dbg, _ = _get_object_tracking_pose(stage, object_prim_path, usd, usd_geom)
                 tgt_pos_dbg = _to_numpy(annotation_target.get("target_pos"), dtype=np.float32).reshape(-1)
@@ -4549,6 +4533,7 @@ def _run_pick_place_episode(
                 raise RuntimeError(
                     "Mug grasp annotation target selection failed; refusing fallback to bbox/root pose."
                 )
+            _current_ann_idx = "none"
             raw_pick_x, raw_pick_y, pick_source = _query_object_pick_xy(
                 stage=stage,
                 object_prim_path=object_prim_path,
@@ -4820,24 +4805,6 @@ def _run_pick_place_episode(
             _obj_gt, _ = _get_prim_world_pose(stage, object_prim_path, usd, usd_geom)
             _obj_center = _obj_gt[:3].copy()
 
-            # Helper to restore ball from kinematic to dynamic after seg2.
-            # _curobo_full_approach leaves ball kinematic to prevent
-            # displacement during settle.  Must call before close gate.
-            def _restore_ball_dynamic():
-                try:
-                    from pxr import UsdPhysics as _UsdPhysics
-                    for _p in [object_prim_path, object_prim_path + "/Body"]:
-                        _pr = stage.GetPrimAtPath(_p)
-                        if _pr and _pr.IsValid() and _pr.HasAPI(_UsdPhysics.RigidBodyAPI):
-                            _rb = _UsdPhysics.RigidBodyAPI(_pr)
-                            _ke = _rb.GetKinematicEnabledAttr()
-                            if _ke.HasValue() and _ke.Get():
-                                _ke.Set(False)
-                                LOG.info("collect: restored ball dynamic on %s", _p)
-                            break
-                except Exception:
-                    pass
-
             _current_phase = "APPROACH"
             curobo_ok = _curobo_full_approach(
                 curobo_state=curobo_state,
@@ -4914,9 +4881,10 @@ def _run_pick_place_episode(
                         dtype=np.float32,
                     )
                     _planned_target[0] = _alt_xyz.copy()
+                    _current_ann_idx = str(_alt["index"])
                     LOG.info(
-                        "collect: attempt %d replan %d with alt annotation idx=%d z=%.4f",
-                        attempt, _rp + 1, _alt["index"], _alt_z,
+                        "collect: attempt %d replan %d with alt annotation idx=%s z=%.4f",
+                        attempt, _rp + 1, _current_ann_idx, _alt_z,
                     )
                     curobo_ok = _curobo_full_approach(
                         curobo_state=curobo_state,
@@ -5051,7 +5019,7 @@ def _run_pick_place_episode(
                 REACH_BEFORE_CLOSE_MAX_OBJECT_TIP_MID_XY_DISTANCE,
                 REACH_BEFORE_CLOSE_MAX_ABS_TIP_MID_Z_DELTA,
             )
-            _restore_ball_dynamic()
+
             _record_failed_annotation_target(
                 cache_key=annotation_failed_pose_cache_key,
                 target=current_grasp_target,
@@ -5077,7 +5045,7 @@ def _run_pick_place_episode(
                 "skipping close",
                 attempt, _ball_drift, _BALL_DRIFT_THRESHOLD,
             )
-            _restore_ball_dynamic()
+
             _record_failed_annotation_target(
                 cache_key=annotation_failed_pose_cache_key,
                 target=current_grasp_target,
@@ -5091,10 +5059,7 @@ def _run_pick_place_episode(
                 break
             continue
 
-        # Restore ball to dynamic before close gate — fingers can now
-        # physically grip the ball.
         _current_phase = "CLOSE"
-        _restore_ball_dynamic()
         _hold_gr_target = float(GRIPPER_CLOSED)  # default; updated by contact detection
         if CLOSE_HOLD_STEPS > 0:
             print(f"[CLOSE] attempt={attempt} ENTERING close_hold steps={CLOSE_HOLD_STEPS} version={_CODE_VERSION}", flush=True)
