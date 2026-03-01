@@ -5325,24 +5325,39 @@ def _configure_finger_drives(stage: Any, robot_prim_path: str,
     provide extra margin for small spherical objects.
     """
     from pxr import UsdPhysics as _UsdPhysics
-    finger_joints = [
-        f"{robot_prim_path}/panda_finger_joint1",
-        f"{robot_prim_path}/panda_finger_joint2",
-    ]
-    for jpath in finger_joints:
-        jprim = stage.GetPrimAtPath(jpath)
-        if not jprim or not jprim.IsValid():
-            LOG.warning("finger drive: joint prim %s not found", jpath)
+    # Search for finger joint prims anywhere under the robot hierarchy.
+    # In different Franka USD variants the joints live at different depths
+    # (e.g. /panda_hand/panda_finger_joint1 or directly under robot root).
+    joint_names = {"panda_finger_joint1", "panda_finger_joint2"}
+    found: list[Any] = []
+    for prim in stage.Traverse():
+        p = prim.GetPath().pathString
+        if not p.startswith(robot_prim_path):
             continue
-        drive = _UsdPhysics.DriveAPI.Get(jprim, "linear")
-        if not drive:
+        name = p.rsplit("/", 1)[-1]
+        if name in joint_names:
+            found.append(prim)
+    if not found:
+        LOG.warning("finger drive: no finger joint prims found under %s", robot_prim_path)
+        return
+    for jprim in found:
+        jpath = jprim.GetPath().pathString
+        jname = jpath.rsplit("/", 1)[-1]
+        # Try both linear (prismatic) and angular (revolute) drive types
+        drive = None
+        for dtype in ("linear", "angular"):
+            drive = _UsdPhysics.DriveAPI.Get(jprim, dtype)
+            if drive and drive.GetStiffnessAttr():
+                break
+            drive = None
+        if drive is None:
+            # Apply linear drive (Franka fingers are prismatic)
             _UsdPhysics.DriveAPI.Apply(jprim, "linear")
             drive = _UsdPhysics.DriveAPI.Get(jprim, "linear")
         old_kp = drive.GetStiffnessAttr().Get() if drive.GetStiffnessAttr() else "N/A"
         old_kd = drive.GetDampingAttr().Get() if drive.GetDampingAttr() else "N/A"
         old_mf = drive.GetMaxForceAttr().Get() if drive.GetMaxForceAttr() else "N/A"
-        jname = jpath.rsplit("/", 1)[-1]
-        LOG.info("finger drive %s BEFORE: kp=%s kd=%s maxF=%s", jname, old_kp, old_kd, old_mf)
+        LOG.info("finger drive %s BEFORE: kp=%s kd=%s maxF=%s path=%s", jname, old_kp, old_kd, old_mf, jpath)
         drive.GetStiffnessAttr().Set(stiffness)
         drive.GetDampingAttr().Set(damping)
         drive.GetMaxForceAttr().Set(max_force)
