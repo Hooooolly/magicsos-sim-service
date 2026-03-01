@@ -1,0 +1,138 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: sim-interactive-1
+  namespace: embodied
+  labels:
+    app: sim-interactive-1
+    app.kubernetes.io/component: interactive-sim
+    app.kubernetes.io/name: sim-interactive-1
+    platform.magics.ai/embodied: "true"
+    platform.magics.ai/gpu-index: "0"
+spec:
+  hostNetwork: true
+  nodeName: node1
+  restartPolicy: Never
+  containers:
+  - name: isaac-sim
+    image: sim-interactive:latest
+    imagePullPolicy: IfNotPresent
+    command: ["/bin/bash", "-c"]
+    args:
+    - |
+      set -e
+      echo "[startup] $(date) Pre-built image detected, skipping dep install..."
+      if [ -z "$CUDA_HOME" ]; then
+        for d in /usr/local/cuda-11.8 /usr/local/cuda /usr; do
+          [ -x "$d/bin/nvcc" ] && export CUDA_HOME=$d && break
+        done
+      fi
+      export PATH=${CUDA_HOME}/bin:$PATH
+      CACHE_DIR=$(ls -d /opt/curobo-cache/*/ 2>/dev/null | head -1)
+      if [ -n "$CACHE_DIR" ] && [ -d /sim-service/curobo/curobolib ]; then
+        echo "[startup] $(date) Installing pre-compiled curobo from $CACHE_DIR"
+        for ext_dir in "$CACHE_DIR"/*/; do
+          so_file=$(find "$ext_dir" -name "*.so" -print -quit 2>/dev/null)
+          if [ -n "$so_file" ]; then
+            cp "$so_file" /sim-service/curobo/curobolib/
+            echo "[startup]   copied $(basename $so_file)"
+          fi
+        done
+      fi
+      echo "[startup] $(date) Launching Isaac Sim..."
+      exec /isaac-sim/python.sh -u /sim-service/run_interactive.py
+    env:
+    - name: PYTHONUNBUFFERED
+      value: "1"
+    - name: LIVESTREAM
+      value: "2"
+    - name: ACCEPT_EULA
+      value: "Y"
+    - name: PRIVACY_CONSENT
+      value: "Y"
+    - name: CUDA_VISIBLE_DEVICES
+      value: "0"
+    - name: HEALTH_PORT
+      value: "6901"
+    - name: BRIDGE_PORT
+      value: "6801"
+    - name: WEBRTC_PORT
+      value: "49201"
+    - name: KIT_API_PORT
+      value: "8112"
+    - name: MEDIA_PORT
+      value: "48101"
+    - name: ISAACSIM_PATH
+      value: /isaac-sim
+    - name: PYTHONPATH
+      value: /sim-service
+    - name: EMBODIED_DATASETS_ROOT
+      value: /data/embodied/dataset/sim
+    - name: COLLECT_PLANNER_BACKEND
+      value: curobo
+    - name: COLLECT_VERBOSE_DEBUG
+      value: "1"
+    - name: SIM_SCENE_AUTO_LIFT
+      value: "1"
+    - name: TORCH_CUDA_ARCH_LIST
+      value: "7.5"
+    - name: CUDA_HOME
+      value: /usr/local/cuda-11.8
+    ports:
+    - containerPort: 6901
+      hostPort: 6901
+      name: http
+      protocol: TCP
+    - containerPort: 6801
+      hostPort: 6801
+      name: bridge-api
+      protocol: TCP
+    - containerPort: 8112
+      hostPort: 8112
+      name: kit-api
+      protocol: TCP
+    - containerPort: 49201
+      hostPort: 49201
+      name: webrtc-signal
+      protocol: TCP
+    - containerPort: 48101
+      hostPort: 48101
+      name: media-udp
+      protocol: UDP
+    resources:
+      requests:
+        memory: "8Gi"
+        nvidia.com/gpu: "1"
+      limits:
+        memory: "32Gi"
+        nvidia.com/gpu: "1"
+    volumeMounts:
+    - name: sim-service-code
+      mountPath: /sim-service
+    - name: data-storage
+      mountPath: /data
+    - name: scenesmith-data
+      mountPath: /scenesmith
+    - name: dshm
+      mountPath: /dev/shm
+    - name: embodied-shared
+      mountPath: /data/embodied
+  volumes:
+  - name: sim-service-code
+    hostPath:
+      path: /home/magics/sim-service
+      type: Directory
+  - name: data-storage
+    hostPath:
+      path: /data
+  - name: scenesmith-data
+    hostPath:
+      path: /home/magics/rlinf-workspace/scenesmith
+      type: Directory
+  - name: dshm
+    emptyDir:
+      medium: Memory
+      sizeLimit: 16Gi
+  - name: embodied-shared
+    persistentVolumeClaim:
+      claimName: embodied-nfs-pvc
