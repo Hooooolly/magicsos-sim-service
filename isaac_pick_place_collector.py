@@ -34,7 +34,7 @@ from lerobot_writer import SimLeRobotWriter
 
 LOG = logging.getLogger("isaac-pick-place-collector")
 
-_CODE_VERSION = "2026-03-01T19"
+_CODE_VERSION = "2026-03-01T20"
 print(f"[RELOAD] isaac_pick_place_collector loaded: version={_CODE_VERSION}", flush=True)
 
 STATE_DIM = 23
@@ -1984,15 +1984,47 @@ def _resolve_target_object_prim(
 
 
 def _compute_prim_bbox(stage: Any, prim_path: str, usd_geom: Any) -> Optional[tuple[np.ndarray, np.ndarray]]:
+    """Compute world-space AABB for *prim_path*.
+
+    Uses ComputeLocalBound + ComputeLocalToWorldTransform instead of
+    ComputeWorldBound because the latter returns stale local-space
+    extents for FixedCuboid prims when the Fabric layer is active
+    (translate not applied to the bbox).
+    """
     prim = stage.GetPrimAtPath(prim_path)
     if not prim or not prim.IsValid():
         return None
     try:
         import pxr.Usd as _usd_bbox
-        cache = usd_geom.BBoxCache(_usd_bbox.TimeCode.Default(), ["default", "render"])
-        rng = cache.ComputeWorldBound(prim).GetRange()
-        mn = np.array([float(rng.GetMin()[0]), float(rng.GetMin()[1]), float(rng.GetMin()[2])], dtype=np.float32)
-        mx = np.array([float(rng.GetMax()[0]), float(rng.GetMax()[1]), float(rng.GetMax()[2])], dtype=np.float32)
+        from pxr import Gf as _gf_bbox
+        tc = _usd_bbox.TimeCode.Default()
+        cache = usd_geom.BBoxCache(tc, ["default", "render"])
+        local_bound = cache.ComputeLocalBound(prim)
+        local_rng = local_bound.GetRange()
+        if local_rng.IsEmpty():
+            return None
+        # World transform (reliable even when Fabric is active)
+        xf = usd_geom.Xformable(prim)
+        world_tf = xf.ComputeLocalToWorldTransform(tc)
+        # Transform 8 corners of local bbox to world space
+        lo = local_rng.GetMin()
+        hi = local_rng.GetMax()
+        corners = [
+            _gf_bbox.Vec3d(lo[0], lo[1], lo[2]),
+            _gf_bbox.Vec3d(hi[0], lo[1], lo[2]),
+            _gf_bbox.Vec3d(lo[0], hi[1], lo[2]),
+            _gf_bbox.Vec3d(lo[0], lo[1], hi[2]),
+            _gf_bbox.Vec3d(hi[0], hi[1], lo[2]),
+            _gf_bbox.Vec3d(hi[0], lo[1], hi[2]),
+            _gf_bbox.Vec3d(lo[0], hi[1], hi[2]),
+            _gf_bbox.Vec3d(hi[0], hi[1], hi[2]),
+        ]
+        world_pts = [world_tf.Transform(c) for c in corners]
+        xs = [float(p[0]) for p in world_pts]
+        ys = [float(p[1]) for p in world_pts]
+        zs = [float(p[2]) for p in world_pts]
+        mn = np.array([min(xs), min(ys), min(zs)], dtype=np.float32)
+        mx = np.array([max(xs), max(ys), max(zs)], dtype=np.float32)
         if not np.all(np.isfinite(mn)) or not np.all(np.isfinite(mx)):
             return None
         return mn, mx
