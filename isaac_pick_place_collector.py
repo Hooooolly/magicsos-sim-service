@@ -34,7 +34,7 @@ from lerobot_writer import SimLeRobotWriter
 
 LOG = logging.getLogger("isaac-pick-place-collector")
 
-_CODE_VERSION = "2026-02-28T15"
+_CODE_VERSION = "2026-02-28T16"
 print(f"[RELOAD] isaac_pick_place_collector loaded: version={_CODE_VERSION}", flush=True)
 
 STATE_DIM = 23
@@ -4840,7 +4840,7 @@ def _run_pick_place_episode(
                     if _residual > _RESIST_THRESHOLD:
                         _stall_count += 1
                         if _stall_count == _RESIST_PATIENCE:
-                            _SQUEEZE_OFFSET = 0.008  # 8mm inward from contact → firm grip force
+                            _SQUEEZE_OFFSET = 0.003  # 3mm inward from contact → gentle grip
                             _hold_gr_target = max(_per_finger_avg - _SQUEEZE_OFFSET, 0.0)
                             print(f"[CLOSE] attempt={attempt} contact at step={_cs} total_w={_cur_gw:.4f} per_finger={_per_finger_avg:.4f} residual={_residual:.4f} → hold={_hold_gr_target:.4f} (squeeze={_SQUEEZE_OFFSET})", flush=True)
                     else:
@@ -5361,12 +5361,12 @@ def _safe_world_reset(world: Any) -> None:
 def _configure_finger_drives(stage: Any, robot_prim_path: str,
                               stiffness: float = 2000.0,
                               damping: float = 100.0,
-                              max_force: float = 200.0) -> None:
+                              max_force: float = 80.0) -> None:
     """Set appropriate drive stiffness on Franka finger joints for grasping.
 
     Default Isaac Sim 4.5.0 uses kp=400, maxForce=7.2N which is too weak
     to hold objects during lift.  MagicSim uses kp=2000, effort=200N.
-    With 128 solver iterations + TGS enabled, high forces are stable.
+    200N squeezes small objects out; 80N provides firm grip without ejection.
     """
     from pxr import UsdPhysics as _UsdPhysics
     # Search for finger joint prims anywhere under the robot hierarchy.
