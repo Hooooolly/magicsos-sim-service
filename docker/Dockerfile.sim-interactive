@@ -1,0 +1,76 @@
+ARG BASE_IMAGE=nvcr.io/nvidia/isaac-sim:5.1.0
+FROM ${BASE_IMAGE}
+
+USER root
+
+# --- Build tools ---
+RUN apt-get update -qq && \
+    apt-get install -y -qq g++ wget ninja-build && \
+    rm -rf /var/lib/apt/lists/*
+
+# --- CUDA toolkit (for curobo JIT) ---
+# isaac-sim:4.5.0 has no nvcc -> needs cuda-11.8
+# isaac-sim:5.1.0 has no nvcc -> needs cuda-12.8
+ARG CUDA_INSTALLER_URL=""
+RUN if [ -n "$CUDA_INSTALLER_URL" ]; then \
+      wget -q "$CUDA_INSTALLER_URL" -O /tmp/cuda.run && \
+      sh /tmp/cuda.run --silent --toolkit && \
+      rm /tmp/cuda.run; \
+    else \
+      # Fallback: try installing from NVIDIA repo
+      wget -q https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64/cuda-keyring_1.1-1_all.deb -O /tmp/cuda-keyring.deb && \
+      dpkg -i /tmp/cuda-keyring.deb && \
+      apt-get update -qq && \
+      apt-get install -y -qq cuda-nvcc-11-8 cuda-cudart-dev-11-8 && \
+      rm -rf /var/lib/apt/lists/*; \
+    fi
+
+# Auto-detect CUDA_HOME
+RUN for d in /usr/local/cuda-12.8 /usr/local/cuda-11.8 /usr/local/cuda; do \
+      if [ -x "$d/bin/nvcc" ]; then echo "CUDA_HOME=$d" && ln -sf "$d" /usr/local/cuda-active; break; fi; \
+    done
+ENV CUDA_HOME=/usr/local/cuda-active
+ENV PATH=${CUDA_HOME}/bin:/isaac-sim/kit/python/bin:${PATH}
+
+# --- Python deps ---
+RUN /isaac-sim/python.sh -m pip install -q \
+    flask pandas pyarrow imageio imageio-ffmpeg \
+    ninja warp-lang yourdfpy trimesh tqdm
+
+# --- Pre-compile curobo CUDA extensions ---
+ARG TORCH_CUDA_ARCH_LIST="7.5"
+ENV TORCH_CUDA_ARCH_LIST=${TORCH_CUDA_ARCH_LIST}
+
+# Copy curobo source for compilation
+COPY third_party/curobo/src/curobo/ /tmp/curobo-src/curobo/
+# curobolib needs the cpp/ and cu source files
+COPY third_party/curobo/src/curobo/curobolib/ /tmp/curobo-src/curobo/curobolib/
+ENV PYTHONPATH=/tmp/curobo-src:${PYTHONPATH}
+
+# JIT compile + cache the .so files
+RUN /isaac-sim/python.sh -c "\
+import os; \
+os.environ.setdefault('TORCH_CUDA_ARCH_LIST', '7.5'); \
+from curobo.wrap.reacher.motion_gen import MotionGen; \
+print('Curobo MotionGen JIT OK')" && \
+    PYVER=$(/isaac-sim/python.sh -c "import sys; print(f'py{sys.version_info.major}{sys.version_info.minor}')") && \
+    CUTAG=$(/isaac-sim/python.sh -c "import torch; print('cu' + torch.version.cuda.replace('.',''))") && \
+    CACHE_DIR="/opt/curobo-cache/${PYVER}_${CUTAG}" && \
+    mkdir -p "${CACHE_DIR}" && \
+    find /root/.cache/torch_extensions -name '*.so' | while read so; do \
+      ext_name=$(basename "$(dirname "$so")"); \
+      mkdir -p "${CACHE_DIR}/${ext_name}"; \
+      cp "$so" "${CACHE_DIR}/${ext_name}/"; \
+      echo "Cached: ${ext_name}/$(basename $so)"; \
+    done && \
+    echo "All curobo .so cached to ${CACHE_DIR}"
+
+# Clean up temp curobo source
+RUN rm -rf /tmp/curobo-src
+
+# --- Runtime env ---
+ENV PYTHONUNBUFFERED=1
+ENV ACCEPT_EULA=Y
+ENV PRIVACY_CONSENT=Y
+ENV ISAACSIM_PATH=/isaac-sim
+WORKDIR /sim-service
