@@ -34,7 +34,7 @@ from lerobot_writer import SimLeRobotWriter
 
 LOG = logging.getLogger("isaac-pick-place-collector")
 
-_CODE_VERSION = "2026-03-01T25i"
+_CODE_VERSION = "2026-03-02T25j"
 print(f"[RELOAD] isaac_pick_place_collector loaded: version={_CODE_VERSION}", flush=True)
 
 STATE_DIM = 23
@@ -4774,8 +4774,8 @@ def _run_pick_place_episode(
                     tip_mid_offset_in_hand=annotation_tip_mid_offset_hand,
                 )
                 ok = _verify_reach_before_close(m)
-                # Also check EEF distance to PLANNED target (teleport pushes
-                # ball, making live target inaccurate).
+
+
                 planned_ok = False
                 eef_pos, _ = _get_eef_pose(stage, eef_prim_path, get_prim_at_path, usd, usd_geom)
                 planned_d = _planned_target[0] - eef_pos[:3]
@@ -4784,7 +4784,7 @@ def _run_pick_place_episode(
                 if (planned_dist <= REACH_BEFORE_CLOSE_MAX_OBJECT_EEF_DISTANCE
                         and planned_xy <= REACH_BEFORE_CLOSE_MAX_OBJECT_EEF_XY_DISTANCE):
                     planned_ok = True
-                final_ok = ok or planned_ok
+                final_ok = ok  # T25j: removed planned_ok bypass (seg2 no longer teleports)
                 _reach_check_log_count[0] += 1
                 if _reach_check_log_count[0] <= 3 or final_ok:
                     LOG.info(
@@ -4991,21 +4991,8 @@ def _run_pick_place_episode(
         )
         _log_attempt_world_debug(attempt, "pre_close_gate", current_grasp_target)
         reach_ok = _verify_reach_before_close(reach_metrics)
-        # Also accept if EEF is close to PLANNED target (ball may have
-        # shifted during teleport approach).
-        if not reach_ok:
-            eef_pos_settle, _ = _get_eef_pose(stage, eef_prim_path, get_prim_at_path, usd, usd_geom)
-            _pd = _planned_target[0] - eef_pos_settle[:3]
-            _pd_dist = float(np.linalg.norm(_pd))
-            _pd_xy = float(np.linalg.norm(_pd[:2]))
-            if (_pd_dist <= REACH_BEFORE_CLOSE_MAX_OBJECT_EEF_DISTANCE
-                    and _pd_xy <= REACH_BEFORE_CLOSE_MAX_OBJECT_EEF_XY_DISTANCE):
-                reach_ok = True
-                LOG.info(
-                    "collect: attempt %d post-settle reach_ok via planned target "
-                    "(planned_d=%.4f planned_xy=%.4f)",
-                    attempt, _pd_dist, _pd_xy,
-                )
+        # T25j: removed planned_ok fallback — seg2 no longer teleports,
+        # so live ball position is accurate. Only use tip_mid-based check.
         if not reach_ok:
             LOG.warning(
                 "collect: grasp retry %d/%d reach_before_close failed metrics=%s "
