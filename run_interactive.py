@@ -1270,6 +1270,111 @@ def scene_info():
     })
 
 
+@bridge.route("/scene/snapshot", methods=["GET"])
+def scene_snapshot():
+    """Rich scene snapshot for save: objects with position, physics, bbox, lighting, cameras."""
+    stage = _get_stage()
+    if not stage:
+        return jsonify({"error": "No stage"}), 500
+
+    from pxr import UsdPhysics, UsdLux
+
+    bbox_cache = UsdGeom.BBoxCache(0, [UsdGeom.Tokens.default_, UsdGeom.Tokens.render])
+    world = stage.GetPrimAtPath("/World")
+
+    objects = []
+    lights = []
+    cameras = []
+
+    for prim in (world.GetChildren() if world.IsValid() else []):
+        if not prim.IsValid():
+            continue
+        path = prim.GetPath().pathString
+        name = prim.GetName()
+        type_name = prim.GetTypeName()
+
+        # Skip internal prims
+        if type_name in ("Scope", "Shader", "Material"):
+            continue
+
+        # Camera
+        if prim.IsA(UsdGeom.Camera):
+            cam_data = {"path": path, "name": name}
+            try:
+                xf = UsdGeom.Xformable(prim)
+                mat = xf.ComputeLocalToWorldTransform(0)
+                cam_data["position"] = [float(mat[3][0]), float(mat[3][1]), float(mat[3][2])]
+            except Exception:
+                pass
+            cameras.append(cam_data)
+            continue
+
+        # Lights
+        if prim.IsA(UsdLux.BoundableLightBase) or prim.IsA(UsdLux.NonboundableLightBase):
+            light_data = {"path": path, "name": name, "type": type_name}
+            try:
+                xf = UsdGeom.Xformable(prim)
+                mat = xf.ComputeLocalToWorldTransform(0)
+                light_data["position"] = [float(mat[3][0]), float(mat[3][1]), float(mat[3][2])]
+            except Exception:
+                pass
+            lights.append(light_data)
+            continue
+
+        # Regular object
+        obj = {"path": path, "name": name, "type": type_name}
+
+        # Position
+        try:
+            xf = UsdGeom.Xformable(prim)
+            translate_op = None
+            for op in xf.GetOrderedXformOps():
+                if op.GetOpType() == UsdGeom.XformOp.TypeTranslate:
+                    translate_op = op
+                    break
+            if translate_op:
+                t = translate_op.Get()
+                obj["position"] = [float(t[0]), float(t[1]), float(t[2])]
+        except Exception:
+            pass
+
+        # Bounding box
+        try:
+            bbox_cache.Clear()
+            bbox = bbox_cache.ComputeWorldBound(prim).GetRange()
+            bmin, bmax = bbox.GetMin(), bbox.GetMax()
+            obj["bbox_min"] = [float(bmin[0]), float(bmin[1]), float(bmin[2])]
+            obj["bbox_max"] = [float(bmax[0]), float(bmax[1]), float(bmax[2])]
+        except Exception:
+            pass
+
+        # Physics properties (check prim and children)
+        has_rigid_body = prim.HasAPI(UsdPhysics.RigidBodyAPI)
+        has_collision = prim.HasAPI(UsdPhysics.CollisionAPI)
+        has_articulation = prim.HasAPI(UsdPhysics.ArticulationRootAPI)
+        if not has_collision:
+            for child in prim.GetAllChildren():
+                if child.HasAPI(UsdPhysics.CollisionAPI):
+                    has_collision = True
+                    break
+        obj["physics"] = {
+            "rigid_body": has_rigid_body,
+            "collision": has_collision,
+            "articulation": has_articulation,
+        }
+
+        objects.append(obj)
+
+    return jsonify({
+        "scene": _state["scene"],
+        "objects": objects,
+        "lights": lights,
+        "cameras": cameras,
+        "physics_running": _state.get("physics", False),
+        "robots": _state.get("robots", {}),
+    })
+
+
 # ── Robot endpoints ──────────────────────────────────────────
 
 ROBOT_USD_MAP = {
