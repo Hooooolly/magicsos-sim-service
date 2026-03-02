@@ -34,7 +34,7 @@ from lerobot_writer import SimLeRobotWriter
 
 LOG = logging.getLogger("isaac-pick-place-collector")
 
-_CODE_VERSION = "2026-03-02T25k"
+_CODE_VERSION = "2026-03-02T25l"
 print(f"[RELOAD] isaac_pick_place_collector loaded: version={_CODE_VERSION}", flush=True)
 
 STATE_DIM = 23
@@ -158,7 +158,7 @@ ROBOT_REACH_RADIUS_X = 0.75
 ROBOT_REACH_RADIUS_Y = 0.75
 REACH_INTERSECTION_MIN_SPAN = 0.25
 PICK_CLAMP_MAX_DELTA = 0.03
-DEFAULT_EPISODE_TIMEOUT_SEC = 180.0
+DEFAULT_EPISODE_TIMEOUT_SEC = 300.0
 STATE_JOINT_VEL_CLIP_RAD_S = 20.0
 # Use ROS camera frame pose for wrist camera to avoid USD axis confusion:
 # - +Z forward, +Y up (camera_axes='ros').
@@ -3078,6 +3078,106 @@ def _execute_curobo_trajectory(
     return False
 
 
+def _slerp_quat(q0: np.ndarray, q1: np.ndarray, t: float) -> np.ndarray:
+    """Spherical linear interpolation between quaternions (w, x, y, z)."""
+    q0 = q0.astype(np.float64)
+    q1 = q1.astype(np.float64)
+    q0 /= np.linalg.norm(q0) + 1e-12
+    q1 /= np.linalg.norm(q1) + 1e-12
+    dot = float(np.dot(q0, q1))
+    if dot < 0:
+        q1 = -q1
+        dot = -dot
+    dot = min(dot, 1.0)
+    if dot > 0.9995:
+        result = q0 + t * (q1 - q0)
+        return (result / (np.linalg.norm(result) + 1e-12)).astype(np.float32)
+    theta = np.arccos(dot)
+    sin_theta = np.sin(theta)
+    result = (np.sin((1 - t) * theta) / sin_theta) * q0 + (np.sin(t * theta) / sin_theta) * q1
+    return (result / (np.linalg.norm(result) + 1e-12)).astype(np.float32)
+
+
+def _cartesian_linear_approach(
+    ik_solver: Any,
+    franka: Any,
+    world: Any,
+    stage: Any,
+    eef_prim_path: str,
+    get_prim_at_path: Any,
+    usd: Any,
+    usd_geom: Any,
+    target_pos_world: np.ndarray,
+    target_quat_world: np.ndarray,
+    record_fn: Any,
+    timeout_fn: Any,
+    stop_event: Any = None,
+    reach_check_fn: Any = None,
+    n_waypoints: int = 10,
+    steps_per_wp: int = 3,
+    settle_steps: int = 30,
+) -> bool:
+    """MoveL-style Cartesian linear approach: lerp pos, slerp quat, IK solve, PD execute.
+
+    Bypasses Curobo MotionGen collision checking for close-range seg2 motion.
+    """
+    eef_pos, eef_quat = _get_eef_pose(stage, eef_prim_path, get_prim_at_path, usd, usd_geom)
+    tgt_pos = np.asarray(target_pos_world, dtype=np.float32)
+    tgt_quat = np.asarray(target_quat_world, dtype=np.float32)
+
+    dist = float(np.linalg.norm(tgt_pos - eef_pos))
+    LOG.info(
+        "MoveL seg2: eef=[%.4f,%.4f,%.4f] target=[%.4f,%.4f,%.4f] dist=%.4f n_wp=%d",
+        eef_pos[0], eef_pos[1], eef_pos[2],
+        tgt_pos[0], tgt_pos[1], tgt_pos[2],
+        dist, n_waypoints,
+    )
+
+    joint_targets = []
+    for i in range(1, n_waypoints + 1):
+        t = float(i) / n_waypoints
+        wp_pos = (1.0 - t) * eef_pos + t * tgt_pos
+        wp_quat = _slerp_quat(eef_quat, tgt_quat, t)
+        q = _solve_ik_arm_target(ik_solver, wp_pos, target_orientation=wp_quat)
+        if q is None:
+            LOG.warning("MoveL IK fail at wp %d/%d pos=[%.4f,%.4f,%.4f]",
+                        i, n_waypoints, wp_pos[0], wp_pos[1], wp_pos[2])
+            if joint_targets:
+                q = joint_targets[-1]
+            else:
+                return False
+        joint_targets.append(q)
+
+    LOG.info("MoveL seg2: %d/%d IK solutions, executing with steps_per_wp=%d",
+             len(joint_targets), n_waypoints, steps_per_wp)
+
+    for i, arm_target in enumerate(joint_targets):
+        if timeout_fn():
+            return False
+        if stop_event is not None and stop_event.is_set():
+            return False
+        arm = np.clip(arm_target, FRANKA_ARM_LOWER, FRANKA_ARM_UPPER)
+        _set_joint_targets(franka, arm, GRIPPER_OPEN, physics_control=True)
+        for _ in range(steps_per_wp):
+            world.step(render=True)
+        record_fn(arm_target=arm, gripper_target=GRIPPER_OPEN)
+
+    last_arm = np.clip(joint_targets[-1], FRANKA_ARM_LOWER, FRANKA_ARM_UPPER)
+    for j in range(settle_steps):
+        if timeout_fn():
+            return False
+        if stop_event is not None and stop_event.is_set():
+            return False
+        _set_joint_targets(franka, last_arm, GRIPPER_OPEN, physics_control=True)
+        world.step(render=True)
+        record_fn(arm_target=last_arm, gripper_target=GRIPPER_OPEN)
+        if reach_check_fn is not None and reach_check_fn():
+            LOG.info("MoveL settle reached at step %d/%d", j + 1, settle_steps)
+            return True
+
+    return False
+
+
 def _curobo_full_approach(
     curobo_state: dict,
     franka: Any,
@@ -3096,6 +3196,9 @@ def _curobo_full_approach(
     usd: Any = None,
     usd_geom: Any = None,
     object_world_pos: np.ndarray | None = None,
+    ik_solver: Any = None,
+    eef_prim_path: str | None = None,
+    get_prim_at_path: Any = None,
 ) -> bool:
     """Plan and execute a full approach trajectory via Curobo (two segments).
 
@@ -3269,44 +3372,62 @@ def _curobo_full_approach(
         world.step(render=True)
         record_fn(arm_target=traj1_final, gripper_target=GRIPPER_OPEN)
 
-    # --- Segment 2: pre-grasp -> down-pick (no object, no table collision) ---
-    # Table collision is removed because the gripper fingers extend ~4cm below
-    # the EEF frame. At pick_grasp_z (table + 1cm), the fingers would collide
-    # with the table cuboid. The pre-grasp → grasp motion is only ~12cm so
-    # removing the table is safe.
-    try:
-        _update_curobo_world(
-            curobo_state, stage, robot_prim_path,
-            table_prim_path, object_prim_path,
-            include_object=False,
-            include_table=False,
+    # --- Segment 2: pre-grasp -> down-pick (MoveL: Cartesian linear + IK) ---
+    # T25l: Use IK point-solve instead of Curobo MotionGen for seg2.
+    # Curobo collision margin stacking (~40-65mm) prevents accurate endpoint
+    # convergence. MoveL bypasses collision checking for the short (~12cm)
+    # pre-grasp → grasp motion.
+    if ik_solver is not None and eef_prim_path is not None:
+        LOG.info("Curobo full_approach: segment 2 using MoveL (IK point-solve)")
+        reached = _cartesian_linear_approach(
+            ik_solver=ik_solver,
+            franka=franka,
+            world=world,
+            stage=stage,
+            eef_prim_path=eef_prim_path,
+            get_prim_at_path=get_prim_at_path or stage.GetPrimAtPath,
+            usd=usd,
+            usd_geom=usd_geom,
+            target_pos_world=target_pos_world,
+            target_quat_world=target_quat_world,
+            record_fn=record_fn,
+            timeout_fn=timeout_fn,
+            stop_event=stop_event,
+            reach_check_fn=reach_check_fn,
         )
-    except Exception as exc:
-        LOG.warning("Curobo full_approach: world update (seg2) failed: %s", exc)
+    else:
+        # Fallback to Curobo MotionGen if no IK solver available
+        LOG.info("Curobo full_approach: segment 2 using Curobo MotionGen (no IK solver)")
+        try:
+            _update_curobo_world(
+                curobo_state, stage, robot_prim_path,
+                table_prim_path, object_prim_path,
+                include_object=False,
+                include_table=False,
+            )
+        except Exception as exc:
+            LOG.warning("Curobo full_approach: world update (seg2) failed: %s", exc)
 
-    cur_q = _to_numpy(franka.get_joint_positions())[:7]
-    traj2 = _plan_curobo_segment(
-        curobo_state, cur_q, target_pos_world, target_quat_world,
-        robot_base_pos, robot_base_quat,
-    )
-    if traj2 is None:
-        LOG.warning("Curobo full_approach: segment 2 (-> down-pick) plan failed")
-        return False
+        cur_q = _to_numpy(franka.get_joint_positions())[:7]
+        traj2 = _plan_curobo_segment(
+            curobo_state, cur_q, target_pos_world, target_quat_world,
+            robot_base_pos, robot_base_quat,
+        )
+        if traj2 is None:
+            LOG.warning("Curobo full_approach: segment 2 (-> down-pick) plan failed")
+            return False
 
-    LOG.info("Curobo full_approach: segment 2 planned (%d steps)", traj2.shape[0])
-    # T25i: seg2 uses PD control (teleport=False) so fingers physically
-    # avoid the ball.  No kinematic toggle needed — ball stays dynamic
-    # throughout the entire pick-place cycle.
-    reached = _execute_curobo_trajectory(
-        franka, world, traj2, GRIPPER_OPEN,
-        record_fn=record_fn,
-        timeout_fn=timeout_fn,
-        stop_event=stop_event,
-        reach_check_fn=reach_check_fn,
-        early_halt_after=4,
-        teleport=False,
-        settle_steps=30,
-    )
+        LOG.info("Curobo full_approach: segment 2 planned (%d steps)", traj2.shape[0])
+        reached = _execute_curobo_trajectory(
+            franka, world, traj2, GRIPPER_OPEN,
+            record_fn=record_fn,
+            timeout_fn=timeout_fn,
+            stop_event=stop_event,
+            reach_check_fn=reach_check_fn,
+            early_halt_after=4,
+            teleport=False,
+            settle_steps=30,
+        )
 
     return reached
 
@@ -4822,6 +4943,9 @@ def _run_pick_place_episode(
                 usd=usd,
                 usd_geom=usd_geom,
                 object_world_pos=_obj_center,
+                ik_solver=ik_solver,
+                eef_prim_path=eef_prim_path,
+                get_prim_at_path=get_prim_at_path,
             )
             if stopped:
                 break
@@ -4902,6 +5026,9 @@ def _run_pick_place_episode(
                         usd=usd,
                         usd_geom=usd_geom,
                         object_world_pos=_obj_center,
+                        ik_solver=ik_solver,
+                        eef_prim_path=eef_prim_path,
+                        get_prim_at_path=get_prim_at_path,
                     )
                     if curobo_ok:
                         annotation_target = _alt
@@ -4936,6 +5063,9 @@ def _run_pick_place_episode(
                         usd=usd,
                         usd_geom=usd_geom,
                         object_world_pos=_obj_center,
+                        ik_solver=ik_solver,
+                        eef_prim_path=eef_prim_path,
+                        get_prim_at_path=get_prim_at_path,
                     )
             if stopped:
                 break
