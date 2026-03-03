@@ -34,7 +34,7 @@ from lerobot_writer import SimLeRobotWriter
 
 LOG = logging.getLogger("isaac-pick-place-collector")
 
-_CODE_VERSION = "2026-03-02T25n"
+_CODE_VERSION = "2026-03-03T25o"
 print(f"[RELOAD] isaac_pick_place_collector loaded: version={_CODE_VERSION}", flush=True)
 
 STATE_DIM = 23
@@ -3811,36 +3811,39 @@ def _verify_after_retrieval(metrics: dict[str, float]) -> bool:
 
 
 def _verify_reach_before_close(metrics: dict[str, float]) -> bool:
-    eef_dist = _metric_prefer_target(
+    # T25o: use min(object, target) instead of prefer-target.
+    # Ball orientation jitter makes target_* unreliable for spheres —
+    # if object distance is small the tip IS at the ball regardless.
+    eef_dist = _metric_min_object_target(
         metrics,
-        target_key="target_eef_distance",
         object_key="object_eef_distance",
+        target_key="target_eef_distance",
     )
-    eef_xy = _metric_prefer_target(
+    eef_xy = _metric_min_object_target(
         metrics,
-        target_key="target_eef_xy_distance",
         object_key="object_eef_xy_distance",
+        target_key="target_eef_xy_distance",
     )
     eef_ok = bool(
         eef_dist <= REACH_BEFORE_CLOSE_MAX_OBJECT_EEF_DISTANCE
         and eef_xy <= REACH_BEFORE_CLOSE_MAX_OBJECT_EEF_XY_DISTANCE
     )
-    tip_dist = _metric_prefer_target(
+    tip_dist = _metric_min_object_target(
         metrics,
-        target_key="target_tip_mid_distance",
         object_key="object_tip_mid_distance",
+        target_key="target_tip_mid_distance",
         default=float("nan"),
     )
-    tip_xy = _metric_prefer_target(
+    tip_xy = _metric_min_object_target(
         metrics,
-        target_key="target_tip_mid_xy_distance",
         object_key="object_tip_mid_xy_distance",
+        target_key="target_tip_mid_xy_distance",
         default=float("nan"),
     )
-    tip_dz = _metric_prefer_target(
+    tip_dz = _metric_min_object_target(
         metrics,
-        target_key="target_tip_mid_z_delta",
         object_key="object_tip_mid_z_delta",
+        target_key="target_tip_mid_z_delta",
         default=float("nan"),
     )
     tip_available = np.isfinite(tip_dist) and np.isfinite(tip_xy) and np.isfinite(tip_dz)
