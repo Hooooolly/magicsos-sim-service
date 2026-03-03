@@ -34,7 +34,7 @@ from lerobot_writer import SimLeRobotWriter
 
 LOG = logging.getLogger("isaac-pick-place-collector")
 
-_CODE_VERSION = "2026-03-02T25l"
+_CODE_VERSION = "2026-03-02T25m"
 print(f"[RELOAD] isaac_pick_place_collector loaded: version={_CODE_VERSION}", flush=True)
 
 STATE_DIM = 23
@@ -3113,9 +3113,9 @@ def _cartesian_linear_approach(
     timeout_fn: Any,
     stop_event: Any = None,
     reach_check_fn: Any = None,
-    n_waypoints: int = 10,
-    steps_per_wp: int = 3,
-    settle_steps: int = 30,
+    n_waypoints: int = 20,
+    steps_per_wp: int = 8,
+    settle_steps: int = 50,
 ) -> bool:
     """MoveL-style Cartesian linear approach: lerp pos, slerp quat, IK solve, PD execute.
 
