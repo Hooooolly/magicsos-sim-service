@@ -34,7 +34,7 @@ from lerobot_writer import SimLeRobotWriter
 
 LOG = logging.getLogger("isaac-pick-place-collector")
 
-_CODE_VERSION = "2026-03-03T25q"
+_CODE_VERSION = "2026-03-03T25r"
 print(f"[RELOAD] isaac_pick_place_collector loaded: version={_CODE_VERSION}", flush=True)
 
 STATE_DIM = 23
@@ -92,6 +92,7 @@ OBJECT_MASS = 0.1
 MIN_PICK_PLACE_DIST = 0.1
 DEFAULT_ROUNDS_PER_EPISODE = 1
 DEFAULT_RESET_MODE = "full"  # "full" | "arm_only"
+DEFAULT_OBJECT_POSITION_NOISE = 0.0  # metres; ±noise random offset in x,y after reset
 STEPS_PER_SEGMENT = 200
 TABLE_MARGIN = 0.08
 MAX_GRIPPER_STEP = 0.008
@@ -3886,6 +3887,7 @@ def _run_pick_place_episode(
     table_prim_path: str | None = None,
     reset_mode: str = DEFAULT_RESET_MODE,
     rounds_per_episode: int = DEFAULT_ROUNDS_PER_EPISODE,
+    object_position_noise: float = DEFAULT_OBJECT_POSITION_NOISE,
 ) -> tuple[int, bool, bool]:
     reset_mode = str(reset_mode or DEFAULT_RESET_MODE).strip().lower()
     if reset_mode not in ("full", "arm_only"):
@@ -3894,10 +3896,43 @@ def _run_pick_place_episode(
         rounds_per_episode = max(1, int(rounds_per_episode or DEFAULT_ROUNDS_PER_EPISODE))
     except Exception:
         rounds_per_episode = DEFAULT_ROUNDS_PER_EPISODE
+    try:
+        object_position_noise = max(0.0, float(object_position_noise or 0.0))
+    except Exception:
+        object_position_noise = DEFAULT_OBJECT_POSITION_NOISE
     if reset_mode == "full" or episode_index == 0:
         _safe_world_reset(world)
     for _ in range(10):
         world.step(render=True)
+
+    # Apply random position noise to the target object after reset
+    if object_position_noise > 0.0 and (reset_mode == "full" or episode_index == 0):
+        try:
+            from pxr import UsdGeom, Gf
+            obj_prim = stage.GetPrimAtPath(object_prim_path)
+            if obj_prim and obj_prim.IsValid():
+                xf = UsdGeom.Xformable(obj_prim)
+                local_xform = xf.GetLocalTransformation()
+                cur_t = local_xform.ExtractTranslation()
+                rng_ep = np.random.default_rng()
+                dx = float(rng_ep.uniform(-object_position_noise, object_position_noise))
+                dy = float(rng_ep.uniform(-object_position_noise, object_position_noise))
+                new_t = Gf.Vec3d(cur_t[0] + dx, cur_t[1] + dy, cur_t[2])
+                ops = xf.GetOrderedXformOps()
+                for op in ops:
+                    if op.GetOpType() == UsdGeom.XformOp.TypeTranslate:
+                        op.Set(new_t)
+                        break
+                else:
+                    xf.AddTranslateOp().Set(new_t)
+                for _ in range(5):
+                    world.step(render=True)
+                LOG.info(
+                    "object_position_noise=%.3f applied: (%+.4f, %+.4f) -> obj at (%.4f, %.4f, %.4f)",
+                    object_position_noise, dx, dy, float(new_t[0]), float(new_t[1]), float(new_t[2]),
+                )
+        except Exception as _noise_exc:
+            LOG.warning("object_position_noise failed: %s", _noise_exc)
     if COLLECT_VERBOSE_DEBUG:
         LOG.info(
             "collect-debug: episode=%d planner=%s steps_per_segment=%d "
@@ -6369,6 +6404,7 @@ def run_collection_in_process(
     episode_timeout_sec: float | None = None,
     reset_mode: str = DEFAULT_RESET_MODE,
     rounds_per_episode: int = DEFAULT_ROUNDS_PER_EPISODE,
+    object_position_noise: float = DEFAULT_OBJECT_POSITION_NOISE,
 ) -> dict[str, Any]:
     if num_episodes <= 0:
         raise ValueError("num_episodes must be > 0")
@@ -6387,6 +6423,10 @@ def run_collection_in_process(
     if reset_mode not in ("full", "arm_only"):
         reset_mode = DEFAULT_RESET_MODE
     rounds_per_episode = max(1, int(rounds_per_episode or DEFAULT_ROUNDS_PER_EPISODE))
+    try:
+        object_position_noise = max(0.0, float(os.environ.get("COLLECT_OBJECT_POSITION_NOISE", str(object_position_noise))))
+    except Exception:
+        object_position_noise = DEFAULT_OBJECT_POSITION_NOISE
     _rpe_env = os.environ.get("COLLECT_ROUNDS_PER_EPISODE")
     if _rpe_env is not None:
         try:
@@ -6397,7 +6437,8 @@ def run_collection_in_process(
     os.makedirs(output_dir, exist_ok=True)
     print(
         f"[COLLECT_START] code_version={_CODE_VERSION} CLOSE_HOLD_STEPS={CLOSE_HOLD_STEPS} "
-        f"reset_mode={reset_mode} rounds_per_episode={rounds_per_episode}",
+        f"reset_mode={reset_mode} rounds_per_episode={rounds_per_episode} "
+        f"object_position_noise={object_position_noise:.4f}",
         flush=True,
     )
 
@@ -6480,6 +6521,7 @@ def run_collection_in_process(
                     table_prim_path=ctx.get("table_prim_path"),
                     reset_mode=reset_mode,
                     rounds_per_episode=rounds_per_episode,
+                    object_position_noise=object_position_noise,
                 )
             finally:
                 writer.finish_episode(

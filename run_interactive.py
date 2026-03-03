@@ -1509,7 +1509,7 @@ def collect_start():
     try:
         num_episodes = int(data.get("num_episodes", 10))
         steps_per_segment = int(data.get("steps_per_segment", os.environ.get("COLLECT_STEPS_PER_SEGMENT_DEFAULT", "70")))
-        episode_timeout_sec = float(data.get("episode_timeout_sec", os.environ.get("COLLECT_EPISODE_TIMEOUT_SEC", "180")))
+        episode_timeout_sec = float(data.get("episode_timeout_sec", os.environ.get("COLLECT_EPISODE_TIMEOUT_SEC", "300")))
     except Exception:
         return jsonify({"error": "num_episodes/steps_per_segment/episode_timeout_sec must be numeric"}), 400
     skill = str(data.get("skill", "pick_place") or "pick_place")
@@ -1521,6 +1521,10 @@ def collect_start():
         rounds_per_episode = int(data.get("rounds_per_episode", 1))
     except Exception:
         rounds_per_episode = 1
+    try:
+        object_position_noise = float(data.get("object_position_noise", 0.0))
+    except Exception:
+        object_position_noise = 0.0
     if target_objects is not None and not isinstance(target_objects, list):
         return jsonify({"error": "target_objects must be a list when provided"}), 400
 
@@ -1543,6 +1547,7 @@ def collect_start():
         target_objects=target_objects,
         reset_mode=reset_mode,
         rounds_per_episode=rounds_per_episode,
+        object_position_noise=object_position_noise,
     )
 
 
@@ -1816,7 +1821,7 @@ def _process_commands():
                     try:
                         num_episodes = int(cmd.get("num_episodes", 10))
                         steps_per_segment = int(cmd.get("steps_per_segment", os.environ.get("COLLECT_STEPS_PER_SEGMENT_DEFAULT", "70")))
-                        episode_timeout_sec = float(cmd.get("episode_timeout_sec", os.environ.get("COLLECT_EPISODE_TIMEOUT_SEC", "180")))
+                        episode_timeout_sec = float(cmd.get("episode_timeout_sec", os.environ.get("COLLECT_EPISODE_TIMEOUT_SEC", "300")))
                     except Exception:
                         cmd["error"] = "num_episodes/steps_per_segment/episode_timeout_sec must be numeric"
                         continue
@@ -1825,6 +1830,10 @@ def _process_commands():
                     scene_mode = str(cmd.get("scene_mode", "auto") or "auto")
                     reset_mode = str(cmd.get("reset_mode", "full") or "full").strip().lower()
                     rounds_per_episode = int(cmd.get("rounds_per_episode", 1))
+                    try:
+                        object_position_noise = float(cmd.get("object_position_noise", 0.0))
+                    except Exception:
+                        object_position_noise = 0.0
                     target_objects = cmd.get("target_objects")
                     if num_episodes <= 0:
                         cmd["error"] = "num_episodes must be > 0"
@@ -1859,6 +1868,7 @@ def _process_commands():
                             "target_objects": target_objects,
                             "reset_mode": reset_mode,
                             "rounds_per_episode": rounds_per_episode,
+                            "object_position_noise": object_position_noise,
                         }
                         cmd["result"] = {
                             "status": "started",
@@ -1871,6 +1881,7 @@ def _process_commands():
                             "target_objects": target_objects,
                             "reset_mode": reset_mode,
                             "rounds_per_episode": rounds_per_episode,
+                            "object_position_noise": object_position_noise,
                         }
                         print(
                             f"[collect] queued main-thread collection: skill={skill}, "
@@ -1898,12 +1909,16 @@ def _run_pending_collection():
     _collect_request = None
     num_episodes = int(req.get("num_episodes", 10))
     steps_per_segment = int(req.get("steps_per_segment", os.environ.get("COLLECT_STEPS_PER_SEGMENT_DEFAULT", "70")))
-    episode_timeout_sec = float(req.get("episode_timeout_sec", os.environ.get("COLLECT_EPISODE_TIMEOUT_SEC", "180")))
+    episode_timeout_sec = float(req.get("episode_timeout_sec", os.environ.get("COLLECT_EPISODE_TIMEOUT_SEC", "300")))
     skill = str(req.get("skill", "pick_place"))
     output_dir = _normalize_collect_output_dir(req.get("output_dir"), skill)
     scene_mode = str(req.get("scene_mode", "auto") or "auto")
     reset_mode = str(req.get("reset_mode", "full") or "full").strip().lower()
     rounds_per_episode = int(req.get("rounds_per_episode", 1))
+    try:
+        object_position_noise = float(req.get("object_position_noise", 0.0))
+    except Exception:
+        object_position_noise = 0.0
     target_objects = req.get("target_objects")
 
     try:
@@ -1920,7 +1935,7 @@ def _run_pending_collection():
             f"[collect] start main-thread run: skill={skill}, scene_mode={scene_mode}, "
             f"episodes={num_episodes}, steps_per_segment={steps_per_segment}, "
             f"timeout={episode_timeout_sec}s, output={output_dir}, targets={target_objects}, "
-            f"reset_mode={reset_mode}, rounds={rounds_per_episode}"
+            f"reset_mode={reset_mode}, rounds={rounds_per_episode}, obj_noise={object_position_noise}"
         )
 
         import importlib
@@ -1955,6 +1970,8 @@ def _run_pending_collection():
                 collect_kwargs["reset_mode"] = reset_mode
             if "rounds_per_episode" in inspect.signature(run_collection_in_process).parameters:
                 collect_kwargs["rounds_per_episode"] = rounds_per_episode
+            if "object_position_noise" in inspect.signature(run_collection_in_process).parameters:
+                collect_kwargs["object_position_noise"] = object_position_noise
         except Exception:
             pass
 
