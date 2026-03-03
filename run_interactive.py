@@ -1245,7 +1245,7 @@ def scene_save():
         return jsonify({"error": "name required"}), 400
     safe_name = "".join(c if c.isalnum() or c in "-_ " else "_" for c in name)[:60].strip()
     ts = int(time.time())
-    output_dir = os.path.join("/data", "sim_scenes")
+    output_dir = os.environ.get("SIM_SCENE_LIBRARY", "/data/embodied/scene/library")
     output_path = os.path.join(output_dir, f"{safe_name}_{ts}.usda")
     return _enqueue_cmd("scene_save", output_path=output_path, output_dir=output_dir)
 

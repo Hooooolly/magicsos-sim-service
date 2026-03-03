@@ -1,3 +1,16 @@
+# sim-interactive base image
+#
+# Multi-version: works with both isaac-sim:4.5.0 and 5.1.0
+#   4.5.0: Python 3.10, PyTorch 2.5+cu118, CUDA 11.8
+#   5.1.0: Python 3.11, PyTorch 2.7+cu128, CUDA 12.8
+#
+# Build:
+#   See docker/build.sh for the full 4-step process.
+#   Step 1 produces the -base image (no GPU needed).
+#   Step 2 compiles curobo CUDA kernels on GPU.
+#   Step 3 bakes the compiled .so into the final image.
+#   Step 4 imports into containerd for K8s.
+
 ARG BASE_IMAGE=nvcr.io/nvidia/isaac-sim:5.1.0
 FROM ${BASE_IMAGE}
 
@@ -9,9 +22,6 @@ RUN apt-get update -qq && \
     rm -rf /var/lib/apt/lists/*
 
 # --- CUDA toolkit (for curobo JIT) ---
-# isaac-sim:4.5.0 has no nvcc -> needs cuda-11.8
-# isaac-sim:5.1.0 has no nvcc -> needs cuda-12.8
-# Install nvcc via apt (cuda-nvcc + cuda-cudart-dev)
 # 4.5.0 needs cuda-11-8, 5.1.0 needs cuda-12-8
 ARG CUDA_APT_VERSION="12-8"
 RUN wget -q https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64/cuda-keyring_1.1-1_all.deb -O /tmp/cuda-keyring.deb && \
@@ -20,25 +30,32 @@ RUN wget -q https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/
     apt-get install -y -qq cuda-nvcc-${CUDA_APT_VERSION} cuda-cudart-dev-${CUDA_APT_VERSION} && \
     rm -rf /var/lib/apt/lists/*
 
-# Auto-detect CUDA_HOME
+# Create /usr/local/cuda-active symlink (isaac-sim sets CUDA_HOME to this path)
 RUN for d in /usr/local/cuda-12.8 /usr/local/cuda-11.8 /usr/local/cuda; do \
-      if [ -x "$d/bin/nvcc" ]; then echo "CUDA_HOME=$d" && ln -sf "$d" /usr/local/cuda-active; break; fi; \
-    done
+      if [ -x "$d/bin/nvcc" ]; then \
+        echo "CUDA_HOME=$d" && ln -sf "$d" /usr/local/cuda-active; break; \
+      fi; \
+    done && \
+    test -L /usr/local/cuda-active || \
+      (echo "ERROR: no nvcc found, cuda-active symlink not created" && exit 1)
 ENV CUDA_HOME=/usr/local/cuda-active
 ENV PATH=${CUDA_HOME}/bin:/isaac-sim/kit/python/bin:${PATH}
 
 # --- Python deps ---
-RUN /isaac-sim/python.sh -m pip install -q \
+# NOTE: In 5.1.0, /isaac-sim/python.sh launches full Kit app.
+# Use the bare interpreter with setup_python_env.sh sourced instead.
+RUN bash -c 'source /isaac-sim/setup_python_env.sh && \
+    /isaac-sim/kit/python/bin/python3 -m pip install -q \
     flask pandas pyarrow imageio imageio-ffmpeg \
-    ninja warp-lang yourdfpy trimesh tqdm
+    ninja warp-lang yourdfpy trimesh tqdm'
 
 # --- Curobo source (for JIT at runtime or GPU build step) ---
 ARG TORCH_CUDA_ARCH_LIST="7.5"
 ENV TORCH_CUDA_ARCH_LIST=${TORCH_CUDA_ARCH_LIST}
 
-# Copy curobo source into image for JIT compilation
-# (JIT requires GPU, so we do it in a post-build docker run + commit step)
-COPY third_party/curobo/src/curobo/ /opt/curobo-src/curobo/
+# Build context must contain curobo/ directory.
+# See build.sh: it copies third_party/curobo/src/curobo/ into build context.
+COPY curobo/ /opt/curobo-src/curobo/
 
 # --- Runtime env ---
 ENV PYTHONUNBUFFERED=1
