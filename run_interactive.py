@@ -1516,6 +1516,11 @@ def collect_start():
     output_dir = _normalize_collect_output_dir(data.get("output_dir"), skill)
     scene_mode = str(data.get("scene_mode", "auto") or "auto")
     target_objects = data.get("target_objects")
+    reset_mode = str(data.get("reset_mode", "full") or "full").strip().lower()
+    try:
+        rounds_per_episode = int(data.get("rounds_per_episode", 1))
+    except Exception:
+        rounds_per_episode = 1
     if target_objects is not None and not isinstance(target_objects, list):
         return jsonify({"error": "target_objects must be a list when provided"}), 400
 
@@ -1536,6 +1541,8 @@ def collect_start():
         skill=skill,
         scene_mode=scene_mode,
         target_objects=target_objects,
+        reset_mode=reset_mode,
+        rounds_per_episode=rounds_per_episode,
     )
 
 
@@ -1816,6 +1823,8 @@ def _process_commands():
                     skill = str(cmd.get("skill", "pick_place") or "pick_place")
                     output_dir = _normalize_collect_output_dir(cmd.get("output_dir"), skill)
                     scene_mode = str(cmd.get("scene_mode", "auto") or "auto")
+                    reset_mode = str(cmd.get("reset_mode", "full") or "full").strip().lower()
+                    rounds_per_episode = int(cmd.get("rounds_per_episode", 1))
                     target_objects = cmd.get("target_objects")
                     if num_episodes <= 0:
                         cmd["error"] = "num_episodes must be > 0"
@@ -1848,6 +1857,8 @@ def _process_commands():
                             "skill": skill,
                             "scene_mode": scene_mode,
                             "target_objects": target_objects,
+                            "reset_mode": reset_mode,
+                            "rounds_per_episode": rounds_per_episode,
                         }
                         cmd["result"] = {
                             "status": "started",
@@ -1858,6 +1869,8 @@ def _process_commands():
                             "skill": skill,
                             "scene_mode": scene_mode,
                             "target_objects": target_objects,
+                            "reset_mode": reset_mode,
+                            "rounds_per_episode": rounds_per_episode,
                         }
                         print(
                             f"[collect] queued main-thread collection: skill={skill}, "
