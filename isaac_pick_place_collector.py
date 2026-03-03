@@ -34,7 +34,7 @@ from lerobot_writer import SimLeRobotWriter
 
 LOG = logging.getLogger("isaac-pick-place-collector")
 
-_CODE_VERSION = "2026-03-02T25m"
+_CODE_VERSION = "2026-03-02T25n"
 print(f"[RELOAD] isaac_pick_place_collector loaded: version={_CODE_VERSION}", flush=True)
 
 STATE_DIM = 23
@@ -1485,6 +1485,7 @@ def _solve_ik_arm_target(
     ik_solver: Any,
     target_position: np.ndarray,
     target_orientation: np.ndarray | None = None,
+    warm_start: np.ndarray | None = None,
 ) -> np.ndarray | None:
     if ik_solver is None:
         return None
@@ -1501,11 +1502,14 @@ def _solve_ik_arm_target(
                     orient = None
             else:
                 orient = None
-        action, success = ik_solver.compute_inverse_kinematics(
+        kwargs = dict(
             target_position=np.asarray(target_position, dtype=np.float32),
             target_orientation=orient,
             position_tolerance=0.01,
         )
+        if warm_start is not None:
+            kwargs["warm_start"] = np.asarray(warm_start, dtype=np.float32)
+        action, success = ik_solver.compute_inverse_kinematics(**kwargs)
         if not success or action is None:
             return None
         joints = _to_numpy(getattr(action, "joint_positions", None))
@@ -3134,11 +3138,29 @@ def _cartesian_linear_approach(
     )
 
     joint_targets = []
+    # T25n: get current arm joints as initial IK warm_start for joint continuity
+    cur_joints = _to_numpy(franka.get_joint_positions())[:7]
+    prev_q = cur_joints.copy()
+    MAX_JOINT_JUMP = 0.5  # rad — reject IK solutions with large discontinuities
     for i in range(1, n_waypoints + 1):
         t = float(i) / n_waypoints
         wp_pos = (1.0 - t) * eef_pos + t * tgt_pos
         wp_quat = _slerp_quat(eef_quat, tgt_quat, t)
-        q = _solve_ik_arm_target(ik_solver, wp_pos, target_orientation=wp_quat)
+        # T25n: pass previous solution as warm_start for joint continuity
+        q = _solve_ik_arm_target(ik_solver, wp_pos, target_orientation=wp_quat,
+                                 warm_start=prev_q)
+        if q is not None:
+            jump = float(np.max(np.abs(q - prev_q)))
+            if jump > MAX_JOINT_JUMP:
+                LOG.warning("MoveL wp %d/%d joint jump %.3f rad > %.1f, retrying without orient",
+                            i, n_waypoints, jump, MAX_JOINT_JUMP)
+                q2 = _solve_ik_arm_target(ik_solver, wp_pos, target_orientation=None,
+                                          warm_start=prev_q)
+                if q2 is not None and float(np.max(np.abs(q2 - prev_q))) < jump:
+                    q = q2
+                elif jump > MAX_JOINT_JUMP * 2:
+                    LOG.warning("MoveL wp %d/%d jump %.3f too large, clamping", i, n_waypoints, jump)
+                    q = prev_q + np.clip(q - prev_q, -MAX_JOINT_JUMP, MAX_JOINT_JUMP)
         if q is None:
             LOG.warning("MoveL IK fail at wp %d/%d pos=[%.4f,%.4f,%.4f]",
                         i, n_waypoints, wp_pos[0], wp_pos[1], wp_pos[2])
@@ -3146,6 +3168,7 @@ def _cartesian_linear_approach(
                 q = joint_targets[-1]
             else:
                 return False
+        prev_q = q
         joint_targets.append(q)
 
     LOG.info("MoveL seg2: %d/%d IK solutions, executing with steps_per_wp=%d",
@@ -4904,7 +4927,7 @@ def _run_pick_place_episode(
                 if (planned_dist <= REACH_BEFORE_CLOSE_MAX_OBJECT_EEF_DISTANCE
                         and planned_xy <= REACH_BEFORE_CLOSE_MAX_OBJECT_EEF_XY_DISTANCE):
                     planned_ok = True
-                final_ok = ok  # T25j: removed planned_ok bypass (seg2 no longer teleports)
+                final_ok = ok or planned_ok  # T25n: re-enable planned_ok — MoveL gets EEF close but tip_mid amplifies error for diagonal approaches
                 _reach_check_log_count[0] += 1
                 if _reach_check_log_count[0] <= 3 or final_ok:
                     LOG.info(
