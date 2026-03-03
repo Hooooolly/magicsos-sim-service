@@ -34,7 +34,7 @@ from lerobot_writer import SimLeRobotWriter
 
 LOG = logging.getLogger("isaac-pick-place-collector")
 
-_CODE_VERSION = "2026-03-03T25p"
+_CODE_VERSION = "2026-03-03T25q"
 print(f"[RELOAD] isaac_pick_place_collector loaded: version={_CODE_VERSION}", flush=True)
 
 STATE_DIM = 23
@@ -90,6 +90,8 @@ WAYPOINT_NOISE_RAD = 0.05
 OBJECT_SIZE = 0.04
 OBJECT_MASS = 0.1
 MIN_PICK_PLACE_DIST = 0.1
+DEFAULT_ROUNDS_PER_EPISODE = 1
+DEFAULT_RESET_MODE = "full"  # "full" | "arm_only"
 STEPS_PER_SEGMENT = 200
 TABLE_MARGIN = 0.08
 MAX_GRIPPER_STEP = 0.008
@@ -3882,8 +3884,18 @@ def _run_pick_place_episode(
     finger_right_prim_path: str | None = None,
     robot_prim_path: str | None = None,
     table_prim_path: str | None = None,
+    reset_mode: str = DEFAULT_RESET_MODE,
+    rounds_per_episode: int = DEFAULT_ROUNDS_PER_EPISODE,
 ) -> tuple[int, bool, bool]:
-    _safe_world_reset(world)
+    reset_mode = str(reset_mode or DEFAULT_RESET_MODE).strip().lower()
+    if reset_mode not in ("full", "arm_only"):
+        reset_mode = DEFAULT_RESET_MODE
+    try:
+        rounds_per_episode = max(1, int(rounds_per_episode or DEFAULT_ROUNDS_PER_EPISODE))
+    except Exception:
+        rounds_per_episode = DEFAULT_ROUNDS_PER_EPISODE
+    if reset_mode == "full" or episode_index == 0:
+        _safe_world_reset(world)
     for _ in range(10):
         world.step(render=True)
     if COLLECT_VERBOSE_DEBUG:
@@ -4124,11 +4136,8 @@ def _run_pick_place_episode(
     _current_attempt = 0
     _current_ann_idx = "none"
     stopped = False
-    place_pos: tuple[float, float] | None = None
     last_pick_pos: tuple[float, float] = (float(work_center[0]), float(work_center[1]))
-    grasp_succeeded = False
-    attempt_used = 0
-    ik_target_orientation: np.ndarray | None = None
+    any_round_succeeded = False
     episode_started = time.monotonic()
     timeout_sec = max(0.0, float(episode_timeout_sec))
     object_tokens = set(_object_token_candidates(object_prim_path))
@@ -4620,906 +4629,962 @@ def _run_pick_place_episode(
         except Exception as exc:
             LOG.debug("collect-debug: attempt %d %s logging failed: %s", attempt, tag, exc)
 
-    for attempt in range(1, GRASP_MAX_ATTEMPTS + 1):
-        if _timeout_triggered():
-            break
-        attempt_used = attempt
-        _current_attempt = attempt
-        _current_phase = "SELECT"
-        if stop_event is not None and stop_event.is_set():
-            stopped = True
-            break
-        annotation_target = _select_annotation_grasp_target(
-            stage=stage,
-            object_prim_path=object_prim_path,
-            usd=usd,
-            usd_geom=usd_geom,
-            candidates=annotation_candidates,
-            attempt_index=attempt,
-            ik_solver=ik_solver,
-            table_x_range=table_x_range,
-            table_y_range=table_y_range,
-            table_top_z=table_top_z,
-            failed_pose_ids=_get_failed_annotation_pose_ids(annotation_failed_pose_cache_key),
-            tip_mid_offset_in_hand=annotation_tip_mid_offset_hand,
-            annotation_pose_is_tip_mid_frame=ANNOTATION_POSE_IS_TIP_MID_FRAME,
-            local_pos_scale=annotation_local_pos_scale,
-            align_tip_mid_to_center=annotation_align_tip_mid,
-        )
-        if force_topdown_grasp and annotation_target is not None:
-            annotation_target = None
-        if annotation_target is not None:
-            raw_pick_x = float(annotation_target["target_pos"][0])
-            raw_pick_y = float(annotation_target["target_pos"][1])
-            pick_source = "annotation"
-            current_grasp_target = annotation_target
-            _current_ann_idx = str(annotation_target.get("index", "na"))
+    for round_idx in range(rounds_per_episode):
+        place_pos: tuple[float, float] | None = None
+        grasp_succeeded = False
+        attempt_used = 0
+        ik_target_orientation: np.ndarray | None = None
+        current_grasp_target = None
+        _current_phase = "INIT"
+        _current_attempt = 0
+        _current_ann_idx = "none"
+        _clear_failed_annotation_pose_ids(annotation_failed_pose_cache_key)
+
+        if rounds_per_episode > 1:
             try:
-                obj_pos_dbg, _ = _get_object_tracking_pose(stage, object_prim_path, usd, usd_geom)
-                tgt_pos_dbg = _to_numpy(annotation_target.get("target_pos"), dtype=np.float32).reshape(-1)
-                d = tgt_pos_dbg[:3] - obj_pos_dbg[:3]
+                _rnd_obj_pos, _ = _get_object_tracking_pose(stage, object_prim_path, usd, usd_geom)
                 LOG.info(
-                    "collect: attempt %d annotation_pick idx=%s group=%s label=%s "
-                    "converted=%s ik_feasible=%s relaxed=%s target=(%.4f, %.4f, %.4f) "
-                    "obj_delta=(%.4f, %.4f, %.4f)",
-                    attempt,
-                    str(annotation_target.get("index", "na")),
-                    str(annotation_target.get("candidate_group", "body")),
-                    str(annotation_target.get("label", "body")),
-                    bool(annotation_target.get("annotation_tip_mid_to_hand_converted", False)),
-                    bool(annotation_target.get("ik_feasible", False)),
-                    bool(annotation_target.get("ik_orientation_relaxed", False)),
-                    float(tgt_pos_dbg[0]),
-                    float(tgt_pos_dbg[1]),
-                    float(tgt_pos_dbg[2]),
-                    float(d[0]),
-                    float(d[1]),
-                    float(d[2]),
+                    "Episode %d Round %d/%d starting, object at (%.4f, %.4f, %.4f)",
+                    episode_index + 1,
+                    round_idx + 1,
+                    rounds_per_episode,
+                    float(_rnd_obj_pos[0]),
+                    float(_rnd_obj_pos[1]),
+                    float(_rnd_obj_pos[2]),
                 )
             except Exception:
                 pass
-        else:
-            if is_mug_target and enforce_mug_annotation_target:
-                raise RuntimeError(
-                    "Mug grasp annotation target selection failed; refusing fallback to bbox/root pose."
-                )
-            _current_ann_idx = "none"
-            raw_pick_x, raw_pick_y, pick_source = _query_object_pick_xy(
+
+        for attempt in range(1, GRASP_MAX_ATTEMPTS + 1):
+            if _timeout_triggered():
+                break
+            attempt_used = attempt
+            _current_attempt = attempt
+            _current_phase = "SELECT"
+            if stop_event is not None and stop_event.is_set():
+                stopped = True
+                break
+            annotation_target = _select_annotation_grasp_target(
                 stage=stage,
                 object_prim_path=object_prim_path,
                 usd=usd,
                 usd_geom=usd_geom,
+                candidates=annotation_candidates,
+                attempt_index=attempt,
+                ik_solver=ik_solver,
+                table_x_range=table_x_range,
+                table_y_range=table_y_range,
+                table_top_z=table_top_z,
+                failed_pose_ids=_get_failed_annotation_pose_ids(annotation_failed_pose_cache_key),
+                tip_mid_offset_in_hand=annotation_tip_mid_offset_hand,
+                annotation_pose_is_tip_mid_frame=ANNOTATION_POSE_IS_TIP_MID_FRAME,
+                local_pos_scale=annotation_local_pos_scale,
+                align_tip_mid_to_center=annotation_align_tip_mid,
             )
-            current_grasp_target = {
-                "target_pos": np.array([raw_pick_x, raw_pick_y, float(table_top_z)], dtype=np.float32),
-                "target_quat": np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32),
-                "source": pick_source,
-                "source_id": GRASP_POSE_SOURCE_IDS.get(pick_source, GRASP_POSE_SOURCE_IDS["none"]),
-                "valid": pick_source in {"bbox_center", "root_pose"},
-            }
-        pick_x = float(np.clip(raw_pick_x, table_x_range[0], table_x_range[1]))
-        pick_y = float(np.clip(raw_pick_y, table_y_range[0], table_y_range[1]))
-        clamp_delta = float(np.linalg.norm(np.array([pick_x - raw_pick_x, pick_y - raw_pick_y], dtype=np.float32)))
-        if clamp_delta > PICK_CLAMP_MAX_DELTA and np.isfinite(raw_pick_x) and np.isfinite(raw_pick_y):
-            LOG.warning(
-                "collect: attempt %d workspace mismatch (%s raw=(%.3f, %.3f), clamped=(%.3f, %.3f), delta=%.3f) -> using CLAMPED live target",
-                attempt,
-                pick_source,
-                raw_pick_x,
-                raw_pick_y,
-                pick_x,
-                pick_y,
-                clamp_delta,
-            )
-            # Keep target inside robot-table reachable workspace for physically valid approach.
-            if current_grasp_target is not None:
-                if current_grasp_target.get("source") == "annotation":
-                    if is_mug_target and enforce_mug_annotation_target:
-                        raise RuntimeError(
-                            "Mug annotation target projected outside workspace; refusing fallback to bbox target."
-                        )
-                    # Annotation can point to unreachable local handles; switch to live bbox target.
-                    current_grasp_target = {
-                        "target_pos": np.array([pick_x, pick_y, float(table_top_z)], dtype=np.float32),
-                        "target_quat": np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32),
-                        "source": "bbox_center",
-                        "source_id": GRASP_POSE_SOURCE_IDS["bbox_center"],
-                        "valid": True,
-                    }
-                else:
-                    pos = _to_numpy(current_grasp_target.get("target_pos"), dtype=np.float32).reshape(-1)
-                    if pos.size < 3:
-                        pos = np.array([pick_x, pick_y, float(table_top_z)], dtype=np.float32)
-                    else:
-                        pos = pos.copy()
-                        pos[0] = pick_x
-                        pos[1] = pick_y
-                    current_grasp_target["target_pos"] = pos.astype(np.float32, copy=False)
-        last_pick_pos = (pick_x, pick_y)
-        if abs(pick_x - raw_pick_x) > 1e-3 or abs(pick_y - raw_pick_y) > 1e-3:
-            LOG.warning(
-                "collect: attempt %d pick pose clamped (%s): raw=(%.3f, %.3f), clamped=(%.3f, %.3f)",
-                attempt,
-                pick_source,
-                raw_pick_x,
-                raw_pick_y,
-                pick_x,
-                pick_y,
-            )
-        LOG.info(
-            "collect: attempt %d planner=%s source=%s pick=(%.4f, %.4f) place_hint=%s",
-            attempt,
-            "curobo",
-            pick_source,
-            pick_x,
-            pick_y,
-            "none" if place_pos is None else f"({place_pos[0]:.4f}, {place_pos[1]:.4f})",
-        )
-        _log_attempt_world_debug(attempt, "pre_plan", current_grasp_target)
-        if place_pos is None:
-            place_pos = _sample_place_from_pick(rng, table_x_range, table_y_range, last_pick_pos)
-        object_height = _estimate_object_height(stage, object_prim_path, usd_geom, fallback=OBJECT_SIZE)
-        z_targets = _compute_pick_place_z_targets(
-            stage=stage,
-            object_prim_path=object_prim_path,
-            usd_geom=usd_geom,
-            table_top_z=table_top_z,
-            fallback_object_height=object_height,
-        )
-        object_height = float(z_targets["object_height"])
-        LOG.info(
-            "collect: attempt %d z_targets BEFORE clip: pick_grasp_z=%.4f pick_approach_z=%.4f "
-            "obj_h=%.4f table_top_z=%.4f annotation_target=%s",
-            attempt,
-            float(z_targets["pick_grasp_z"]),
-            float(z_targets["pick_approach_z"]),
-            float(z_targets["object_height"]),
-            float(table_top_z),
-            "NOT_NONE" if annotation_target is not None else "NONE",
-        )
-        if annotation_target is not None:
-            ann_z = float(annotation_target["target_pos"][2])
-            # ann_z is in panda_hand frame (after TCP→panda_hand conversion).
-            # Convert back to TCP Z so that _curobo_full_approach can re-offset
-            # correctly for whatever orientation it ends up using (annotation or
-            # top-down fallback).  TCP_z = panda_hand_z + TCP_OFFSET * approach_dir_z.
-            _ann_quat = _normalize_quat_wxyz(annotation_target["target_quat"])
-            _ann_approach_dir_z = float(_quat_to_rot_wxyz(_ann_quat)[:, 2][2])
-            _TCP_Z_OFFSET = 0.1034
-            ann_tcp_z = ann_z + _TCP_Z_OFFSET * _ann_approach_dir_z
-            min_z = float(table_top_z) + IK_PICK_MIN_CLEARANCE_FROM_TABLE
-            max_z = max(min_z + 0.01, float(z_targets["pick_approach_z"]) - 0.04)
-            z_targets["pick_grasp_z"] = float(np.clip(ann_tcp_z, min_z, max_z))
-            z_targets["pick_approach_z"] = max(
-                float(z_targets["pick_approach_z"]),
-                float(z_targets["pick_grasp_z"]) + 0.08,
-            )
-            LOG.info(
-                "collect: attempt %d z_targets AFTER clip: ann_z=%.4f min_z=%.4f max_z=%.4f "
-                "clipped_pick_grasp_z=%.4f pick_approach_z=%.4f",
-                attempt, ann_z, min_z, max_z,
-                float(z_targets["pick_grasp_z"]),
-                float(z_targets["pick_approach_z"]),
-            )
-            ik_target_orientation = _normalize_quat_wxyz(annotation_target["target_quat"])
-        elif force_topdown_grasp:
-            ik_target_orientation = TOP_DOWN_FALLBACK_QUAT.copy()
-            if current_grasp_target is not None:
-                current_grasp_target["target_quat"] = ik_target_orientation.copy()
-        elif no_annotation_available:
-            ik_target_orientation = TOP_DOWN_FALLBACK_QUAT.copy()
-            if current_grasp_target is not None:
-                current_grasp_target["target_quat"] = ik_target_orientation.copy()
-            LOG.info("collect: attempt %d using top-down fallback orientation (no annotation)", attempt)
-        elif ik_target_orientation is None:
-            _, cand_quat = _get_eef_pose(stage, eef_prim_path, get_prim_at_path, usd, usd_geom)
-            cand_quat = np.asarray(cand_quat, dtype=np.float32).reshape(-1)
-            if cand_quat.size >= 4 and np.all(np.isfinite(cand_quat[:4])):
-                norm = float(np.linalg.norm(cand_quat[:4]))
-                if np.isfinite(norm) and norm > 1e-6:
-                    ik_target_orientation = (cand_quat[:4] / norm).astype(np.float32)
-
-        if current_grasp_target is not None and current_grasp_target.get("source") != "annotation":
-            pos = _to_numpy(current_grasp_target.get("target_pos"), dtype=np.float32).reshape(-1)
-            if pos.size >= 3:
-                pos = pos.copy()
-                pos[2] = float(z_targets["pick_grasp_z"])
-                current_grasp_target["target_pos"] = pos
-
-        for _ in range(8):
-            world.step(render=True)
-            _record_frame()
-
-        # First attempt replans from current arm; later retries bias back to canonical HOME to unwind knots.
-        attempt_home_arm = _current_arm_target() if attempt == 1 else HOME.copy()
-        waypoints = _make_pick_place_waypoints_ik(
-            ik_solver=ik_solver,
-            pick_pos=last_pick_pos,
-            place_pos=place_pos,
-            pick_grasp_z=float(z_targets["pick_grasp_z"]),
-            pick_approach_z=float(z_targets["pick_approach_z"]),
-            place_grasp_z=float(z_targets["place_grasp_z"]),
-            place_approach_z=float(z_targets["place_approach_z"]),
-            table_top_z=float(table_top_z),
-            rng=rng,
-            target_orientation=ik_target_orientation,
-            home_arm=attempt_home_arm,
-        )
-        if waypoints is None:
-            waypoints = _make_pick_place_waypoints(
-                last_pick_pos,
-                place_pos,
-                rng,
-                work_center=work_center,
-                home_arm=attempt_home_arm,
-            )
-
-        names = [wp[0] for wp in waypoints]
-        if "CLOSE" not in names or "LIFT" not in names:
-            LOG.warning("collect: invalid waypoint list without CLOSE/LIFT, skipping episode")
-            break
-        close_idx = names.index("CLOSE")
-        lift_idx = names.index("LIFT")
-        if close_idx <= 0 or lift_idx <= close_idx:
-            LOG.warning(
-                "collect: invalid waypoint order (close_idx=%d lift_idx=%d), skipping episode",
-                close_idx,
-                lift_idx,
-            )
-            break
-
-        _, home_arm, home_gripper = waypoints[0]
-        for _ in range(30):
-            if _timeout_triggered():
-                break
-            arm_cmd, gr_cmd = _step_toward_joint_targets(franka, home_arm, home_gripper)
-            _set_joint_targets(franka, arm_cmd, gr_cmd, physics_control=True)
-            world.step(render=True)
-            _record_frame(arm_target=home_arm, gripper_target=home_gripper)
-        if stopped:
-            break
-
-        pick_transitions = list(zip(waypoints[:close_idx], waypoints[1 : close_idx + 1]))
-        lift_transitions = list(zip(waypoints[close_idx:lift_idx], waypoints[close_idx + 1 : lift_idx + 1]))
-        place_transitions = list(zip(waypoints[lift_idx:-1], waypoints[lift_idx + 1 :]))
-
-        # ---- Curobo full approach ---
-        if True:
-            LOG.info(
-                "collect: attempt %d FINAL z_targets pick_grasp_z=%.4f before down_xyz",
-                attempt, float(z_targets["pick_grasp_z"]),
-            )
-            down_xyz = np.array(
-                [last_pick_pos[0], last_pick_pos[1],
-                 float(z_targets["pick_grasp_z"])],
-                dtype=np.float32,
-            )
-            down_quat = (
-                ik_target_orientation
-                if ik_target_orientation is not None
-                else TOP_DOWN_FALLBACK_QUAT.copy()
-            )
-
-            _reach_check_log_count = [0]
-            # Planned grasp target (set before approach, used in closure).
-            # Teleport-based approach may push the ball, so the live target
-            # shifts while the robot is still at the PLANNED position.
-            # Accept reach if EEF is close to EITHER live or planned target.
-            _planned_target = [down_xyz.copy()]
-
-            def _curobo_reach_check() -> bool:
-                m = _compute_grasp_metrics(
-                    franka=franka,
+            if force_topdown_grasp and annotation_target is not None:
+                annotation_target = None
+            if annotation_target is not None:
+                raw_pick_x = float(annotation_target["target_pos"][0])
+                raw_pick_y = float(annotation_target["target_pos"][1])
+                pick_source = "annotation"
+                current_grasp_target = annotation_target
+                _current_ann_idx = str(annotation_target.get("index", "na"))
+                try:
+                    obj_pos_dbg, _ = _get_object_tracking_pose(stage, object_prim_path, usd, usd_geom)
+                    tgt_pos_dbg = _to_numpy(annotation_target.get("target_pos"), dtype=np.float32).reshape(-1)
+                    d = tgt_pos_dbg[:3] - obj_pos_dbg[:3]
+                    LOG.info(
+                        "collect: attempt %d annotation_pick idx=%s group=%s label=%s "
+                        "converted=%s ik_feasible=%s relaxed=%s target=(%.4f, %.4f, %.4f) "
+                        "obj_delta=(%.4f, %.4f, %.4f)",
+                        attempt,
+                        str(annotation_target.get("index", "na")),
+                        str(annotation_target.get("candidate_group", "body")),
+                        str(annotation_target.get("label", "body")),
+                        bool(annotation_target.get("annotation_tip_mid_to_hand_converted", False)),
+                        bool(annotation_target.get("ik_feasible", False)),
+                        bool(annotation_target.get("ik_orientation_relaxed", False)),
+                        float(tgt_pos_dbg[0]),
+                        float(tgt_pos_dbg[1]),
+                        float(tgt_pos_dbg[2]),
+                        float(d[0]),
+                        float(d[1]),
+                        float(d[2]),
+                    )
+                except Exception:
+                    pass
+            else:
+                if is_mug_target and enforce_mug_annotation_target:
+                    raise RuntimeError(
+                        "Mug grasp annotation target selection failed; refusing fallback to bbox/root pose."
+                    )
+                _current_ann_idx = "none"
+                raw_pick_x, raw_pick_y, pick_source = _query_object_pick_xy(
                     stage=stage,
-                    eef_prim_path=eef_prim_path,
-                    get_prim_at_path=get_prim_at_path,
+                    object_prim_path=object_prim_path,
                     usd=usd,
                     usd_geom=usd_geom,
-                    object_prim_path=object_prim_path,
-                    table_top_z=table_top_z,
-                    object_height=float(z_targets["object_height"]),
-                    finger_left_prim_path=finger_left_prim_path,
-                    finger_right_prim_path=finger_right_prim_path,
-                    current_target=current_grasp_target,
-                    tip_mid_offset_in_hand=annotation_tip_mid_offset_hand,
                 )
-                ok = _verify_reach_before_close(m)
-
-
-                planned_ok = False
-                eef_pos, _ = _get_eef_pose(stage, eef_prim_path, get_prim_at_path, usd, usd_geom)
-                planned_d = _planned_target[0] - eef_pos[:3]
-                planned_dist = float(np.linalg.norm(planned_d))
-                planned_xy = float(np.linalg.norm(planned_d[:2]))
-                if (planned_dist <= REACH_BEFORE_CLOSE_MAX_OBJECT_EEF_DISTANCE
-                        and planned_xy <= REACH_BEFORE_CLOSE_MAX_OBJECT_EEF_XY_DISTANCE):
-                    planned_ok = True
-                final_ok = ok or planned_ok  # T25n: re-enable planned_ok — MoveL gets EEF close but tip_mid amplifies error for diagonal approaches
-                _reach_check_log_count[0] += 1
-                if _reach_check_log_count[0] <= 3 or final_ok:
-                    LOG.info(
-                        "reach_check: eef_d=%.4f eef_xy=%.4f planned_d=%.4f planned_xy=%.4f "
-                        "tip_d=%.4f tip_dz=%.4f live_ok=%s planned_ok=%s ok=%s",
-                        m.get("target_eef_distance", m.get("object_eef_distance", -1)),
-                        m.get("target_eef_xy_distance", m.get("object_eef_xy_distance", -1)),
-                        planned_dist, planned_xy,
-                        m.get("target_tip_mid_distance", m.get("object_tip_mid_distance", -1)),
-                        m.get("target_tip_mid_z_delta", m.get("object_tip_mid_z_delta", -1)),
-                        ok, planned_ok, final_ok,
-                    )
-                return final_ok
-
-            # Read object ground-truth position from physics for Curobo
-            # collision cuboid.  Always use the live position rather than
-            # estimating from table_top_z which can be stale.
-            _obj_gt, _ = _get_prim_world_pose(stage, object_prim_path, usd, usd_geom)
-            _obj_center = _obj_gt[:3].copy()
-
-            _current_phase = "APPROACH"
-            curobo_ok = _curobo_full_approach(
-                curobo_state=curobo_state,
-                franka=franka,
-                world=world,
-                stage=stage,
-                robot_prim_path=robot_prim_path,
-                table_prim_path=table_prim_path,
-                object_prim_path=object_prim_path,
-                target_pos_world=down_xyz,
-                target_quat_world=down_quat,
-                record_fn=_record_frame,
-                timeout_fn=_timeout_triggered,
-                stop_event=stop_event,
-                reach_check_fn=_curobo_reach_check,
-                usd=usd,
-                usd_geom=usd_geom,
-                object_world_pos=_obj_center,
-                ik_solver=ik_solver,
-                eef_prim_path=eef_prim_path,
-                get_prim_at_path=get_prim_at_path,
-            )
-            if stopped:
-                break
-            # Annotation pose cycling + top-down fallback.
-            # If annotation orientation fails Curobo, try up to 2 alternative annotation
-            # poses before falling back to top-down vertical approach.
-            if not curobo_ok and not np.allclose(down_quat, TOP_DOWN_FALLBACK_QUAT, atol=0.05):
-                # Partial retract toward HOME before replanning so Curobo
-                # start-state clears the table collision zone, but stays close
-                # enough for an accurate short re-approach.
-                for _h in range(15):
-                    if _timeout_triggered():
-                        break
-                    arm_cmd, gr_cmd = _step_toward_joint_targets(franka, HOME.copy(), GRIPPER_OPEN)
-                    _set_joint_targets(franka, arm_cmd, gr_cmd, physics_control=True)
-                    world.step(render=True)
-                    _record_frame(arm_target=HOME.copy(), gripper_target=GRIPPER_OPEN)
-
-                _REPLAN_LIMIT = 2
-                for _rp in range(_REPLAN_LIMIT):
-                    if _timeout_triggered() or (stop_event is not None and stop_event.is_set()):
-                        break
-                    if annotation_target is not None:
-                        _record_failed_annotation_target(
-                            cache_key=annotation_failed_pose_cache_key,
-                            target=annotation_target,
-                            reason="curobo_seg1_fail",
-                            attempt=attempt,
-                        )
-                    _alt = _select_annotation_grasp_target(
-                        stage=stage,
-                        object_prim_path=object_prim_path,
-                        usd=usd,
-                        usd_geom=usd_geom,
-                        candidates=annotation_candidates,
-                        attempt_index=attempt + _rp + 1,
-                        ik_solver=ik_solver,
-                        table_x_range=table_x_range,
-                        table_y_range=table_y_range,
-                        table_top_z=table_top_z,
-                        failed_pose_ids=_get_failed_annotation_pose_ids(annotation_failed_pose_cache_key),
-                        tip_mid_offset_in_hand=annotation_tip_mid_offset_hand,
-                        annotation_pose_is_tip_mid_frame=ANNOTATION_POSE_IS_TIP_MID_FRAME,
-                        local_pos_scale=annotation_local_pos_scale,
-                        align_tip_mid_to_center=annotation_align_tip_mid,
-                    )
-                    if _alt is None:
-                        LOG.info("collect: attempt %d replan %d no more annotation candidates", attempt, _rp + 1)
-                        break
-                    _alt_quat = _normalize_quat_wxyz(_alt["target_quat"])
-                    _alt_approach_dir_z = float(_quat_to_rot_wxyz(_alt_quat)[:, 2][2])
-                    _alt_tcp_z = float(_alt["target_pos"][2]) + _TCP_Z_OFFSET * _alt_approach_dir_z
-                    _alt_z = float(np.clip(_alt_tcp_z, min_z, max_z))
-                    _alt_xyz = np.array(
-                        [float(_alt["target_pos"][0]), float(_alt["target_pos"][1]), _alt_z],
-                        dtype=np.float32,
-                    )
-                    _planned_target[0] = _alt_xyz.copy()
-                    _current_ann_idx = str(_alt["index"])
-                    LOG.info(
-                        "collect: attempt %d replan %d with alt annotation idx=%s z=%.4f",
-                        attempt, _rp + 1, _current_ann_idx, _alt_z,
-                    )
-                    curobo_ok = _curobo_full_approach(
-                        curobo_state=curobo_state,
-                        franka=franka,
-                        world=world,
-                        stage=stage,
-                        robot_prim_path=robot_prim_path,
-                        table_prim_path=table_prim_path,
-                        object_prim_path=object_prim_path,
-                        target_pos_world=_alt_xyz,
-                        target_quat_world=_alt_quat,
-                        record_fn=_record_frame,
-                        timeout_fn=_timeout_triggered,
-                        stop_event=stop_event,
-                        reach_check_fn=_curobo_reach_check,
-                        usd=usd,
-                        usd_geom=usd_geom,
-                        object_world_pos=_obj_center,
-                        ik_solver=ik_solver,
-                        eef_prim_path=eef_prim_path,
-                        get_prim_at_path=get_prim_at_path,
-                    )
-                    if curobo_ok:
-                        annotation_target = _alt
-                        down_quat = _alt_quat
-                        break
-
-                # Top-down fallback if all annotation replans failed.
-                # Use object center XY (not annotation's side-approach panda_hand XY).
-                if not curobo_ok:
-                    LOG.info("collect: attempt %d all annotation replans failed, top-down fallback", attempt)
-                    _obj_pos_td, _ = _get_prim_world_pose(stage, object_prim_path, usd, usd_geom)
-                    td_xyz = np.array(
-                        [float(_obj_pos_td[0]), float(_obj_pos_td[1]), down_xyz[2]],
-                        dtype=np.float32,
-                    )
-                    _planned_target[0] = td_xyz.copy()
-                    td_quat = TOP_DOWN_FALLBACK_QUAT.copy()
-                    curobo_ok = _curobo_full_approach(
-                        curobo_state=curobo_state,
-                        franka=franka,
-                        world=world,
-                        stage=stage,
-                        robot_prim_path=robot_prim_path,
-                        table_prim_path=table_prim_path,
-                        object_prim_path=object_prim_path,
-                        target_pos_world=td_xyz,
-                        target_quat_world=td_quat,
-                        record_fn=_record_frame,
-                        timeout_fn=_timeout_triggered,
-                        stop_event=stop_event,
-                        reach_check_fn=_curobo_reach_check,
-                        usd=usd,
-                        usd_geom=usd_geom,
-                        object_world_pos=_obj_center,
-                        ik_solver=ik_solver,
-                        eef_prim_path=eef_prim_path,
-                        get_prim_at_path=get_prim_at_path,
-                    )
-            if stopped:
-                break
-            if curobo_ok:
-                LOG.info("collect: attempt %d Curobo full_approach reached target", attempt)
-            else:
-                LOG.warning("collect: attempt %d Curobo full_approach failed; skipping attempt", attempt)
-                continue
-        if stopped:
-            break
-
-        # Convergence settle: hold current pose open-gripper for a few steps.
-        _current_phase = "SETTLE"
-        close_arm_pre = _to_numpy(franka.get_joint_positions())[:7].astype(np.float32)
-        for settle_step in range(SETTLE_MAX_STEPS):
-            if _timeout_triggered():
-                break
-            arm_cmd, gr_cmd = _step_toward_joint_targets(franka, close_arm_pre, GRIPPER_OPEN)
-            _set_joint_targets(franka, arm_cmd, gr_cmd, physics_control=True)
-            world.step(render=True)
-            _record_frame(arm_target=close_arm_pre, gripper_target=GRIPPER_OPEN)
-            # Check joint convergence after minimum settle period.
-            if settle_step >= PRE_CLOSE_SETTLE_STEPS - 1:
-                current_joints = _to_numpy(franka.get_joint_positions())
-                if current_joints.size >= 7:
-                    max_err = float(np.max(np.abs(
-                        close_arm_pre[:7] - current_joints[:7].astype(np.float32)
-                    )))
-                    if max_err < SETTLE_CONVERGENCE_RAD:
-                        LOG.info(
-                            "collect: attempt %d settle converged in %d steps (max_err=%.4f)",
-                            attempt, settle_step + 1, max_err,
-                        )
-                        break
-        if stopped:
-            break
-
-        reach_metrics = _compute_grasp_metrics(
-            franka=franka,
-            stage=stage,
-            eef_prim_path=eef_prim_path,
-            get_prim_at_path=get_prim_at_path,
-            usd=usd,
-            usd_geom=usd_geom,
-            object_prim_path=object_prim_path,
-            table_top_z=table_top_z,
-            object_height=object_height,
-            finger_left_prim_path=finger_left_prim_path,
-            finger_right_prim_path=finger_right_prim_path,
-            current_target=current_grasp_target,
-            tip_mid_offset_in_hand=annotation_tip_mid_offset_hand,
-        )
-        _log_attempt_world_debug(attempt, "pre_close_gate", current_grasp_target)
-        reach_ok = _verify_reach_before_close(reach_metrics)
-        # T25j: removed planned_ok fallback — seg2 no longer teleports,
-        # so live ball position is accurate. Only use tip_mid-based check.
-        if not reach_ok:
-            LOG.warning(
-                "collect: grasp retry %d/%d reach_before_close failed metrics=%s "
-                "thresholds={eef<=%.3f,eef_xy<=%.3f,tip<=%.3f,tip_xy<=%.3f,|tip_dz|<=%.3f}",
+                current_grasp_target = {
+                    "target_pos": np.array([raw_pick_x, raw_pick_y, float(table_top_z)], dtype=np.float32),
+                    "target_quat": np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32),
+                    "source": pick_source,
+                    "source_id": GRASP_POSE_SOURCE_IDS.get(pick_source, GRASP_POSE_SOURCE_IDS["none"]),
+                    "valid": pick_source in {"bbox_center", "root_pose"},
+                }
+            pick_x = float(np.clip(raw_pick_x, table_x_range[0], table_x_range[1]))
+            pick_y = float(np.clip(raw_pick_y, table_y_range[0], table_y_range[1]))
+            clamp_delta = float(np.linalg.norm(np.array([pick_x - raw_pick_x, pick_y - raw_pick_y], dtype=np.float32)))
+            if clamp_delta > PICK_CLAMP_MAX_DELTA and np.isfinite(raw_pick_x) and np.isfinite(raw_pick_y):
+                LOG.warning(
+                    "collect: attempt %d workspace mismatch (%s raw=(%.3f, %.3f), clamped=(%.3f, %.3f), delta=%.3f) -> using CLAMPED live target",
+                    attempt,
+                    pick_source,
+                    raw_pick_x,
+                    raw_pick_y,
+                    pick_x,
+                    pick_y,
+                    clamp_delta,
+                )
+                # Keep target inside robot-table reachable workspace for physically valid approach.
+                if current_grasp_target is not None:
+                    if current_grasp_target.get("source") == "annotation":
+                        if is_mug_target and enforce_mug_annotation_target:
+                            raise RuntimeError(
+                                "Mug annotation target projected outside workspace; refusing fallback to bbox target."
+                            )
+                        # Annotation can point to unreachable local handles; switch to live bbox target.
+                        current_grasp_target = {
+                            "target_pos": np.array([pick_x, pick_y, float(table_top_z)], dtype=np.float32),
+                            "target_quat": np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32),
+                            "source": "bbox_center",
+                            "source_id": GRASP_POSE_SOURCE_IDS["bbox_center"],
+                            "valid": True,
+                        }
+                    else:
+                        pos = _to_numpy(current_grasp_target.get("target_pos"), dtype=np.float32).reshape(-1)
+                        if pos.size < 3:
+                            pos = np.array([pick_x, pick_y, float(table_top_z)], dtype=np.float32)
+                        else:
+                            pos = pos.copy()
+                            pos[0] = pick_x
+                            pos[1] = pick_y
+                        current_grasp_target["target_pos"] = pos.astype(np.float32, copy=False)
+            last_pick_pos = (pick_x, pick_y)
+            if abs(pick_x - raw_pick_x) > 1e-3 or abs(pick_y - raw_pick_y) > 1e-3:
+                LOG.warning(
+                    "collect: attempt %d pick pose clamped (%s): raw=(%.3f, %.3f), clamped=(%.3f, %.3f)",
+                    attempt,
+                    pick_source,
+                    raw_pick_x,
+                    raw_pick_y,
+                    pick_x,
+                    pick_y,
+                )
+            LOG.info(
+                "collect: attempt %d planner=%s source=%s pick=(%.4f, %.4f) place_hint=%s",
                 attempt,
-                GRASP_MAX_ATTEMPTS,
-                reach_metrics,
-                REACH_BEFORE_CLOSE_MAX_OBJECT_EEF_DISTANCE,
-                REACH_BEFORE_CLOSE_MAX_OBJECT_EEF_XY_DISTANCE,
-                REACH_BEFORE_CLOSE_MAX_OBJECT_TIP_MID_DISTANCE,
-                REACH_BEFORE_CLOSE_MAX_OBJECT_TIP_MID_XY_DISTANCE,
-                REACH_BEFORE_CLOSE_MAX_ABS_TIP_MID_Z_DELTA,
+                "curobo",
+                pick_source,
+                pick_x,
+                pick_y,
+                "none" if place_pos is None else f"({place_pos[0]:.4f}, {place_pos[1]:.4f})",
             )
-
-            _record_failed_annotation_target(
-                cache_key=annotation_failed_pose_cache_key,
-                target=current_grasp_target,
-                reason="reach_verify_failed",
-                attempt=attempt,
+            _log_attempt_world_debug(attempt, "pre_plan", current_grasp_target)
+            if place_pos is None:
+                place_pos = _sample_place_from_pick(rng, table_x_range, table_y_range, last_pick_pos)
+            object_height = _estimate_object_height(stage, object_prim_path, usd_geom, fallback=OBJECT_SIZE)
+            z_targets = _compute_pick_place_z_targets(
+                stage=stage,
+                object_prim_path=object_prim_path,
+                usd_geom=usd_geom,
+                table_top_z=table_top_z,
+                fallback_object_height=object_height,
             )
-            lift_arm = waypoints[lift_idx][1]
-            _current_phase = "REPLAN"
-            _prepare_replan_from_current(lift_arm=lift_arm)
-            if stopped:
+            object_height = float(z_targets["object_height"])
+            LOG.info(
+                "collect: attempt %d z_targets BEFORE clip: pick_grasp_z=%.4f pick_approach_z=%.4f "
+                "obj_h=%.4f table_top_z=%.4f annotation_target=%s",
+                attempt,
+                float(z_targets["pick_grasp_z"]),
+                float(z_targets["pick_approach_z"]),
+                float(z_targets["object_height"]),
+                float(table_top_z),
+                "NOT_NONE" if annotation_target is not None else "NONE",
+            )
+            if annotation_target is not None:
+                ann_z = float(annotation_target["target_pos"][2])
+                # ann_z is in panda_hand frame (after TCP→panda_hand conversion).
+                # Convert back to TCP Z so that _curobo_full_approach can re-offset
+                # correctly for whatever orientation it ends up using (annotation or
+                # top-down fallback).  TCP_z = panda_hand_z + TCP_OFFSET * approach_dir_z.
+                _ann_quat = _normalize_quat_wxyz(annotation_target["target_quat"])
+                _ann_approach_dir_z = float(_quat_to_rot_wxyz(_ann_quat)[:, 2][2])
+                _TCP_Z_OFFSET = 0.1034
+                ann_tcp_z = ann_z + _TCP_Z_OFFSET * _ann_approach_dir_z
+                min_z = float(table_top_z) + IK_PICK_MIN_CLEARANCE_FROM_TABLE
+                max_z = max(min_z + 0.01, float(z_targets["pick_approach_z"]) - 0.04)
+                z_targets["pick_grasp_z"] = float(np.clip(ann_tcp_z, min_z, max_z))
+                z_targets["pick_approach_z"] = max(
+                    float(z_targets["pick_approach_z"]),
+                    float(z_targets["pick_grasp_z"]) + 0.08,
+                )
+                LOG.info(
+                    "collect: attempt %d z_targets AFTER clip: ann_z=%.4f min_z=%.4f max_z=%.4f "
+                    "clipped_pick_grasp_z=%.4f pick_approach_z=%.4f",
+                    attempt, ann_z, min_z, max_z,
+                    float(z_targets["pick_grasp_z"]),
+                    float(z_targets["pick_approach_z"]),
+                )
+                ik_target_orientation = _normalize_quat_wxyz(annotation_target["target_quat"])
+            elif force_topdown_grasp:
+                ik_target_orientation = TOP_DOWN_FALLBACK_QUAT.copy()
+                if current_grasp_target is not None:
+                    current_grasp_target["target_quat"] = ik_target_orientation.copy()
+            elif no_annotation_available:
+                ik_target_orientation = TOP_DOWN_FALLBACK_QUAT.copy()
+                if current_grasp_target is not None:
+                    current_grasp_target["target_quat"] = ik_target_orientation.copy()
+                LOG.info("collect: attempt %d using top-down fallback orientation (no annotation)", attempt)
+            elif ik_target_orientation is None:
+                _, cand_quat = _get_eef_pose(stage, eef_prim_path, get_prim_at_path, usd, usd_geom)
+                cand_quat = np.asarray(cand_quat, dtype=np.float32).reshape(-1)
+                if cand_quat.size >= 4 and np.all(np.isfinite(cand_quat[:4])):
+                    norm = float(np.linalg.norm(cand_quat[:4]))
+                    if np.isfinite(norm) and norm > 1e-6:
+                        ik_target_orientation = (cand_quat[:4] / norm).astype(np.float32)
+    
+            if current_grasp_target is not None and current_grasp_target.get("source") != "annotation":
+                pos = _to_numpy(current_grasp_target.get("target_pos"), dtype=np.float32).reshape(-1)
+                if pos.size >= 3:
+                    pos = pos.copy()
+                    pos[2] = float(z_targets["pick_grasp_z"])
+                    current_grasp_target["target_pos"] = pos
+    
+            for _ in range(8):
+                world.step(render=True)
+                _record_frame()
+    
+            # First attempt replans from current arm; later retries bias back to canonical HOME to unwind knots.
+            attempt_home_arm = _current_arm_target() if attempt == 1 else HOME.copy()
+            waypoints = _make_pick_place_waypoints_ik(
+                ik_solver=ik_solver,
+                pick_pos=last_pick_pos,
+                place_pos=place_pos,
+                pick_grasp_z=float(z_targets["pick_grasp_z"]),
+                pick_approach_z=float(z_targets["pick_approach_z"]),
+                place_grasp_z=float(z_targets["place_grasp_z"]),
+                place_approach_z=float(z_targets["place_approach_z"]),
+                table_top_z=float(table_top_z),
+                rng=rng,
+                target_orientation=ik_target_orientation,
+                home_arm=attempt_home_arm,
+            )
+            if waypoints is None:
+                waypoints = _make_pick_place_waypoints(
+                    last_pick_pos,
+                    place_pos,
+                    rng,
+                    work_center=work_center,
+                    home_arm=attempt_home_arm,
+                )
+    
+            names = [wp[0] for wp in waypoints]
+            if "CLOSE" not in names or "LIFT" not in names:
+                LOG.warning("collect: invalid waypoint list without CLOSE/LIFT, skipping episode")
                 break
-            continue
-
-        # Ball displacement check: if the ball moved significantly during
-        # teleport approach, the close will fail (gripper closes on air).
-        # Skip directly to the next annotation to save time.
-        _obj_now, _ = _get_prim_world_pose(stage, object_prim_path, usd, usd_geom)
-        _ball_drift = float(np.linalg.norm(_obj_now[:3] - _obj_center))
-        _BALL_DRIFT_THRESHOLD = 0.05  # 5cm
-        if _ball_drift > _BALL_DRIFT_THRESHOLD:
-            LOG.warning(
-                "collect: attempt %d ball displaced %.3fm (>%.2f) during approach, "
-                "skipping close",
-                attempt, _ball_drift, _BALL_DRIFT_THRESHOLD,
-            )
-
-            _record_failed_annotation_target(
-                cache_key=annotation_failed_pose_cache_key,
-                target=current_grasp_target,
-                reason="ball_displaced",
-                attempt=attempt,
-            )
-            lift_arm = waypoints[lift_idx][1]
-            _current_phase = "REPLAN"
-            _prepare_replan_from_current(lift_arm=lift_arm)
-            if stopped:
+            close_idx = names.index("CLOSE")
+            lift_idx = names.index("LIFT")
+            if close_idx <= 0 or lift_idx <= close_idx:
+                LOG.warning(
+                    "collect: invalid waypoint order (close_idx=%d lift_idx=%d), skipping episode",
+                    close_idx,
+                    lift_idx,
+                )
                 break
-            continue
-
-        _current_phase = "CLOSE"
-        _hold_gr_target = float(GRIPPER_CLOSED)  # default; updated by contact detection
-        if CLOSE_HOLD_STEPS > 0:
-            print(f"[CLOSE] attempt={attempt} ENTERING close_hold steps={CLOSE_HOLD_STEPS} version={_CODE_VERSION}", flush=True)
-            close_arm = _to_numpy(franka.get_joint_positions())[:7].astype(np.float32)
-            _close_ramp_steps = max(int(GRIPPER_OPEN / 0.002), 1)  # ~20 steps
-            _stall_count = 0
-            _RESIST_THRESHOLD = 0.004  # per-finger: 4mm gap actual→target = blocked (PD lag ~2-3mm)
-            _RESIST_PATIENCE = 3  # resistance for 3 consecutive steps → confirmed contact
-            _MIN_CLOSE_STEP = 15  # skip early steps; at step 15 target=0.01 < ball radius 0.014
-            for _cs in range(CLOSE_HOLD_STEPS):
+    
+            _, home_arm, home_gripper = waypoints[0]
+            for _ in range(30):
                 if _timeout_triggered():
                     break
-                # Gradual teleport close: ramp gripper target from OPEN→CLOSED
-                # over ~20 steps, then hold closed for the remainder.
-                _gr_frac = min(1.0, float(_cs + 1) / float(_close_ramp_steps))
-                _gr_target = float(GRIPPER_OPEN * (1.0 - _gr_frac) + GRIPPER_CLOSED * _gr_frac)
-                # If we detected contact, hold at the stalled width instead of pushing to 0
-                if _stall_count >= _RESIST_PATIENCE:
-                    _gr_target = _hold_gr_target
-                arm_cmd, _ = _step_toward_joint_targets(franka, close_arm, _gr_target)
-                # PD control only — no teleport (physics_control=False).
-                # Teleport bypasses physics and punches fingers through the ball.
-                # PD lets fingers stall on contact so stall detection works.
-                _set_joint_targets(franka, arm_cmd, _gr_target, physics_control=True)
+                arm_cmd, gr_cmd = _step_toward_joint_targets(franka, home_arm, home_gripper)
+                _set_joint_targets(franka, arm_cmd, gr_cmd, physics_control=True)
                 world.step(render=True)
-                # Log ball + fingertip ground truth every 5 steps
-                if _cs % 5 == 0:
-                    _ball_pos, _ = _get_prim_world_pose(stage, object_prim_path, usd, usd_geom)
+                _record_frame(arm_target=home_arm, gripper_target=home_gripper)
+            if stopped:
+                break
+    
+            pick_transitions = list(zip(waypoints[:close_idx], waypoints[1 : close_idx + 1]))
+            lift_transitions = list(zip(waypoints[close_idx:lift_idx], waypoints[close_idx + 1 : lift_idx + 1]))
+            place_transitions = list(zip(waypoints[lift_idx:-1], waypoints[lift_idx + 1 :]))
+    
+            # ---- Curobo full approach ---
+            if True:
+                LOG.info(
+                    "collect: attempt %d FINAL z_targets pick_grasp_z=%.4f before down_xyz",
+                    attempt, float(z_targets["pick_grasp_z"]),
+                )
+                down_xyz = np.array(
+                    [last_pick_pos[0], last_pick_pos[1],
+                     float(z_targets["pick_grasp_z"])],
+                    dtype=np.float32,
+                )
+                down_quat = (
+                    ik_target_orientation
+                    if ik_target_orientation is not None
+                    else TOP_DOWN_FALLBACK_QUAT.copy()
+                )
+    
+                _reach_check_log_count = [0]
+                # Planned grasp target (set before approach, used in closure).
+                # Teleport-based approach may push the ball, so the live target
+                # shifts while the robot is still at the PLANNED position.
+                # Accept reach if EEF is close to EITHER live or planned target.
+                _planned_target = [down_xyz.copy()]
+    
+                def _curobo_reach_check() -> bool:
+                    m = _compute_grasp_metrics(
+                        franka=franka,
+                        stage=stage,
+                        eef_prim_path=eef_prim_path,
+                        get_prim_at_path=get_prim_at_path,
+                        usd=usd,
+                        usd_geom=usd_geom,
+                        object_prim_path=object_prim_path,
+                        table_top_z=table_top_z,
+                        object_height=float(z_targets["object_height"]),
+                        finger_left_prim_path=finger_left_prim_path,
+                        finger_right_prim_path=finger_right_prim_path,
+                        current_target=current_grasp_target,
+                        tip_mid_offset_in_hand=annotation_tip_mid_offset_hand,
+                    )
+                    ok = _verify_reach_before_close(m)
+    
+    
+                    planned_ok = False
+                    eef_pos, _ = _get_eef_pose(stage, eef_prim_path, get_prim_at_path, usd, usd_geom)
+                    planned_d = _planned_target[0] - eef_pos[:3]
+                    planned_dist = float(np.linalg.norm(planned_d))
+                    planned_xy = float(np.linalg.norm(planned_d[:2]))
+                    if (planned_dist <= REACH_BEFORE_CLOSE_MAX_OBJECT_EEF_DISTANCE
+                            and planned_xy <= REACH_BEFORE_CLOSE_MAX_OBJECT_EEF_XY_DISTANCE):
+                        planned_ok = True
+                    final_ok = ok or planned_ok  # T25n: re-enable planned_ok — MoveL gets EEF close but tip_mid amplifies error for diagonal approaches
+                    _reach_check_log_count[0] += 1
+                    if _reach_check_log_count[0] <= 3 or final_ok:
+                        LOG.info(
+                            "reach_check: eef_d=%.4f eef_xy=%.4f planned_d=%.4f planned_xy=%.4f "
+                            "tip_d=%.4f tip_dz=%.4f live_ok=%s planned_ok=%s ok=%s",
+                            m.get("target_eef_distance", m.get("object_eef_distance", -1)),
+                            m.get("target_eef_xy_distance", m.get("object_eef_xy_distance", -1)),
+                            planned_dist, planned_xy,
+                            m.get("target_tip_mid_distance", m.get("object_tip_mid_distance", -1)),
+                            m.get("target_tip_mid_z_delta", m.get("object_tip_mid_z_delta", -1)),
+                            ok, planned_ok, final_ok,
+                        )
+                    return final_ok
+    
+                # Read object ground-truth position from physics for Curobo
+                # collision cuboid.  Always use the live position rather than
+                # estimating from table_top_z which can be stale.
+                _obj_gt, _ = _get_prim_world_pose(stage, object_prim_path, usd, usd_geom)
+                _obj_center = _obj_gt[:3].copy()
+    
+                _current_phase = "APPROACH"
+                curobo_ok = _curobo_full_approach(
+                    curobo_state=curobo_state,
+                    franka=franka,
+                    world=world,
+                    stage=stage,
+                    robot_prim_path=robot_prim_path,
+                    table_prim_path=table_prim_path,
+                    object_prim_path=object_prim_path,
+                    target_pos_world=down_xyz,
+                    target_quat_world=down_quat,
+                    record_fn=_record_frame,
+                    timeout_fn=_timeout_triggered,
+                    stop_event=stop_event,
+                    reach_check_fn=_curobo_reach_check,
+                    usd=usd,
+                    usd_geom=usd_geom,
+                    object_world_pos=_obj_center,
+                    ik_solver=ik_solver,
+                    eef_prim_path=eef_prim_path,
+                    get_prim_at_path=get_prim_at_path,
+                )
+                if stopped:
+                    break
+                # Annotation pose cycling + top-down fallback.
+                # If annotation orientation fails Curobo, try up to 2 alternative annotation
+                # poses before falling back to top-down vertical approach.
+                if not curobo_ok and not np.allclose(down_quat, TOP_DOWN_FALLBACK_QUAT, atol=0.05):
+                    # Partial retract toward HOME before replanning so Curobo
+                    # start-state clears the table collision zone, but stays close
+                    # enough for an accurate short re-approach.
+                    for _h in range(15):
+                        if _timeout_triggered():
+                            break
+                        arm_cmd, gr_cmd = _step_toward_joint_targets(franka, HOME.copy(), GRIPPER_OPEN)
+                        _set_joint_targets(franka, arm_cmd, gr_cmd, physics_control=True)
+                        world.step(render=True)
+                        _record_frame(arm_target=HOME.copy(), gripper_target=GRIPPER_OPEN)
+    
+                    _REPLAN_LIMIT = 2
+                    for _rp in range(_REPLAN_LIMIT):
+                        if _timeout_triggered() or (stop_event is not None and stop_event.is_set()):
+                            break
+                        if annotation_target is not None:
+                            _record_failed_annotation_target(
+                                cache_key=annotation_failed_pose_cache_key,
+                                target=annotation_target,
+                                reason="curobo_seg1_fail",
+                                attempt=attempt,
+                            )
+                        _alt = _select_annotation_grasp_target(
+                            stage=stage,
+                            object_prim_path=object_prim_path,
+                            usd=usd,
+                            usd_geom=usd_geom,
+                            candidates=annotation_candidates,
+                            attempt_index=attempt + _rp + 1,
+                            ik_solver=ik_solver,
+                            table_x_range=table_x_range,
+                            table_y_range=table_y_range,
+                            table_top_z=table_top_z,
+                            failed_pose_ids=_get_failed_annotation_pose_ids(annotation_failed_pose_cache_key),
+                            tip_mid_offset_in_hand=annotation_tip_mid_offset_hand,
+                            annotation_pose_is_tip_mid_frame=ANNOTATION_POSE_IS_TIP_MID_FRAME,
+                            local_pos_scale=annotation_local_pos_scale,
+                            align_tip_mid_to_center=annotation_align_tip_mid,
+                        )
+                        if _alt is None:
+                            LOG.info("collect: attempt %d replan %d no more annotation candidates", attempt, _rp + 1)
+                            break
+                        _alt_quat = _normalize_quat_wxyz(_alt["target_quat"])
+                        _alt_approach_dir_z = float(_quat_to_rot_wxyz(_alt_quat)[:, 2][2])
+                        _alt_tcp_z = float(_alt["target_pos"][2]) + _TCP_Z_OFFSET * _alt_approach_dir_z
+                        _alt_z = float(np.clip(_alt_tcp_z, min_z, max_z))
+                        _alt_xyz = np.array(
+                            [float(_alt["target_pos"][0]), float(_alt["target_pos"][1]), _alt_z],
+                            dtype=np.float32,
+                        )
+                        _planned_target[0] = _alt_xyz.copy()
+                        _current_ann_idx = str(_alt["index"])
+                        LOG.info(
+                            "collect: attempt %d replan %d with alt annotation idx=%s z=%.4f",
+                            attempt, _rp + 1, _current_ann_idx, _alt_z,
+                        )
+                        curobo_ok = _curobo_full_approach(
+                            curobo_state=curobo_state,
+                            franka=franka,
+                            world=world,
+                            stage=stage,
+                            robot_prim_path=robot_prim_path,
+                            table_prim_path=table_prim_path,
+                            object_prim_path=object_prim_path,
+                            target_pos_world=_alt_xyz,
+                            target_quat_world=_alt_quat,
+                            record_fn=_record_frame,
+                            timeout_fn=_timeout_triggered,
+                            stop_event=stop_event,
+                            reach_check_fn=_curobo_reach_check,
+                            usd=usd,
+                            usd_geom=usd_geom,
+                            object_world_pos=_obj_center,
+                            ik_solver=ik_solver,
+                            eef_prim_path=eef_prim_path,
+                            get_prim_at_path=get_prim_at_path,
+                        )
+                        if curobo_ok:
+                            annotation_target = _alt
+                            down_quat = _alt_quat
+                            break
+    
+                    # Top-down fallback if all annotation replans failed.
+                    # Use object center XY (not annotation's side-approach panda_hand XY).
+                    if not curobo_ok:
+                        LOG.info("collect: attempt %d all annotation replans failed, top-down fallback", attempt)
+                        _obj_pos_td, _ = _get_prim_world_pose(stage, object_prim_path, usd, usd_geom)
+                        td_xyz = np.array(
+                            [float(_obj_pos_td[0]), float(_obj_pos_td[1]), down_xyz[2]],
+                            dtype=np.float32,
+                        )
+                        _planned_target[0] = td_xyz.copy()
+                        td_quat = TOP_DOWN_FALLBACK_QUAT.copy()
+                        curobo_ok = _curobo_full_approach(
+                            curobo_state=curobo_state,
+                            franka=franka,
+                            world=world,
+                            stage=stage,
+                            robot_prim_path=robot_prim_path,
+                            table_prim_path=table_prim_path,
+                            object_prim_path=object_prim_path,
+                            target_pos_world=td_xyz,
+                            target_quat_world=td_quat,
+                            record_fn=_record_frame,
+                            timeout_fn=_timeout_triggered,
+                            stop_event=stop_event,
+                            reach_check_fn=_curobo_reach_check,
+                            usd=usd,
+                            usd_geom=usd_geom,
+                            object_world_pos=_obj_center,
+                            ik_solver=ik_solver,
+                            eef_prim_path=eef_prim_path,
+                            get_prim_at_path=get_prim_at_path,
+                        )
+                if stopped:
+                    break
+                if curobo_ok:
+                    LOG.info("collect: attempt %d Curobo full_approach reached target", attempt)
+                else:
+                    LOG.warning("collect: attempt %d Curobo full_approach failed; skipping attempt", attempt)
+                    continue
+            if stopped:
+                break
+    
+            # Convergence settle: hold current pose open-gripper for a few steps.
+            _current_phase = "SETTLE"
+            close_arm_pre = _to_numpy(franka.get_joint_positions())[:7].astype(np.float32)
+            for settle_step in range(SETTLE_MAX_STEPS):
+                if _timeout_triggered():
+                    break
+                arm_cmd, gr_cmd = _step_toward_joint_targets(franka, close_arm_pre, GRIPPER_OPEN)
+                _set_joint_targets(franka, arm_cmd, gr_cmd, physics_control=True)
+                world.step(render=True)
+                _record_frame(arm_target=close_arm_pre, gripper_target=GRIPPER_OPEN)
+                # Check joint convergence after minimum settle period.
+                if settle_step >= PRE_CLOSE_SETTLE_STEPS - 1:
+                    current_joints = _to_numpy(franka.get_joint_positions())
+                    if current_joints.size >= 7:
+                        max_err = float(np.max(np.abs(
+                            close_arm_pre[:7] - current_joints[:7].astype(np.float32)
+                        )))
+                        if max_err < SETTLE_CONVERGENCE_RAD:
+                            LOG.info(
+                                "collect: attempt %d settle converged in %d steps (max_err=%.4f)",
+                                attempt, settle_step + 1, max_err,
+                            )
+                            break
+            if stopped:
+                break
+    
+            reach_metrics = _compute_grasp_metrics(
+                franka=franka,
+                stage=stage,
+                eef_prim_path=eef_prim_path,
+                get_prim_at_path=get_prim_at_path,
+                usd=usd,
+                usd_geom=usd_geom,
+                object_prim_path=object_prim_path,
+                table_top_z=table_top_z,
+                object_height=object_height,
+                finger_left_prim_path=finger_left_prim_path,
+                finger_right_prim_path=finger_right_prim_path,
+                current_target=current_grasp_target,
+                tip_mid_offset_in_hand=annotation_tip_mid_offset_hand,
+            )
+            _log_attempt_world_debug(attempt, "pre_close_gate", current_grasp_target)
+            reach_ok = _verify_reach_before_close(reach_metrics)
+            # T25j: removed planned_ok fallback — seg2 no longer teleports,
+            # so live ball position is accurate. Only use tip_mid-based check.
+            if not reach_ok:
+                LOG.warning(
+                    "collect: grasp retry %d/%d reach_before_close failed metrics=%s "
+                    "thresholds={eef<=%.3f,eef_xy<=%.3f,tip<=%.3f,tip_xy<=%.3f,|tip_dz|<=%.3f}",
+                    attempt,
+                    GRASP_MAX_ATTEMPTS,
+                    reach_metrics,
+                    REACH_BEFORE_CLOSE_MAX_OBJECT_EEF_DISTANCE,
+                    REACH_BEFORE_CLOSE_MAX_OBJECT_EEF_XY_DISTANCE,
+                    REACH_BEFORE_CLOSE_MAX_OBJECT_TIP_MID_DISTANCE,
+                    REACH_BEFORE_CLOSE_MAX_OBJECT_TIP_MID_XY_DISTANCE,
+                    REACH_BEFORE_CLOSE_MAX_ABS_TIP_MID_Z_DELTA,
+                )
+    
+                _record_failed_annotation_target(
+                    cache_key=annotation_failed_pose_cache_key,
+                    target=current_grasp_target,
+                    reason="reach_verify_failed",
+                    attempt=attempt,
+                )
+                lift_arm = waypoints[lift_idx][1]
+                _current_phase = "REPLAN"
+                _prepare_replan_from_current(lift_arm=lift_arm)
+                if stopped:
+                    break
+                continue
+    
+            # Ball displacement check: if the ball moved significantly during
+            # teleport approach, the close will fail (gripper closes on air).
+            # Skip directly to the next annotation to save time.
+            _obj_now, _ = _get_prim_world_pose(stage, object_prim_path, usd, usd_geom)
+            _ball_drift = float(np.linalg.norm(_obj_now[:3] - _obj_center))
+            _BALL_DRIFT_THRESHOLD = 0.05  # 5cm
+            if _ball_drift > _BALL_DRIFT_THRESHOLD:
+                LOG.warning(
+                    "collect: attempt %d ball displaced %.3fm (>%.2f) during approach, "
+                    "skipping close",
+                    attempt, _ball_drift, _BALL_DRIFT_THRESHOLD,
+                )
+    
+                _record_failed_annotation_target(
+                    cache_key=annotation_failed_pose_cache_key,
+                    target=current_grasp_target,
+                    reason="ball_displaced",
+                    attempt=attempt,
+                )
+                lift_arm = waypoints[lift_idx][1]
+                _current_phase = "REPLAN"
+                _prepare_replan_from_current(lift_arm=lift_arm)
+                if stopped:
+                    break
+                continue
+    
+            _current_phase = "CLOSE"
+            _hold_gr_target = float(GRIPPER_CLOSED)  # default; updated by contact detection
+            if CLOSE_HOLD_STEPS > 0:
+                print(f"[CLOSE] attempt={attempt} ENTERING close_hold steps={CLOSE_HOLD_STEPS} version={_CODE_VERSION}", flush=True)
+                close_arm = _to_numpy(franka.get_joint_positions())[:7].astype(np.float32)
+                _close_ramp_steps = max(int(GRIPPER_OPEN / 0.002), 1)  # ~20 steps
+                _stall_count = 0
+                _RESIST_THRESHOLD = 0.004  # per-finger: 4mm gap actual→target = blocked (PD lag ~2-3mm)
+                _RESIST_PATIENCE = 3  # resistance for 3 consecutive steps → confirmed contact
+                _MIN_CLOSE_STEP = 15  # skip early steps; at step 15 target=0.01 < ball radius 0.014
+                for _cs in range(CLOSE_HOLD_STEPS):
+                    if _timeout_triggered():
+                        break
+                    # Gradual teleport close: ramp gripper target from OPEN→CLOSED
+                    # over ~20 steps, then hold closed for the remainder.
+                    _gr_frac = min(1.0, float(_cs + 1) / float(_close_ramp_steps))
+                    _gr_target = float(GRIPPER_OPEN * (1.0 - _gr_frac) + GRIPPER_CLOSED * _gr_frac)
+                    # If we detected contact, hold at the stalled width instead of pushing to 0
+                    if _stall_count >= _RESIST_PATIENCE:
+                        _gr_target = _hold_gr_target
+                    arm_cmd, _ = _step_toward_joint_targets(franka, close_arm, _gr_target)
+                    # PD control only — no teleport (physics_control=False).
+                    # Teleport bypasses physics and punches fingers through the ball.
+                    # PD lets fingers stall on contact so stall detection works.
+                    _set_joint_targets(franka, arm_cmd, _gr_target, physics_control=True)
+                    world.step(render=True)
+                    # Log ball + fingertip ground truth every 5 steps
+                    if _cs % 5 == 0:
+                        _ball_pos, _ = _get_prim_world_pose(stage, object_prim_path, usd, usd_geom)
+                        _lf_pos, _lf_q = _get_prim_world_pose(stage, finger_left_prim_path, usd, usd_geom)
+                        _rf_pos, _rf_q = _get_prim_world_pose(stage, finger_right_prim_path, usd, usd_geom)
+                        _lt = _lf_pos[:3] + _quat_to_rot_wxyz(_lf_q)[:, 2] * 0.046
+                        _rt = _rf_pos[:3] + _quat_to_rot_wxyz(_rf_q)[:, 2] * 0.046
+                        _tm = 0.5 * (_lt + _rt)
+                        print(f"[CLOSE] step={_cs} ball=({_ball_pos[0]:.4f},{_ball_pos[1]:.4f},{_ball_pos[2]:.4f}) gr={_gr_target:.4f} Ltip=({_lt[0]:.4f},{_lt[1]:.4f},{_lt[2]:.4f}) Rtip=({_rt[0]:.4f},{_rt[1]:.4f},{_rt[2]:.4f}) mid=({_tm[0]:.4f},{_tm[1]:.4f},{_tm[2]:.4f})", flush=True)
+                    _record_frame(arm_target=close_arm, gripper_target=_gr_target)
+                    # Contact detection: compare actual finger width vs commanded target.
+                    # When fingers hit an object, actual stays wide while target goes to 0.
+                    # Once contact confirmed, hold permanently (no re-checking).
+                    _cur_joints = _to_numpy(franka.get_joint_positions())
+                    _cur_gw = float(_cur_joints[7] + _cur_joints[8]) if _cur_joints.size >= 9 else -1.0
+                    if _stall_count < _RESIST_PATIENCE and _cur_gw > 0 and _cs >= _MIN_CLOSE_STEP:
+                        _per_finger_avg = _cur_gw / 2.0
+                        _residual = _per_finger_avg - _gr_target
+                        if _residual > _RESIST_THRESHOLD:
+                            _stall_count += 1
+                            if _stall_count == _RESIST_PATIENCE:
+                                _SQUEEZE_OFFSET = 0.005  # 5mm inward from contact
+                                _hold_gr_target = max(_per_finger_avg - _SQUEEZE_OFFSET, 0.0)
+                                print(f"[CLOSE] attempt={attempt} contact at step={_cs} total_w={_cur_gw:.4f} per_finger={_per_finger_avg:.4f} residual={_residual:.4f} → hold={_hold_gr_target:.4f} (squeeze={_SQUEEZE_OFFSET})", flush=True)
+                        else:
+                            _stall_count = 0
+                _close_joints = _to_numpy(franka.get_joint_positions())
+                _close_gw = float(_close_joints[7] + _close_joints[8]) if _close_joints.size >= 9 else -1.0
+                print(
+                    f"[CLOSE] attempt={attempt} after {CLOSE_HOLD_STEPS} steps: "
+                    f"width={_close_gw:.4f} (f7={float(_close_joints[7]) if _close_joints.size >= 8 else -1:.4f} "
+                    f"f8={float(_close_joints[8]) if _close_joints.size >= 9 else -1:.4f})",
+                    flush=True,
+                )
+            if stopped:
+                break
+    
+            close_metrics = _compute_grasp_metrics(
+                franka=franka,
+                stage=stage,
+                eef_prim_path=eef_prim_path,
+                get_prim_at_path=get_prim_at_path,
+                usd=usd,
+                usd_geom=usd_geom,
+                object_prim_path=object_prim_path,
+                table_top_z=table_top_z,
+                object_height=object_height,
+                finger_left_prim_path=finger_left_prim_path,
+                finger_right_prim_path=finger_right_prim_path,
+                current_target=current_grasp_target,
+                tip_mid_offset_in_hand=annotation_tip_mid_offset_hand,
+            )
+            close_ok = _verify_after_close(close_metrics)
+            _gw_close = close_metrics.get("gripper_width", -1.0)
+            print(
+                f"[CLOSE_VERIFY] attempt={attempt} ok={close_ok} gripper_width={_gw_close:.4f} "
+                f"eef_dist={close_metrics.get('object_eef_distance', -1):.4f}",
+                flush=True,
+            )
+            if not close_ok:
+                LOG.warning(
+                    "collect: grasp retry %d/%d close_verify failed metrics=%s "
+                    "thresholds={width>=%.4f,width<=%.4f,eef<=%.3f,eef_xy<=%.3f,tip_xy<=%.3f}",
+                    attempt,
+                    GRASP_MAX_ATTEMPTS,
+                    close_metrics,
+                    VERIFY_CLOSE_MIN_GRIPPER_WIDTH,
+                    VERIFY_CLOSE_MAX_GRIPPER_WIDTH,
+                    VERIFY_CLOSE_MAX_OBJECT_EEF_DISTANCE,
+                    VERIFY_CLOSE_MAX_OBJECT_EEF_XY_DISTANCE,
+                    VERIFY_CLOSE_MAX_OBJECT_TIP_MID_XY_DISTANCE,
+                )
+                _record_failed_annotation_target(
+                    cache_key=annotation_failed_pose_cache_key,
+                    target=current_grasp_target,
+                    reason="close_verify_failed",
+                    attempt=attempt,
+                )
+                lift_arm = waypoints[lift_idx][1]
+                _current_phase = "REPLAN"
+                _prepare_replan_from_current(lift_arm=lift_arm)
+                if stopped:
+                    break
+                continue
+    
+            # Lift via Curobo planner — guarantees smooth joint trajectory
+            # from current config to target position above.  IK-based lift
+            # fails because IK returns solutions in different arm configs
+            # (3.5+ rad jumps), causing EEF to rocket upward or dip down.
+            _lift_current_arm = _to_numpy(franka.get_joint_positions())[:7].astype(np.float32)
+            _lift_eef_pos, _lift_eef_quat = _get_eef_pose(
+                stage, eef_prim_path, get_prim_at_path, usd, usd_geom,
+            )
+            _lift_z = max(float(z_targets["pick_approach_z"]),
+                          float(_lift_eef_pos[2]) + 0.05)
+            LOG.info("lift target: pick_approach_z=%.4f eef_z=%.4f → lift_z=%.4f (delta=+%.4f)",
+                     float(z_targets["pick_approach_z"]), float(_lift_eef_pos[2]),
+                     _lift_z, _lift_z - float(_lift_eef_pos[2]))
+    
+            _lift_gripper = _hold_gr_target if _hold_gr_target > 0.001 else float(GRIPPER_CLOSED)
+            # Pre-lift settle: hold current position to let grip stabilize
+            _current_phase = "LIFT_SETTLE"
+            _SETTLE_STEPS = 10
+            for _ss in range(_SETTLE_STEPS):
+                _set_joint_targets(franka, _lift_current_arm, _lift_gripper, physics_control=True)
+                world.step(render=True)
+                _record_frame(arm_target=_lift_current_arm, gripper_target=_lift_gripper)
+    
+            # Plan lift with Curobo (smooth trajectory, no config jumps)
+            _lift_target_pos = _lift_eef_pos.copy()
+            _lift_target_pos[2] = _lift_z
+            _lift_target_quat = ik_target_orientation.copy() if ik_target_orientation is not None else _lift_eef_quat.copy()
+            _robot_base_pos, _robot_base_quat = _get_prim_world_pose(
+                stage, robot_prim_path, usd, usd_geom,
+            )
+            # Remove object AND table from collision world during lift.
+            # Object is grasped.  Table must be removed because fingers at
+            # grasp position are at table surface → INVALID_START_STATE_WORLD_COLLISION.
+            # (Same as Curobo segment 2 does for the approach descent.)
+            try:
+                _update_curobo_world(
+                    curobo_state, stage, robot_prim_path,
+                    table_prim_path, object_prim_path,
+                    include_object=False,
+                    include_table=False,
+                )
+            except Exception:
+                pass
+            _lift_traj = _plan_curobo_segment(
+                curobo_state, _lift_current_arm,
+                _lift_target_pos, _lift_target_quat,
+                _robot_base_pos, _robot_base_quat,
+            )
+            if _lift_traj is not None:
+                LOG.info("lift: Curobo planned %d waypoints", len(_lift_traj))
+            else:
+                LOG.warning("lift: Curobo plan failed, using hold-in-place fallback")
+    
+            _current_phase = "LIFT"
+            _lift_steps = steps_per_segment
+            for _ls in range(_lift_steps):
+                if _timeout_triggered():
+                    break
+                if _lift_traj is not None and len(_lift_traj) > 1:
+                    # Map simulation step to trajectory index
+                    _traj_idx = min(int(float(_ls) / float(_lift_steps) * len(_lift_traj)),
+                                    len(_lift_traj) - 1)
+                    _lift_arm_t = _lift_traj[_traj_idx]
+                else:
+                    # Fallback: hold current position (no IK, no Curobo)
+                    _lift_arm_t = _lift_current_arm
+                _lift_arm_cmd, _ = _step_toward_joint_targets(franka, _lift_arm_t, _lift_gripper)
+                # Bypass gripper rate-limiter during lift: command _lift_gripper directly.
+                # The rate-limiter reads the ACTUAL finger position (pushed open by ball)
+                # and caps the per-step delta, so gr_cmd chases the opening gripper
+                # instead of commanding full close force.
+                _lift_gr_cmd = _lift_gripper
+                _set_joint_targets(franka, _lift_arm_cmd, _lift_gr_cmd, physics_control=True)
+                world.step(render=True)
+                _record_frame(arm_target=_lift_arm_t, gripper_target=_lift_gripper)
+                _log_this_step = (_ls < 10) or (_ls % 20 == 0) or (_ls == _lift_steps - 1)
+                if _log_this_step:
+                    _lb_pos, _ = _get_prim_world_pose(stage, object_prim_path, usd, usd_geom)
+                    _lj = _to_numpy(franka.get_joint_positions())
+                    _lgw = float(_lj[7] + _lj[8]) if _lj.size >= 9 else -1.0
+                    _eef_pos, _ = _get_eef_pose(stage, eef_prim_path, get_prim_at_path, usd, usd_geom)
+                    _ti = int(float(_ls) / float(_lift_steps) * len(_lift_traj)) if _lift_traj is not None and len(_lift_traj) > 1 else -1
                     _lf_pos, _lf_q = _get_prim_world_pose(stage, finger_left_prim_path, usd, usd_geom)
                     _rf_pos, _rf_q = _get_prim_world_pose(stage, finger_right_prim_path, usd, usd_geom)
                     _lt = _lf_pos[:3] + _quat_to_rot_wxyz(_lf_q)[:, 2] * 0.046
                     _rt = _rf_pos[:3] + _quat_to_rot_wxyz(_rf_q)[:, 2] * 0.046
                     _tm = 0.5 * (_lt + _rt)
-                    print(f"[CLOSE] step={_cs} ball=({_ball_pos[0]:.4f},{_ball_pos[1]:.4f},{_ball_pos[2]:.4f}) gr={_gr_target:.4f} Ltip=({_lt[0]:.4f},{_lt[1]:.4f},{_lt[2]:.4f}) Rtip=({_rt[0]:.4f},{_rt[1]:.4f},{_rt[2]:.4f}) mid=({_tm[0]:.4f},{_tm[1]:.4f},{_tm[2]:.4f})", flush=True)
-                _record_frame(arm_target=close_arm, gripper_target=_gr_target)
-                # Contact detection: compare actual finger width vs commanded target.
-                # When fingers hit an object, actual stays wide while target goes to 0.
-                # Once contact confirmed, hold permanently (no re-checking).
-                _cur_joints = _to_numpy(franka.get_joint_positions())
-                _cur_gw = float(_cur_joints[7] + _cur_joints[8]) if _cur_joints.size >= 9 else -1.0
-                if _stall_count < _RESIST_PATIENCE and _cur_gw > 0 and _cs >= _MIN_CLOSE_STEP:
-                    _per_finger_avg = _cur_gw / 2.0
-                    _residual = _per_finger_avg - _gr_target
-                    if _residual > _RESIST_THRESHOLD:
-                        _stall_count += 1
-                        if _stall_count == _RESIST_PATIENCE:
-                            _SQUEEZE_OFFSET = 0.005  # 5mm inward from contact
-                            _hold_gr_target = max(_per_finger_avg - _SQUEEZE_OFFSET, 0.0)
-                            print(f"[CLOSE] attempt={attempt} contact at step={_cs} total_w={_cur_gw:.4f} per_finger={_per_finger_avg:.4f} residual={_residual:.4f} → hold={_hold_gr_target:.4f} (squeeze={_SQUEEZE_OFFSET})", flush=True)
-                    else:
-                        _stall_count = 0
-            _close_joints = _to_numpy(franka.get_joint_positions())
-            _close_gw = float(_close_joints[7] + _close_joints[8]) if _close_joints.size >= 9 else -1.0
-            print(
-                f"[CLOSE] attempt={attempt} after {CLOSE_HOLD_STEPS} steps: "
-                f"width={_close_gw:.4f} (f7={float(_close_joints[7]) if _close_joints.size >= 8 else -1:.4f} "
-                f"f8={float(_close_joints[8]) if _close_joints.size >= 9 else -1:.4f})",
-                flush=True,
+                    print(f"[LIFT] step={_ls}/{_lift_steps} ti={_ti} ball=({_lb_pos[0]:.4f},{_lb_pos[1]:.4f},{_lb_pos[2]:.4f}) eef_z={_eef_pos[2]:.4f} gw={_lgw:.4f} gr_cmd={_lift_gr_cmd:.4f} Ltip=({_lt[0]:.4f},{_lt[1]:.4f},{_lt[2]:.4f}) Rtip=({_rt[0]:.4f},{_rt[1]:.4f},{_rt[2]:.4f}) mid=({_tm[0]:.4f},{_tm[1]:.4f},{_tm[2]:.4f})", flush=True)
+            _ball_pos_after_lift, _ = _get_prim_world_pose(stage, object_prim_path, usd, usd_geom)
+            print(f"[LIFT] final ball_xyz=({_ball_pos_after_lift[0]:.4f},{_ball_pos_after_lift[1]:.4f},{_ball_pos_after_lift[2]:.4f}) grip_target={_lift_gripper:.4f}", flush=True)
+            if stopped:
+                break
+    
+            retrieval_metrics = _compute_grasp_metrics(
+                franka=franka,
+                stage=stage,
+                eef_prim_path=eef_prim_path,
+                get_prim_at_path=get_prim_at_path,
+                usd=usd,
+                usd_geom=usd_geom,
+                object_prim_path=object_prim_path,
+                table_top_z=table_top_z,
+                object_height=object_height,
+                finger_left_prim_path=finger_left_prim_path,
+                finger_right_prim_path=finger_right_prim_path,
+                current_target=current_grasp_target,
+                tip_mid_offset_in_hand=annotation_tip_mid_offset_hand,
             )
-        if stopped:
-            break
-
-        close_metrics = _compute_grasp_metrics(
-            franka=franka,
-            stage=stage,
-            eef_prim_path=eef_prim_path,
-            get_prim_at_path=get_prim_at_path,
-            usd=usd,
-            usd_geom=usd_geom,
-            object_prim_path=object_prim_path,
-            table_top_z=table_top_z,
-            object_height=object_height,
-            finger_left_prim_path=finger_left_prim_path,
-            finger_right_prim_path=finger_right_prim_path,
-            current_target=current_grasp_target,
-            tip_mid_offset_in_hand=annotation_tip_mid_offset_hand,
-        )
-        close_ok = _verify_after_close(close_metrics)
-        _gw_close = close_metrics.get("gripper_width", -1.0)
-        print(
-            f"[CLOSE_VERIFY] attempt={attempt} ok={close_ok} gripper_width={_gw_close:.4f} "
-            f"eef_dist={close_metrics.get('object_eef_distance', -1):.4f}",
-            flush=True,
-        )
-        if not close_ok:
+            retrieval_ok = _verify_after_retrieval(retrieval_metrics)
+    
+            if retrieval_ok:
+                grasp_succeeded = True
+                _clear_failed_annotation_pose_ids(annotation_failed_pose_cache_key)
+                _current_phase = "PLACE"
+                _execute_transitions(place_transitions)
+                break
+    
             LOG.warning(
-                "collect: grasp retry %d/%d close_verify failed metrics=%s "
-                "thresholds={width>=%.4f,width<=%.4f,eef<=%.3f,eef_xy<=%.3f,tip_xy<=%.3f}",
+                "collect: grasp retry %d/%d retrieval_verify failed metrics=%s "
+                "thresholds={width>=%.4f,lift>=%.4f,eef<=%.3f}",
                 attempt,
                 GRASP_MAX_ATTEMPTS,
-                close_metrics,
+                retrieval_metrics,
                 VERIFY_CLOSE_MIN_GRIPPER_WIDTH,
-                VERIFY_CLOSE_MAX_GRIPPER_WIDTH,
-                VERIFY_CLOSE_MAX_OBJECT_EEF_DISTANCE,
-                VERIFY_CLOSE_MAX_OBJECT_EEF_XY_DISTANCE,
-                VERIFY_CLOSE_MAX_OBJECT_TIP_MID_XY_DISTANCE,
+                VERIFY_RETRIEVAL_MIN_LIFT,
+                VERIFY_RETRIEVAL_MAX_OBJECT_EEF_DISTANCE,
             )
             _record_failed_annotation_target(
                 cache_key=annotation_failed_pose_cache_key,
                 target=current_grasp_target,
-                reason="close_verify_failed",
+                reason="retrieval_verify_failed",
                 attempt=attempt,
             )
+    
             lift_arm = waypoints[lift_idx][1]
             _current_phase = "REPLAN"
             _prepare_replan_from_current(lift_arm=lift_arm)
             if stopped:
                 break
-            continue
-
-        # Lift via Curobo planner — guarantees smooth joint trajectory
-        # from current config to target position above.  IK-based lift
-        # fails because IK returns solutions in different arm configs
-        # (3.5+ rad jumps), causing EEF to rocket upward or dip down.
-        _lift_current_arm = _to_numpy(franka.get_joint_positions())[:7].astype(np.float32)
-        _lift_eef_pos, _lift_eef_quat = _get_eef_pose(
-            stage, eef_prim_path, get_prim_at_path, usd, usd_geom,
-        )
-        _lift_z = max(float(z_targets["pick_approach_z"]),
-                      float(_lift_eef_pos[2]) + 0.05)
-        LOG.info("lift target: pick_approach_z=%.4f eef_z=%.4f → lift_z=%.4f (delta=+%.4f)",
-                 float(z_targets["pick_approach_z"]), float(_lift_eef_pos[2]),
-                 _lift_z, _lift_z - float(_lift_eef_pos[2]))
-
-        _lift_gripper = _hold_gr_target if _hold_gr_target > 0.001 else float(GRIPPER_CLOSED)
-        # Pre-lift settle: hold current position to let grip stabilize
-        _current_phase = "LIFT_SETTLE"
-        _SETTLE_STEPS = 10
-        for _ss in range(_SETTLE_STEPS):
-            _set_joint_targets(franka, _lift_current_arm, _lift_gripper, physics_control=True)
-            world.step(render=True)
-            _record_frame(arm_target=_lift_current_arm, gripper_target=_lift_gripper)
-
-        # Plan lift with Curobo (smooth trajectory, no config jumps)
-        _lift_target_pos = _lift_eef_pos.copy()
-        _lift_target_pos[2] = _lift_z
-        _lift_target_quat = ik_target_orientation.copy() if ik_target_orientation is not None else _lift_eef_quat.copy()
-        _robot_base_pos, _robot_base_quat = _get_prim_world_pose(
-            stage, robot_prim_path, usd, usd_geom,
-        )
-        # Remove object AND table from collision world during lift.
-        # Object is grasped.  Table must be removed because fingers at
-        # grasp position are at table surface → INVALID_START_STATE_WORLD_COLLISION.
-        # (Same as Curobo segment 2 does for the approach descent.)
-        try:
-            _update_curobo_world(
-                curobo_state, stage, robot_prim_path,
-                table_prim_path, object_prim_path,
-                include_object=False,
-                include_table=False,
+    
+        if not grasp_succeeded and not stopped and attempt_used >= GRASP_MAX_ATTEMPTS:
+            LOG.warning(
+                "collect: episode %d round %d/%d marked failed after %d grasp attempts",
+                episode_index + 1,
+                round_idx + 1,
+                rounds_per_episode,
+                GRASP_MAX_ATTEMPTS,
             )
-        except Exception:
-            pass
-        _lift_traj = _plan_curobo_segment(
-            curobo_state, _lift_current_arm,
-            _lift_target_pos, _lift_target_quat,
-            _robot_base_pos, _robot_base_quat,
-        )
-        if _lift_traj is not None:
-            LOG.info("lift: Curobo planned %d waypoints", len(_lift_traj))
+
+        # Ensure failed episodes are still visible in dataset metadata/data tables.
+        # If no frame was emitted due early-return branches, write one snapshot frame.
+        if frame_index <= 0 and not stopped:
+            LOG.warning(
+                "collect: episode %d produced 0 frames; writing fallback snapshot frame",
+                episode_index + 1,
+            )
+            state = _extract_state_vector(franka, stage, eef_prim_path, get_prim_at_path, usd, usd_geom)
+            action = np.zeros((ACTION_DIM,), dtype=np.float32)
+            frame_extras = _build_frame_extras(
+                stage=stage,
+                object_prim_path=object_prim_path,
+                usd=usd,
+                usd_geom=usd_geom,
+                current_target=current_grasp_target,
+            )
+            writer.add_frame(
+                episode_index=episode_index,
+                frame_index=0,
+                observation_state=state,
+                action=action,
+                timestamp=0.0,
+                next_done=False,
+                extras=frame_extras,
+            )
+            for cam_name, cam_obj in cameras.items():
+                rgb = _capture_rgb(cam_obj, CAMERA_RESOLUTION)
+                writer.add_video_frame(cam_name, rgb)
+            frame_index = 1
+
+        if not stopped:
+            obj_pos, _ = _get_prim_world_pose(stage, object_prim_path, usd, usd_geom)
+            last_pick_pos = (float(obj_pos[0]), float(obj_pos[1]))
+            place_vec = np.array(place_pos if place_pos is not None else last_pick_pos, dtype=np.float32)
+            place_dist = float(np.linalg.norm(obj_pos[:2] - place_vec))
+            LOG.info(
+                "Episode %d Round %d/%d done: success=%s attempts=%d pick=(%.3f, %.3f) "
+                "place=(%.3f, %.3f) final_obj=(%.3f, %.3f, %.3f) dist=%.3f",
+                episode_index + 1,
+                round_idx + 1,
+                rounds_per_episode,
+                grasp_succeeded,
+                attempt_used,
+                last_pick_pos[0],
+                last_pick_pos[1],
+                place_vec[0],
+                place_vec[1],
+                obj_pos[0],
+                obj_pos[1],
+                obj_pos[2],
+                place_dist,
+            )
         else:
-            LOG.warning("lift: Curobo plan failed, using hold-in-place fallback")
+            LOG.info(
+                "Episode %d Round %d/%d interrupted by stop event",
+                episode_index + 1,
+                round_idx + 1,
+                rounds_per_episode,
+            )
 
-        _current_phase = "LIFT"
-        _lift_steps = steps_per_segment
-        for _ls in range(_lift_steps):
-            if _timeout_triggered():
-                break
-            if _lift_traj is not None and len(_lift_traj) > 1:
-                # Map simulation step to trajectory index
-                _traj_idx = min(int(float(_ls) / float(_lift_steps) * len(_lift_traj)),
-                                len(_lift_traj) - 1)
-                _lift_arm_t = _lift_traj[_traj_idx]
-            else:
-                # Fallback: hold current position (no IK, no Curobo)
-                _lift_arm_t = _lift_current_arm
-            _lift_arm_cmd, _ = _step_toward_joint_targets(franka, _lift_arm_t, _lift_gripper)
-            # Bypass gripper rate-limiter during lift: command _lift_gripper directly.
-            # The rate-limiter reads the ACTUAL finger position (pushed open by ball)
-            # and caps the per-step delta, so gr_cmd chases the opening gripper
-            # instead of commanding full close force.
-            _lift_gr_cmd = _lift_gripper
-            _set_joint_targets(franka, _lift_arm_cmd, _lift_gr_cmd, physics_control=True)
-            world.step(render=True)
-            _record_frame(arm_target=_lift_arm_t, gripper_target=_lift_gripper)
-            _log_this_step = (_ls < 10) or (_ls % 20 == 0) or (_ls == _lift_steps - 1)
-            if _log_this_step:
-                _lb_pos, _ = _get_prim_world_pose(stage, object_prim_path, usd, usd_geom)
-                _lj = _to_numpy(franka.get_joint_positions())
-                _lgw = float(_lj[7] + _lj[8]) if _lj.size >= 9 else -1.0
-                _eef_pos, _ = _get_eef_pose(stage, eef_prim_path, get_prim_at_path, usd, usd_geom)
-                _ti = int(float(_ls) / float(_lift_steps) * len(_lift_traj)) if _lift_traj is not None and len(_lift_traj) > 1 else -1
-                _lf_pos, _lf_q = _get_prim_world_pose(stage, finger_left_prim_path, usd, usd_geom)
-                _rf_pos, _rf_q = _get_prim_world_pose(stage, finger_right_prim_path, usd, usd_geom)
-                _lt = _lf_pos[:3] + _quat_to_rot_wxyz(_lf_q)[:, 2] * 0.046
-                _rt = _rf_pos[:3] + _quat_to_rot_wxyz(_rf_q)[:, 2] * 0.046
-                _tm = 0.5 * (_lt + _rt)
-                print(f"[LIFT] step={_ls}/{_lift_steps} ti={_ti} ball=({_lb_pos[0]:.4f},{_lb_pos[1]:.4f},{_lb_pos[2]:.4f}) eef_z={_eef_pos[2]:.4f} gw={_lgw:.4f} gr_cmd={_lift_gr_cmd:.4f} Ltip=({_lt[0]:.4f},{_lt[1]:.4f},{_lt[2]:.4f}) Rtip=({_rt[0]:.4f},{_rt[1]:.4f},{_rt[2]:.4f}) mid=({_tm[0]:.4f},{_tm[1]:.4f},{_tm[2]:.4f})", flush=True)
-        _ball_pos_after_lift, _ = _get_prim_world_pose(stage, object_prim_path, usd, usd_geom)
-        print(f"[LIFT] final ball_xyz=({_ball_pos_after_lift[0]:.4f},{_ball_pos_after_lift[1]:.4f},{_ball_pos_after_lift[2]:.4f}) grip_target={_lift_gripper:.4f}", flush=True)
-        if stopped:
+        if grasp_succeeded:
+            any_round_succeeded = True
+
+        if not grasp_succeeded or stopped:
             break
 
-        retrieval_metrics = _compute_grasp_metrics(
-            franka=franka,
-            stage=stage,
-            eef_prim_path=eef_prim_path,
-            get_prim_at_path=get_prim_at_path,
-            usd=usd,
-            usd_geom=usd_geom,
-            object_prim_path=object_prim_path,
-            table_top_z=table_top_z,
-            object_height=object_height,
-            finger_left_prim_path=finger_left_prim_path,
-            finger_right_prim_path=finger_right_prim_path,
-            current_target=current_grasp_target,
-            tip_mid_offset_in_hand=annotation_tip_mid_offset_hand,
-        )
-        retrieval_ok = _verify_after_retrieval(retrieval_metrics)
-
-        if retrieval_ok:
-            grasp_succeeded = True
-            _clear_failed_annotation_pose_ids(annotation_failed_pose_cache_key)
-            _current_phase = "PLACE"
-            _execute_transitions(place_transitions)
-            break
-
-        LOG.warning(
-            "collect: grasp retry %d/%d retrieval_verify failed metrics=%s "
-            "thresholds={width>=%.4f,lift>=%.4f,eef<=%.3f}",
-            attempt,
-            GRASP_MAX_ATTEMPTS,
-            retrieval_metrics,
-            VERIFY_CLOSE_MIN_GRIPPER_WIDTH,
-            VERIFY_RETRIEVAL_MIN_LIFT,
-            VERIFY_RETRIEVAL_MAX_OBJECT_EEF_DISTANCE,
-        )
-        _record_failed_annotation_target(
-            cache_key=annotation_failed_pose_cache_key,
-            target=current_grasp_target,
-            reason="retrieval_verify_failed",
-            attempt=attempt,
-        )
-
-        lift_arm = waypoints[lift_idx][1]
-        _current_phase = "REPLAN"
-        _prepare_replan_from_current(lift_arm=lift_arm)
-        if stopped:
-            break
-
-    if not grasp_succeeded and not stopped and attempt_used >= GRASP_MAX_ATTEMPTS:
-        LOG.warning(
-            "collect: episode %d marked failed after %d grasp attempts",
-            episode_index + 1,
-            GRASP_MAX_ATTEMPTS,
-        )
-
-    # Ensure failed episodes are still visible in dataset metadata/data tables.
-    # If no frame was emitted due early-return branches, write one snapshot frame.
-    if frame_index <= 0 and not stopped:
-        LOG.warning(
-            "collect: episode %d produced 0 frames; writing fallback snapshot frame",
-            episode_index + 1,
-        )
-        state = _extract_state_vector(franka, stage, eef_prim_path, get_prim_at_path, usd, usd_geom)
-        action = np.zeros((ACTION_DIM,), dtype=np.float32)
-        frame_extras = _build_frame_extras(
-            stage=stage,
-            object_prim_path=object_prim_path,
-            usd=usd,
-            usd_geom=usd_geom,
-            current_target=current_grasp_target,
-        )
-        writer.add_frame(
-            episode_index=episode_index,
-            frame_index=0,
-            observation_state=state,
-            action=action,
-            timestamp=0.0,
-            next_done=True,
-            extras=frame_extras,
-        )
-        for cam_name, cam_obj in cameras.items():
-            rgb = _capture_rgb(cam_obj, CAMERA_RESOLUTION)
-            writer.add_video_frame(cam_name, rgb)
-        frame_index = 1
-    else:
-        # Mark this episode's final frame as done.
-        for i in range(len(writer.all_frames) - 1, -1, -1):
-            frame = writer.all_frames[i]
-            if int(frame.get("episode_index", -1)) == episode_index:
-                frame["next.done"] = True
-                break
-
-    if not stopped:
-        obj_pos, _ = _get_prim_world_pose(stage, object_prim_path, usd, usd_geom)
-        place_vec = np.array(place_pos if place_pos is not None else last_pick_pos, dtype=np.float32)
-        place_dist = float(np.linalg.norm(obj_pos[:2] - place_vec))
-        LOG.info(
-            "Episode %d done: success=%s attempts=%d pick=(%.3f, %.3f) place=(%.3f, %.3f) final_obj=(%.3f, %.3f, %.3f) dist=%.3f",
-            episode_index + 1,
-            grasp_succeeded,
-            attempt_used,
-            last_pick_pos[0],
-            last_pick_pos[1],
-            place_vec[0],
-            place_vec[1],
-            obj_pos[0],
-            obj_pos[1],
-            obj_pos[2],
-            place_dist,
-        )
-    else:
-        LOG.info("Episode %d interrupted by stop event", episode_index + 1)
+        if round_idx < rounds_per_episode - 1:
+            if not stopped and not (stop_event is not None and stop_event.is_set()):
+                try:
+                    for _ in range(45):
+                        arm_cmd, gr_cmd = _step_toward_joint_targets(franka, HOME, GRIPPER_OPEN)
+                        _set_joint_targets(franka, arm_cmd, gr_cmd, physics_control=True)
+                        world.step(render=True)
+                        _record_frame(arm_target=HOME, gripper_target=GRIPPER_OPEN)
+                    for _ in range(10):
+                        world.step(render=True)
+                    LOG.info(
+                        "Episode %d Round %d/%d inter-round HOME done",
+                        episode_index + 1,
+                        round_idx + 1,
+                        rounds_per_episode,
+                    )
+                except Exception as exc:
+                    LOG.warning("Inter-round HOME failed: %s", exc)
+                    break
 
     # Ensure each episode ends in a predictable home/open pose unless an explicit stop is active.
     if not stopped and not (stop_event is not None and stop_event.is_set()):
@@ -5533,7 +5598,14 @@ def _run_pick_place_episode(
         except Exception as exc:
             LOG.warning("Episode %d failed to return HOME pose: %s", episode_index + 1, exc)
 
-    return frame_index, stopped, grasp_succeeded
+    if frame_index > 0:
+        for i in range(len(writer.all_frames) - 1, -1, -1):
+            frame = writer.all_frames[i]
+            if int(frame.get("episode_index", -1)) == episode_index:
+                frame["next.done"] = True
+                break
+
+    return frame_index, stopped, any_round_succeeded
 
 
 def _setup_pick_place_scene_template(
@@ -6295,6 +6367,8 @@ def run_collection_in_process(
     target_objects: Optional[Sequence[str]] = None,
     dataset_repo_id: Optional[str] = None,
     episode_timeout_sec: float | None = None,
+    reset_mode: str = DEFAULT_RESET_MODE,
+    rounds_per_episode: int = DEFAULT_ROUNDS_PER_EPISODE,
 ) -> dict[str, Any]:
     if num_episodes <= 0:
         raise ValueError("num_episodes must be > 0")
@@ -6307,9 +6381,25 @@ def run_collection_in_process(
     if episode_timeout_sec is None:
         episode_timeout_sec = _read_float_env("COLLECT_EPISODE_TIMEOUT_SEC", DEFAULT_EPISODE_TIMEOUT_SEC)
     episode_timeout_sec = max(0.0, float(episode_timeout_sec))
+    reset_mode = str(reset_mode or DEFAULT_RESET_MODE).strip().lower()
+    if reset_mode not in ("full", "arm_only"):
+        reset_mode = str(os.environ.get("COLLECT_RESET_MODE", DEFAULT_RESET_MODE) or DEFAULT_RESET_MODE).strip().lower()
+    if reset_mode not in ("full", "arm_only"):
+        reset_mode = DEFAULT_RESET_MODE
+    rounds_per_episode = max(1, int(rounds_per_episode or DEFAULT_ROUNDS_PER_EPISODE))
+    _rpe_env = os.environ.get("COLLECT_ROUNDS_PER_EPISODE")
+    if _rpe_env is not None:
+        try:
+            rounds_per_episode = max(1, int(_rpe_env))
+        except (ValueError, TypeError):
+            pass
 
     os.makedirs(output_dir, exist_ok=True)
-    print(f"[COLLECT_START] code_version={_CODE_VERSION} CLOSE_HOLD_STEPS={CLOSE_HOLD_STEPS}", flush=True)
+    print(
+        f"[COLLECT_START] code_version={_CODE_VERSION} CLOSE_HOLD_STEPS={CLOSE_HOLD_STEPS} "
+        f"reset_mode={reset_mode} rounds_per_episode={rounds_per_episode}",
+        flush=True,
+    )
 
     rng = np.random.default_rng(seed)
     if scene_mode in {"auto", "reuse", "existing", "patch", "preserve"}:
@@ -6349,7 +6439,13 @@ def run_collection_in_process(
                 LOG.info("Stop requested before episode %d", episode + 1)
                 break
 
-            LOG.info("Episode %d/%d", episode + 1, num_episodes)
+            LOG.info(
+                "Episode %d/%d (reset_mode=%s, rounds=%d)",
+                episode + 1,
+                num_episodes,
+                reset_mode,
+                rounds_per_episode,
+            )
             episode_start = time.time()
             episode_frames = 0
             stopped = False
@@ -6382,6 +6478,8 @@ def run_collection_in_process(
                     finger_right_prim_path=ctx.get("finger_right_prim_path"),
                     robot_prim_path=ctx.get("robot_prim_path"),
                     table_prim_path=ctx.get("table_prim_path"),
+                    reset_mode=reset_mode,
+                    rounds_per_episode=rounds_per_episode,
                 )
             finally:
                 writer.finish_episode(

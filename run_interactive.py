@@ -1380,6 +1380,8 @@ def scene_snapshot():
 ROBOT_USD_MAP = {
     "franka": "/home/user/magicphysics/MagicPhysics/packages/MagicSim/Assets/Robots/franka_umi.usd",
     "franka_umi": "/home/user/magicphysics/MagicPhysics/packages/MagicSim/Assets/Robots/franka_umi.usd",
+    "openarm": "/data/robots/openarm_bimanual/openarm_bimanual.usd",
+    "openarm_bimanual": "/data/robots/openarm_bimanual/openarm_bimanual.usd",
 }
 
 @bridge.route("/robot/spawn", methods=["POST"])
@@ -1887,6 +1889,8 @@ def _run_pending_collection():
     skill = str(req.get("skill", "pick_place"))
     output_dir = _normalize_collect_output_dir(req.get("output_dir"), skill)
     scene_mode = str(req.get("scene_mode", "auto") or "auto")
+    reset_mode = str(req.get("reset_mode", "full") or "full").strip().lower()
+    rounds_per_episode = int(req.get("rounds_per_episode", 1))
     target_objects = req.get("target_objects")
 
     try:
@@ -1902,7 +1906,8 @@ def _run_pending_collection():
         print(
             f"[collect] start main-thread run: skill={skill}, scene_mode={scene_mode}, "
             f"episodes={num_episodes}, steps_per_segment={steps_per_segment}, "
-            f"timeout={episode_timeout_sec}s, output={output_dir}, targets={target_objects}"
+            f"timeout={episode_timeout_sec}s, output={output_dir}, targets={target_objects}, "
+            f"reset_mode={reset_mode}, rounds={rounds_per_episode}"
         )
 
         import importlib
@@ -1933,6 +1938,10 @@ def _run_pending_collection():
                 collect_kwargs["dataset_repo_id"] = f"local/{os.path.basename(output_dir.rstrip('/'))}"
             if "episode_timeout_sec" in inspect.signature(run_collection_in_process).parameters:
                 collect_kwargs["episode_timeout_sec"] = episode_timeout_sec
+            if "reset_mode" in inspect.signature(run_collection_in_process).parameters:
+                collect_kwargs["reset_mode"] = reset_mode
+            if "rounds_per_episode" in inspect.signature(run_collection_in_process).parameters:
+                collect_kwargs["rounds_per_episode"] = rounds_per_episode
         except Exception:
             pass
 
