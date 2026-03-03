@@ -1507,9 +1507,17 @@ def _solve_ik_arm_target(
             target_orientation=orient,
             position_tolerance=0.01,
         )
+        # T25n: try warm_start; ArticulationKinematicsSolver doesn't support it
+        # but LulaKinematicsSolver does — gracefully fallback
         if warm_start is not None:
-            kwargs["warm_start"] = np.asarray(warm_start, dtype=np.float32)
-        action, success = ik_solver.compute_inverse_kinematics(**kwargs)
+            try:
+                kwargs["warm_start"] = np.asarray(warm_start, dtype=np.float32)
+                action, success = ik_solver.compute_inverse_kinematics(**kwargs)
+            except TypeError:
+                del kwargs["warm_start"]
+                action, success = ik_solver.compute_inverse_kinematics(**kwargs)
+        else:
+            action, success = ik_solver.compute_inverse_kinematics(**kwargs)
         if not success or action is None:
             return None
         joints = _to_numpy(getattr(action, "joint_positions", None))
