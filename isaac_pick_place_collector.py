@@ -34,7 +34,7 @@ from lerobot_writer import SimLeRobotWriter
 
 LOG = logging.getLogger("isaac-pick-place-collector")
 
-_CODE_VERSION = "2026-03-03T25o"
+_CODE_VERSION = "2026-03-03T25p"
 print(f"[RELOAD] isaac_pick_place_collector loaded: version={_CODE_VERSION}", flush=True)
 
 STATE_DIM = 23
@@ -3811,49 +3811,45 @@ def _verify_after_retrieval(metrics: dict[str, float]) -> bool:
 
 
 def _verify_reach_before_close(metrics: dict[str, float]) -> bool:
-    # T25o: use min(object, target) instead of prefer-target.
+    # T25o: check object-based AND target-based independently, pass if EITHER ok.
     # Ball orientation jitter makes target_* unreliable for spheres —
     # if object distance is small the tip IS at the ball regardless.
-    eef_dist = _metric_min_object_target(
-        metrics,
-        object_key="object_eef_distance",
-        target_key="target_eef_distance",
-    )
-    eef_xy = _metric_min_object_target(
-        metrics,
-        object_key="object_eef_xy_distance",
-        target_key="target_eef_xy_distance",
-    )
+    # Cannot mix min() across signed metrics (z_delta), so evaluate each set separately.
+    def _get(key: str, default: float = float("nan")) -> float:
+        try:
+            v = float(metrics.get(key, default))
+            return v if np.isfinite(v) else default
+        except Exception:
+            return default
+
     eef_ok = bool(
-        eef_dist <= REACH_BEFORE_CLOSE_MAX_OBJECT_EEF_DISTANCE
-        and eef_xy <= REACH_BEFORE_CLOSE_MAX_OBJECT_EEF_XY_DISTANCE
+        min(_get("object_eef_distance", 1e9), _get("target_eef_distance", 1e9))
+        <= REACH_BEFORE_CLOSE_MAX_OBJECT_EEF_DISTANCE
+        and min(_get("object_eef_xy_distance", 1e9), _get("target_eef_xy_distance", 1e9))
+        <= REACH_BEFORE_CLOSE_MAX_OBJECT_EEF_XY_DISTANCE
     )
-    tip_dist = _metric_min_object_target(
-        metrics,
-        object_key="object_tip_mid_distance",
-        target_key="target_tip_mid_distance",
-        default=float("nan"),
+
+    # Evaluate tip_ok from object metrics and target metrics separately
+    def _tip_set_ok(dist_key: str, xy_key: str, dz_key: str) -> bool:
+        d = _get(dist_key)
+        xy = _get(xy_key)
+        dz = _get(dz_key)
+        if not (np.isfinite(d) and np.isfinite(xy) and np.isfinite(dz)):
+            return False
+        return bool(
+            d <= REACH_BEFORE_CLOSE_MAX_OBJECT_TIP_MID_DISTANCE
+            and xy <= REACH_BEFORE_CLOSE_MAX_OBJECT_TIP_MID_XY_DISTANCE
+            and abs(dz) <= REACH_BEFORE_CLOSE_MAX_ABS_TIP_MID_Z_DELTA
+        )
+
+    obj_tip_ok = _tip_set_ok("object_tip_mid_distance", "object_tip_mid_xy_distance", "object_tip_mid_z_delta")
+    tgt_tip_ok = _tip_set_ok("target_tip_mid_distance", "target_tip_mid_xy_distance", "target_tip_mid_z_delta")
+    tip_available = (
+        np.isfinite(_get("object_tip_mid_distance")) or np.isfinite(_get("target_tip_mid_distance"))
     )
-    tip_xy = _metric_min_object_target(
-        metrics,
-        object_key="object_tip_mid_xy_distance",
-        target_key="target_tip_mid_xy_distance",
-        default=float("nan"),
-    )
-    tip_dz = _metric_min_object_target(
-        metrics,
-        object_key="object_tip_mid_z_delta",
-        target_key="target_tip_mid_z_delta",
-        default=float("nan"),
-    )
-    tip_available = np.isfinite(tip_dist) and np.isfinite(tip_xy) and np.isfinite(tip_dz)
     if not tip_available:
         return eef_ok
-    tip_ok = bool(
-        tip_dist <= REACH_BEFORE_CLOSE_MAX_OBJECT_TIP_MID_DISTANCE
-        and tip_xy <= REACH_BEFORE_CLOSE_MAX_OBJECT_TIP_MID_XY_DISTANCE
-        and abs(tip_dz) <= REACH_BEFORE_CLOSE_MAX_ABS_TIP_MID_Z_DELTA
-    )
+    tip_ok = obj_tip_ok or tgt_tip_ok
     if REACH_REQUIRE_TIP_MID:
         return tip_ok
     return bool(eef_ok or tip_ok)
