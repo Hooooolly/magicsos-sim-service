@@ -1439,9 +1439,11 @@ def _drain_pending_commands(error_message: str) -> int:
 
 def _request_emergency_stop(reason: str = "manual_estop") -> dict:
     """Emergency-stop entrypoint safe to call from bridge thread."""
-    global _collect_request
+    global _collect_request, _replay_request
     _collect_stop.set()
     _collect_request = None
+    _replay_stop.set()
+    _replay_request = None
     _estop_event.set()
     _state["estop_requested"] = True
     _state["last_estop_reason"] = str(reason)
@@ -1494,6 +1496,8 @@ def code_execute():
 
 _collect_stop = threading.Event()
 _collect_request = None
+_replay_request = None
+_replay_stop = threading.Event()
 
 @bridge.route("/collect/start", methods=["POST"])
 def collect_start():
@@ -1566,6 +1570,54 @@ def collect_stop():
     _collect_stop.set()
     if _state["collect_progress"]:
         _state["collect_progress"]["status"] = "stopping"
+    return jsonify({"status": "stopping"})
+
+
+@bridge.route("/replay/start", methods=["POST"])
+def replay_start():
+    """Start replaying a LeRobot dataset episode on the robot."""
+    if _state["collecting"] or _collect_request is not None:
+        return jsonify({"error": "Cannot replay while collecting"}), 400
+    if _replay_request is not None or _state.get("replaying"):
+        return jsonify({"error": "Replay already running"}), 400
+
+    data = flask_request.get_json(silent=True) or {}
+    dataset_path = data.get("dataset_path", "")
+    episode_index = data.get("episode_index", 0)
+    speed = data.get("speed", 1.0)
+
+    if not dataset_path:
+        return jsonify({"error": "dataset_path is required"}), 400
+
+    try:
+        episode_index = int(episode_index)
+        speed = float(speed)
+    except Exception:
+        return jsonify({"error": "episode_index must be int, speed must be float"}), 400
+
+    return _enqueue_cmd(
+        "replay_start",
+        dataset_path=dataset_path,
+        episode_index=episode_index,
+        speed=speed,
+    )
+
+
+@bridge.route("/replay/status", methods=["GET"])
+def replay_status():
+    return jsonify({
+        "replaying": _state.get("replaying", False),
+        "progress": _state.get("replay_progress"),
+    })
+
+
+@bridge.route("/replay/stop", methods=["POST"])
+def replay_stop():
+    if not _state.get("replaying"):
+        return jsonify({"error": "No replay running"}), 400
+    _replay_stop.set()
+    if _state.get("replay_progress"):
+        _state["replay_progress"]["status"] = "stopping"
     return jsonify({"status": "stopping"})
 
 
@@ -1889,6 +1941,39 @@ def _process_commands():
                             f"steps_per_segment={steps_per_segment}, timeout={episode_timeout_sec}s, output={output_dir}"
                         )
 
+            elif cmd_type == "replay_start":
+                if _state["collecting"] or _collect_request is not None:
+                    cmd["error"] = "Cannot replay while collecting"
+                elif _replay_request is not None or _state.get("replaying"):
+                    cmd["error"] = "Replay already running"
+                else:
+                    dataset_path = cmd["dataset_path"]
+                    episode_index = int(cmd.get("episode_index", 0))
+                    speed = float(cmd.get("speed", 1.0))
+
+                    _replay_stop.clear()
+                    _state["replaying"] = True
+                    _state["replay_progress"] = {
+                        "dataset_path": dataset_path,
+                        "episode_index": episode_index,
+                        "speed": speed,
+                        "current_frame": 0,
+                        "total_frames": 0,
+                        "status": "loading",
+                    }
+                    _replay_request = {
+                        "dataset_path": dataset_path,
+                        "episode_index": episode_index,
+                        "speed": speed,
+                    }
+                    cmd["result"] = {
+                        "status": "started",
+                        "dataset_path": dataset_path,
+                        "episode_index": episode_index,
+                        "speed": speed,
+                    }
+                    print(f"[replay] queued: dataset={dataset_path}, ep={episode_index}, speed={speed}")
+
             else:
                 cmd["error"] = f"Unknown command: {cmd_type}"
 
@@ -2001,6 +2086,149 @@ def _run_pending_collection():
         _state["collecting"] = False
 
 
+def _run_pending_replay():
+    """Run queued replay request on the main thread."""
+    global _replay_request
+    if not _replay_request:
+        return
+
+    req = _replay_request
+    _replay_request = None
+    dataset_path = req["dataset_path"]
+    episode_index = int(req.get("episode_index", 0))
+    speed = float(req.get("speed", 1.0))
+
+    try:
+        import pandas as pd
+        import numpy as np
+
+        # Find parquet file
+        meta_path = os.path.join(dataset_path, "meta", "info.json")
+        if not os.path.exists(meta_path):
+            raise FileNotFoundError(f"Dataset meta not found: {meta_path}")
+
+        with open(meta_path) as f:
+            meta = json.load(f)
+
+        fps = meta.get("fps", 30)
+        chunks_size = meta.get("chunks_size", 1000)
+        data_path_template = meta.get("data_path", "data")
+        features = meta.get("features", {})
+
+        # Extract joint names from features
+        state_feature = features.get("observation.state", {})
+        joint_names = state_feature.get("names", [])
+
+        chunk_index = episode_index // chunks_size
+        if "{" in data_path_template:
+            parquet_rel = data_path_template.format(chunk_index=chunk_index, file_index=0)
+        else:
+            parquet_rel = os.path.join(data_path_template, f"chunk-{chunk_index:03d}", "file-000.parquet")
+
+        parquet_path = os.path.join(dataset_path, parquet_rel)
+        if not os.path.exists(parquet_path):
+            raise FileNotFoundError(f"Parquet not found: {parquet_path}")
+
+        df = pd.read_parquet(parquet_path)
+        if "episode_index" in df.columns:
+            df = df[df["episode_index"] == episode_index]
+
+        if len(df) == 0:
+            raise ValueError(f"Episode {episode_index} not found in {parquet_path}")
+
+        # Get state arrays
+        states = None
+        if "observation.state" in df.columns:
+            states = np.stack(df["observation.state"].values)
+        elif "action" in df.columns:
+            states = np.stack(df["action"].values)
+
+        if states is None or len(states) == 0:
+            raise ValueError("No observation.state or action data found")
+
+        total_frames = len(states)
+        print(f"[replay] loaded {total_frames} frames from ep {episode_index}, fps={fps}, joints={joint_names[:5]}...")
+
+        _state["replay_progress"]["total_frames"] = total_frames
+        _state["replay_progress"]["status"] = "playing"
+
+        # Find robot articulation
+        from omni.isaac.core.utils.stage import get_stage_units
+        stage = _get_stage()
+        if stage is None:
+            raise RuntimeError("No USD stage")
+
+        # Locate robot prims (look for articulation roots)
+        from pxr import UsdPhysics
+        robot_prims = []
+        for prim in stage.Traverse():
+            if prim.HasAPI(UsdPhysics.ArticulationRootAPI):
+                robot_prims.append(prim)
+
+        if not robot_prims:
+            raise RuntimeError("No robot (ArticulationRootAPI) found in scene")
+
+        from omni.isaac.core.articulations import Articulation
+        robot = Articulation(robot_prims[0].GetPath().pathString)
+        robot.initialize()
+
+        dof_names = robot.dof_names
+        print(f"[replay] robot DOFs: {dof_names}")
+
+        # Build index mapping: state array index → robot DOF index
+        dof_map = []
+        for i, name in enumerate(joint_names if joint_names else [f"joint_{j}" for j in range(states.shape[1])]):
+            # Try exact match first
+            if name in dof_names:
+                dof_map.append((i, dof_names.index(name)))
+            else:
+                # Try partial match (e.g. 'openarm_joint1' matches DOF containing 'joint1')
+                for dof_idx, dof_name in enumerate(dof_names):
+                    if name in dof_name or dof_name.endswith(name):
+                        dof_map.append((i, dof_idx))
+                        break
+
+        if not dof_map:
+            print(f"[replay] WARNING: no DOF mapping found. joint_names={joint_names}, dof_names={dof_names}")
+
+        # Replay loop
+        frame_interval = 1.0 / (fps * speed) if fps > 0 and speed > 0 else 1.0 / 30.0
+        for frame_idx in range(total_frames):
+            if _replay_stop.is_set():
+                print(f"[replay] stopped at frame {frame_idx}/{total_frames}")
+                break
+
+            # Set joint positions
+            current_positions = robot.get_joint_positions()
+            state_row = states[frame_idx]
+            for src_idx, dst_idx in dof_map:
+                if src_idx < len(state_row):
+                    current_positions[dst_idx] = float(state_row[src_idx])
+            robot.set_joint_positions(current_positions)
+
+            # Step sim to render
+            if world and PHYSICS_RUNNING:
+                world.step(render=True)
+            else:
+                simulation_app.update()
+
+            _state["replay_progress"]["current_frame"] = frame_idx + 1
+
+            # Throttle to match dataset FPS
+            time.sleep(max(0, frame_interval - 0.001))
+
+        final_status = "stopped" if _replay_stop.is_set() else "done"
+        _state["replay_progress"]["status"] = final_status
+        print(f"[replay] finished: {final_status}, frames={_state['replay_progress']['current_frame']}/{total_frames}")
+
+    except Exception as exc:
+        traceback.print_exc()
+        _state["replay_progress"]["status"] = f"error: {exc}"
+        print(f"[replay] ERROR: {exc}")
+    finally:
+        _state["replaying"] = False
+
+
 def _apply_emergency_stop_if_requested():
     """Main-thread side effects for emergency stop (Isaac API calls)."""
     global PHYSICS_RUNNING
@@ -2026,6 +2254,8 @@ try:
         _process_commands()
         if _state["collecting"] and _collect_request is not None:
             _run_pending_collection()
+        elif _state.get("replaying") and _replay_request is not None:
+            _run_pending_replay()
         elif world and PHYSICS_RUNNING:
             world.step(render=True)
         else:
