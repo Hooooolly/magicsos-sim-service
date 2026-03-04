@@ -1250,6 +1250,244 @@ def scene_save():
     return _enqueue_cmd("scene_save", output_path=output_path, output_dir=output_dir)
 
 
+# ── SceneSmith → USD import ─────────────────────────────────
+
+def _find_scenesmith_scene_state(output_dir):
+    """Search for final scene_state.json in SceneSmith output directory."""
+    root = Path(output_dir)
+    # Priority 1: direct
+    p = root / "scene_state.json"
+    if p.exists():
+        return str(p)
+    # Priority 2: scene_000/room_*/scene_states/final_scene/
+    for ss in sorted(root.glob("scene_000/room_*/scene_states/final_scene/scene_state.json")):
+        return str(ss)
+    # Priority 3: recursive (max depth 6)
+    for ss in sorted(root.rglob("scene_state.json")):
+        if "final_scene" in str(ss):
+            return str(ss)
+    for ss in sorted(root.rglob("scene_state.json")):
+        return str(ss)
+    return None
+
+
+def _parse_sdf_mass(sdf_path):
+    """Extract mass from SDF XML file."""
+    try:
+        import xml.etree.ElementTree as ET
+        tree = ET.parse(sdf_path)
+        for mass_el in tree.getroot().iter("mass"):
+            return float(mass_el.text)
+    except Exception:
+        pass
+    return 0.1
+
+
+def _safe_prim_name(name):
+    """Sanitize string for use as USD prim name."""
+    import re as _re
+    s = _re.sub(r"[^a-zA-Z0-9_]", "_", str(name))
+    if s and s[0].isdigit():
+        s = "_" + s
+    return s or "_unnamed"
+
+
+def _stamp_physics_on_usd(usd_path, object_type, sdf_path=None):
+    """Apply physics APIs to a per-object USD file.
+
+    manipuland: RigidBody + Mass + Collision (dynamic, can be picked up)
+    furniture/other: Collision only (static collider)
+    """
+    from pxr import Gf, Usd, UsdGeom, UsdPhysics
+
+    stage = Usd.Stage.Open(str(usd_path))
+    if stage is None:
+        print(f"[scenesmith-import] WARNING: cannot open {usd_path}")
+        return False
+
+    default_prim = stage.GetDefaultPrim()
+    if not default_prim or not default_prim.IsValid():
+        children = list(stage.GetPseudoRoot().GetChildren())
+        if not children:
+            print(f"[scenesmith-import] WARNING: no prims in {usd_path}")
+            return False
+        default_prim = children[0]
+        stage.SetDefaultPrim(default_prim)
+
+    # Collision on all meshes
+    for prim in stage.Traverse():
+        if prim.IsA(UsdGeom.Mesh):
+            UsdPhysics.CollisionAPI.Apply(prim)
+            mc = UsdPhysics.MeshCollisionAPI.Apply(prim)
+            mc.CreateApproximationAttr("convexHull")
+
+    if object_type == "manipuland":
+        # Dynamic rigid body
+        UsdPhysics.RigidBodyAPI.Apply(default_prim)
+        rb = UsdPhysics.RigidBodyAPI(default_prim)
+        rb.CreateRigidBodyEnabledAttr(True)
+        rb.CreateKinematicEnabledAttr(False)
+
+        mass = _parse_sdf_mass(sdf_path) if sdf_path and os.path.exists(str(sdf_path)) else 0.1
+        UsdPhysics.MassAPI.Apply(default_prim)
+        UsdPhysics.MassAPI(default_prim).CreateMassAttr(float(mass))
+
+    stage.GetRootLayer().Export(str(usd_path))
+    return True
+
+
+def _assemble_scene_usd(scene_path, converted_objects):
+    """Create combined scene USD from per-object USDs."""
+    from pxr import Gf, Usd, UsdGeom, UsdPhysics
+
+    stage = Usd.Stage.CreateNew(str(scene_path))
+    UsdGeom.SetStageUpAxis(stage, UsdGeom.Tokens.z)
+    UsdGeom.SetStageMetersPerUnit(stage, 1.0)
+
+    root = UsdGeom.Xform.Define(stage, "/World")
+    stage.SetDefaultPrim(root.GetPrim())
+
+    # Ground plane
+    gp_xf = UsdGeom.Xform.Define(stage, "/World/GroundPlane")
+    UsdPhysics.CollisionAPI.Apply(gp_xf.GetPrim())
+    gp_mesh = UsdGeom.Mesh.Define(stage, "/World/GroundPlane/Mesh")
+    gp_mesh.CreatePointsAttr([(-50, 0, -50), (50, 0, -50), (50, 0, 50), (-50, 0, 50)])
+    gp_mesh.CreateFaceVertexCountsAttr([4])
+    gp_mesh.CreateFaceVertexIndicesAttr([0, 1, 2, 3])
+    gp_mesh.CreateNormalsAttr([(0, 1, 0)] * 4)
+
+    for item in converted_objects:
+        obj = item["obj"]
+        usd_file = item["usd"]
+        obj_id = obj.get("object_id") or obj.get("id", "unknown")
+        safe_id = _safe_prim_name(obj_id)
+
+        prim_path = f"/World/{safe_id}"
+        prim = stage.OverridePrim(prim_path)
+        prim.GetReferences().AddReference(os.path.abspath(usd_file))
+
+        xf = UsdGeom.Xformable(prim)
+        xf.ClearXformOpOrder()
+
+        # Translation
+        t = obj.get("transform", {}).get("translation", [0, 0, 0])
+        xf.AddTranslateOp().Set(Gf.Vec3d(float(t[0]), float(t[1]), float(t[2])))
+
+        # Rotation (wxyz quaternion)
+        q = obj.get("transform", {}).get("rotation_wxyz")
+        if q and len(q) == 4:
+            xf.AddOrientOp().Set(Gf.Quatf(float(q[0]), float(q[1]), float(q[2]), float(q[3])))
+
+    stage.GetRootLayer().Save()
+    print(f"[scenesmith-import] Assembled scene: {scene_path} ({len(converted_objects)} objects)")
+    return True
+
+
+def _convert_scenesmith_to_usd(output_dir, scene_name, objects_meta=None):
+    """Convert SceneSmith output to physics-ready scene.usda.
+
+    Args:
+        output_dir: SceneSmith output directory (absolute path)
+        scene_name: Human-readable name for the scene
+        objects_meta: Optional list of dicts with {id, group, physics} from backend
+
+    Returns: absolute path to generated .usda file
+    """
+    import trimesh
+
+    state_path = _find_scenesmith_scene_state(output_dir)
+    if not state_path:
+        raise FileNotFoundError(f"No scene_state.json found in {output_dir}")
+
+    with open(state_path) as f:
+        scene_state = json.load(f)
+
+    objects = scene_state.get("objects", {})
+    if isinstance(objects, list):
+        objects = {o.get("object_id", f"obj_{i}"): o for i, o in enumerate(objects)}
+
+    # Room dir = parent of scene_states/
+    room_dir = str(Path(state_path).parent.parent.parent)
+
+    # Merge backend metadata
+    meta_map = {}
+    if objects_meta:
+        for o in objects_meta:
+            if isinstance(o, dict) and "id" in o:
+                meta_map[o["id"]] = o
+
+    # Output paths
+    library = os.environ.get("SIM_SCENE_LIBRARY", "/data/embodied/scene/library")
+    os.makedirs(library, exist_ok=True)
+    ts = int(time.time())
+    safe_name = re.sub(r"[^a-zA-Z0-9_-]", "_", scene_name)[:60]
+    assets_dir = os.path.join(library, f"{safe_name}_{ts}_assets")
+    os.makedirs(assets_dir, exist_ok=True)
+
+    converted = []
+    for obj_id, obj in objects.items():
+        geom_rel = obj.get("geometry_path", "")
+        if not geom_rel:
+            continue
+
+        gltf_path = os.path.join(room_dir, geom_rel)
+        if not os.path.exists(gltf_path):
+            print(f"[scenesmith-import] WARNING: GLTF missing: {gltf_path}")
+            continue
+
+        usd_file = os.path.join(assets_dir, f"{_safe_prim_name(obj_id)}.usdc")
+        try:
+            mesh = trimesh.load(gltf_path)
+            mesh.export(usd_file, file_type="usdc")
+        except Exception as ex:
+            print(f"[scenesmith-import] WARNING: trimesh failed for {obj_id}: {ex}")
+            continue
+
+        # Determine physics type
+        meta = meta_map.get(obj_id, {})
+        obj_type = meta.get("group") or obj.get("object_type", "furniture")
+        obj_type = obj_type.strip().lower()
+
+        # SDF path for mass
+        sdf_rel = obj.get("sdf_path", "")
+        sdf_path = os.path.join(room_dir, sdf_rel) if sdf_rel else None
+
+        _stamp_physics_on_usd(usd_file, obj_type, sdf_path)
+
+        converted.append({"obj": obj, "usd": usd_file, "group": obj_type})
+        print(f"[scenesmith-import] {obj_id} ({obj_type}) -> {os.path.basename(usd_file)}")
+
+    if not converted:
+        raise ValueError(f"No objects converted from {output_dir}")
+
+    scene_path = os.path.join(library, f"{safe_name}_{ts}.usda")
+    _assemble_scene_usd(scene_path, converted)
+    return scene_path
+
+
+@bridge.route("/scene/import_scenesmith", methods=["POST"])
+def scene_import_scenesmith():
+    """Convert SceneSmith output to physics-ready USD and save to scene library."""
+    data = flask_request.get_json(silent=True) or {}
+    output_dir = data.get("scenesmith_output_dir")
+    name = data.get("name", "scenesmith_scene")
+    objects_meta = data.get("objects")
+
+    if not output_dir:
+        return jsonify({"error": "scenesmith_output_dir required"}), 400
+    if not os.path.isdir(output_dir):
+        return jsonify({"error": f"Directory not found: {output_dir}"}), 404
+
+    try:
+        usd_path = _convert_scenesmith_to_usd(output_dir, name, objects_meta)
+        print(f"[scenesmith-import] DONE: {usd_path}")
+        return jsonify({"success": True, "usd_path": usd_path})
+    except Exception as ex:
+        import traceback
+        traceback.print_exc()
+        return jsonify({"error": str(ex)}), 500
+
+
 @bridge.route("/scene/info", methods=["GET"])
 def scene_info():
     stage = _get_stage()
