@@ -1292,6 +1292,46 @@ def _safe_prim_name(name):
     return s or "_unnamed"
 
 
+def _gltf_to_usd_via_pxr(gltf_path, usd_path, obj_id="object"):
+    """Convert GLTF/GLB to USD using trimesh (mesh data) + pxr (USD write)."""
+    import trimesh
+    from pxr import Gf, Usd, UsdGeom, Vt
+
+    scene = trimesh.load(gltf_path)
+    # Normalize: Scene → single mesh
+    if isinstance(scene, trimesh.Scene):
+        mesh = scene.dump(concatenate=True)
+    elif isinstance(scene, trimesh.Trimesh):
+        mesh = scene
+    else:
+        raise ValueError(f"Cannot load mesh from {gltf_path}")
+
+    if mesh is None or len(mesh.vertices) == 0:
+        raise ValueError(f"Empty mesh: {gltf_path}")
+
+    stage = Usd.Stage.CreateNew(str(usd_path))
+    UsdGeom.SetStageUpAxis(stage, UsdGeom.Tokens.z)
+    UsdGeom.SetStageMetersPerUnit(stage, 1.0)
+
+    safe_id = _safe_prim_name(obj_id)
+    root = UsdGeom.Xform.Define(stage, f"/{safe_id}")
+    stage.SetDefaultPrim(root.GetPrim())
+
+    usd_mesh = UsdGeom.Mesh.Define(stage, f"/{safe_id}/Mesh")
+    points = [Gf.Vec3f(*v) for v in mesh.vertices.tolist()]
+    usd_mesh.CreatePointsAttr(points)
+    usd_mesh.CreateFaceVertexCountsAttr([3] * len(mesh.faces))
+    usd_mesh.CreateFaceVertexIndicesAttr(mesh.faces.flatten().tolist())
+
+    if mesh.vertex_normals is not None and len(mesh.vertex_normals) > 0:
+        normals = [Gf.Vec3f(*n) for n in mesh.vertex_normals.tolist()]
+        usd_mesh.CreateNormalsAttr(normals)
+        usd_mesh.SetNormalsInterpolation("vertex")
+
+    stage.GetRootLayer().Save()
+    return str(usd_path)
+
+
 def _stamp_physics_on_usd(usd_path, object_type, sdf_path=None):
     """Apply physics APIs to a per-object USD file.
 
@@ -1393,8 +1433,6 @@ def _convert_scenesmith_to_usd(output_dir, scene_name, objects_meta=None):
 
     Returns: absolute path to generated .usda file
     """
-    import trimesh
-
     state_path = _find_scenesmith_scene_state(output_dir)
     if not state_path:
         raise FileNotFoundError(f"No scene_state.json found in {output_dir}")
@@ -1435,12 +1473,11 @@ def _convert_scenesmith_to_usd(output_dir, scene_name, objects_meta=None):
             print(f"[scenesmith-import] WARNING: GLTF missing: {gltf_path}")
             continue
 
-        usd_file = os.path.join(assets_dir, f"{_safe_prim_name(obj_id)}.usdc")
+        usd_file = os.path.join(assets_dir, f"{_safe_prim_name(obj_id)}.usda")
         try:
-            mesh = trimesh.load(gltf_path)
-            mesh.export(usd_file, file_type="usdc")
+            usd_file = _gltf_to_usd_via_pxr(gltf_path, usd_file, obj_id)
         except Exception as ex:
-            print(f"[scenesmith-import] WARNING: trimesh failed for {obj_id}: {ex}")
+            print(f"[scenesmith-import] WARNING: convert failed for {obj_id}: {ex}")
             continue
 
         # Determine physics type
