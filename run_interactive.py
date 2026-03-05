@@ -2477,16 +2477,16 @@ def _run_pending_replay():
                     break
             if found:
                 continue
-            # Suffix match: "openarm_joint1" → "joint1", prefer left arm
+            # Suffix match: "openarm_joint1" → "joint1", prefer right arm
             import re
             m = re.search(r'((?:finger_)?joint\d+)$', name)
             if m:
                 suffix = m.group(1)
-                # First try left arm
+                # First try right arm (recording was single-arm right)
                 for dof_idx, dof_name in enumerate(dof_names):
                     if dof_idx in mapped_dofs:
                         continue
-                    if dof_name.endswith(suffix) and 'left' in dof_name:
+                    if dof_name.endswith(suffix) and 'right' in dof_name:
                         dof_map.append((i, dof_idx))
                         mapped_dofs.add(dof_idx)
                         found = True
