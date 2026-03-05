@@ -2528,7 +2528,8 @@ def _run_pending_replay():
                 print(f"[replay] stopped at frame {frame_idx}/{total_frames}")
                 break
 
-            # Set joint position targets (PD control → generates forces for grasping)
+            # Set joint position targets via ArticulationAction (PD control → grip force)
+            import numpy as np
             targets = robot.get_joint_positions().copy()
             state_row = states[frame_idx]
             for src_idx, dst_idx, negate in dof_map:
@@ -2537,7 +2538,9 @@ def _run_pending_replay():
                     if negate:
                         val = -val
                     targets[dst_idx] = val
-            robot.set_joint_position_targets(targets)
+            from omni.isaac.core.utils.types import ArticulationAction
+            action = ArticulationAction(joint_positions=np.array(targets))
+            robot.get_articulation_controller().apply_action(action)
 
             # Step sim to render
             if world and PHYSICS_RUNNING:
