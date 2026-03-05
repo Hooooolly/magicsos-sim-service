@@ -2585,17 +2585,17 @@ def _run_pending_replay():
             mat_prim = stage.DefinePrim(mat_path, "Material")
             UsdPhysics.MaterialAPI.Apply(mat_prim)
             phys_mat = UsdPhysics.MaterialAPI(mat_prim)
-            phys_mat.CreateStaticFrictionAttr(5.0)   # very high friction
-            phys_mat.CreateDynamicFrictionAttr(5.0)
+            phys_mat.CreateStaticFrictionAttr(10.0)   # extreme friction for reliable grip
+            phys_mat.CreateDynamicFrictionAttr(10.0)
             phys_mat.CreateRestitutionAttr(0.0)
             # Bind material to cube
             binding = UsdShade.MaterialBindingAPI.Apply(cube_prim)
             binding.Bind(UsdShade.Material(mat_prim), UsdShade.Tokens.weakerThanDescendants, "physics")
-            print(f"[replay] applied friction material to cube: static=5.0 dynamic=5.0")
+            print(f"[replay] applied friction material to cube: static=10.0 dynamic=10.0")
             # Also reduce cube mass for easier grip
             if cube_prim.HasAPI(UsdPhysics.MassAPI):
-                UsdPhysics.MassAPI(cube_prim).CreateMassAttr(0.02)  # 20g instead of 50g
-                print(f"[replay] reduced cube mass to 0.02 kg")
+                UsdPhysics.MassAPI(cube_prim).CreateMassAttr(0.01)  # 10g — very light
+                print(f"[replay] reduced cube mass to 0.01 kg")
 
         # Create a scene-level physics material with high friction
         # (Can't modify instanceable robot prims directly)
