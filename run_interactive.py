@@ -2538,27 +2538,19 @@ def _run_pending_replay():
                 print(f"[replay] stopped at frame {frame_idx}/{total_frames}")
                 break
 
-            # Arm: PD control (damped, smooth, has force)
-            # Finger: kinematic set_joint_positions (reliable position tracking)
+            # All joints via PD: use current positions as base, override mapped joints
+            # No NaN — all joints get a target (unmapped keep current pos)
             state_row = states[frame_idx]
-            targets = np.full(len(robot.dof_names), float('nan'))
-            for src_idx, dst_idx, negate in dof_map_arm:
+            targets = robot.get_joint_positions().copy()
+            for src_idx, dst_idx, negate in dof_map:
                 if src_idx < len(state_row):
                     val = float(state_row[src_idx])
                     if negate:
                         val = -val
                     targets[dst_idx] = val
             from omni.isaac.core.utils.types import ArticulationAction
-            action = ArticulationAction(joint_positions=targets)
+            action = ArticulationAction(joint_positions=np.array(targets))
             ctrl.apply_action(action)
-
-            # Finger: direct position set (kinematic, ensures close/open)
-            if dof_map_finger:
-                positions = robot.get_joint_positions()
-                for src_idx, dst_idx, _ in dof_map_finger:
-                    if src_idx < len(state_row):
-                        positions[dst_idx] = float(state_row[src_idx])
-                robot.set_joint_positions(positions)
 
             # Step sim to render
             if world and PHYSICS_RUNNING:
