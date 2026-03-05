@@ -2457,19 +2457,55 @@ def _run_pending_replay():
 
         # Build index mapping: state array index → robot DOF index
         dof_map = []
+        mapped_dofs = set()
         for i, name in enumerate(joint_names if joint_names else [f"joint_{j}" for j in range(states.shape[1])]):
             # Try exact match first
             if name in dof_names:
-                dof_map.append((i, dof_names.index(name)))
-            else:
-                # Try partial match (e.g. 'openarm_joint1' matches DOF containing 'joint1')
+                idx = dof_names.index(name)
+                dof_map.append((i, idx))
+                mapped_dofs.add(idx)
+                continue
+            # Try substring match
+            found = False
+            for dof_idx, dof_name in enumerate(dof_names):
+                if dof_idx in mapped_dofs:
+                    continue
+                if name in dof_name or dof_name.endswith(name):
+                    dof_map.append((i, dof_idx))
+                    mapped_dofs.add(dof_idx)
+                    found = True
+                    break
+            if found:
+                continue
+            # Suffix match: "openarm_joint1" → "joint1", prefer left arm
+            import re
+            m = re.search(r'((?:finger_)?joint\d+)$', name)
+            if m:
+                suffix = m.group(1)
+                # First try left arm
                 for dof_idx, dof_name in enumerate(dof_names):
-                    if name in dof_name or dof_name.endswith(name):
+                    if dof_idx in mapped_dofs:
+                        continue
+                    if dof_name.endswith(suffix) and 'left' in dof_name:
                         dof_map.append((i, dof_idx))
+                        mapped_dofs.add(dof_idx)
+                        found = True
                         break
+                if not found:
+                    # Fall back to any match
+                    for dof_idx, dof_name in enumerate(dof_names):
+                        if dof_idx in mapped_dofs:
+                            continue
+                        if dof_name.endswith(suffix):
+                            dof_map.append((i, dof_idx))
+                            mapped_dofs.add(dof_idx)
+                            break
 
         if not dof_map:
             print(f"[replay] WARNING: no DOF mapping found. joint_names={joint_names}, dof_names={dof_names}")
+        else:
+            print(f"[replay] DOF mapping ({len(dof_map)} joints): " +
+                  ", ".join(f"{joint_names[s]}→{dof_names[d]}" for s, d in dof_map))
 
         # Replay loop
         frame_interval = 1.0 / (fps * speed) if fps > 0 and speed > 0 else 1.0 / 30.0
