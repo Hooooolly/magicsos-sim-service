@@ -2540,14 +2540,21 @@ def _run_pending_replay():
 
         # Diagnostic: check collision on finger and cube prims
         from pxr import UsdGeom, UsdShade, UsdPhysics
-        print("[replay] collision check:")
+        print("[replay] collision check — all prims under openarm with collision or finger:")
         for p in stage.Traverse():
+            path_str = str(p.GetPath())
             name = p.GetName().lower()
             has_col = p.HasAPI(UsdPhysics.CollisionAPI)
-            if 'finger' in name or 'grip' in name:
-                print(f"  {p.GetPath()} collision={has_col} mesh={p.IsA(UsdGeom.Mesh)}")
-            elif 'cube' in name and has_col:
-                print(f"  {p.GetPath()} collision={has_col}")
+            # Show all prims under openarm that have collision
+            if '/openarm' in path_str.lower() and has_col:
+                print(f"  COL: {p.GetPath()} type={p.GetTypeName()}")
+            # Show all finger-related prims regardless
+            if 'finger' in path_str.lower():
+                print(f"  FIN: {p.GetPath()} type={p.GetTypeName()} col={has_col} mesh={p.IsA(UsdGeom.Mesh)} gprim={p.IsA(UsdGeom.Gprim)}")
+        # Also check cube
+        for p in stage.Traverse():
+            if 'cube' in p.GetName().lower() and p.HasAPI(UsdPhysics.CollisionAPI):
+                print(f"  CUBE: {p.GetPath()} col=True")
 
         # Find cube and bowl prims for position tracking
         cube_prim = bowl_prim = None
