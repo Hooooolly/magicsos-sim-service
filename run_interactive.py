@@ -2505,21 +2505,22 @@ def _run_pending_replay():
         right_arm_idx.sort(key=lambda i: dof_names[i])  # sort by name → joint1, joint2, ...
         right_finger_idx = [i for i, n in enumerate(dof_names) if 'right' in n and 'finger' in n]
 
-        # dof_map: list of (data_col, sim_dof_idx, negate)
-        dof_map = []
+        # Split mapping: arm (PD) vs finger (kinematic)
+        import numpy as np
+        dof_map_arm = []
+        dof_map_finger = []
         for sim_j, data_j in enumerate(data_to_sim):
             if sim_j < len(right_arm_idx) and data_j < states.shape[1]:
-                dof_map.append((data_j, right_arm_idx[sim_j], sim_j in negate_joint))
-        # Finger: data col 7 → right finger DOFs
+                dof_map_arm.append((data_j, right_arm_idx[sim_j], sim_j in negate_joint))
         for fidx in right_finger_idx:
             if states.shape[1] > 7:
-                dof_map.append((7, fidx, False))
+                dof_map_finger.append((7, fidx, False))
+        dof_map = dof_map_arm + dof_map_finger
 
-        # Set damping to prevent oscillation (default is 0 → undamped spring)
-        import numpy as np
+        # Set damping on arm joints to prevent oscillation
         ctrl = robot.get_articulation_controller()
         stiffness, damping = ctrl.get_gains()
-        damping = np.where(stiffness > 0, stiffness * 0.1, damping)  # 10% critical damping
+        damping = np.where(stiffness > 0, stiffness * 0.1, damping)
         ctrl.set_gains(stiffness, damping)
         print(f"[replay] set damping: arm={damping[1]:.1f}, finger={damping[16]:.1f}")
 
@@ -2537,10 +2538,11 @@ def _run_pending_replay():
                 print(f"[replay] stopped at frame {frame_idx}/{total_frames}")
                 break
 
-            # All joints via PD control (apply_action) — generates grip force
+            # Arm: PD control (damped, smooth, has force)
+            # Finger: kinematic set_joint_positions (reliable position tracking)
             state_row = states[frame_idx]
             targets = np.full(len(robot.dof_names), float('nan'))
-            for src_idx, dst_idx, negate in dof_map:
+            for src_idx, dst_idx, negate in dof_map_arm:
                 if src_idx < len(state_row):
                     val = float(state_row[src_idx])
                     if negate:
@@ -2549,6 +2551,14 @@ def _run_pending_replay():
             from omni.isaac.core.utils.types import ArticulationAction
             action = ArticulationAction(joint_positions=targets)
             ctrl.apply_action(action)
+
+            # Finger: direct position set (kinematic, ensures close/open)
+            if dof_map_finger:
+                positions = robot.get_joint_positions()
+                for src_idx, dst_idx, _ in dof_map_finger:
+                    if src_idx < len(state_row):
+                        positions[dst_idx] = float(state_row[src_idx])
+                robot.set_joint_positions(positions)
 
             # Step sim to render
             if world and PHYSICS_RUNNING:
