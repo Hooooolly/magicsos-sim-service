@@ -2613,8 +2613,11 @@ def _run_pending_replay():
 
             _state["replay_progress"]["current_frame"] = frame_idx + 1
 
-            # Log cube/bowl positions + actual finger pos every second
-            if frame_idx % log_every == 0:
+            # Log cube/bowl positions + actual finger pos
+            # Dense logging (every 5 frames) during grip phase (frame 230-350), else every second
+            in_grip_phase = 230 <= frame_idx <= 350
+            should_log = (in_grip_phase and frame_idx % 5 == 0) or (not in_grip_phase and frame_idx % log_every == 0)
+            if should_log:
                 parts = []
                 finger_val = float(state_row[7]) if states.shape[1] > 7 else -1
                 actual_pos = robot.get_joint_positions()
