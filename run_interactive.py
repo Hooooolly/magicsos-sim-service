@@ -2597,6 +2597,11 @@ def _run_pending_replay():
                     if negate:
                         val = -val
                     targets[dst_idx] = val
+            # Extra squeeze: when finger is closing (target < 0.02), push to 0.0
+            # This maximizes grip force through PD control
+            for fidx in right_finger_idx:
+                if targets[fidx] < 0.02:
+                    targets[fidx] = 0.0
             action = ArticulationAction(joint_positions=np.array(targets))
             ctrl.apply_action(action)
 
@@ -2608,10 +2613,12 @@ def _run_pending_replay():
 
             _state["replay_progress"]["current_frame"] = frame_idx + 1
 
-            # Log cube/bowl positions every second
+            # Log cube/bowl positions + actual finger pos every second
             if frame_idx % log_every == 0:
                 parts = []
                 finger_val = float(state_row[7]) if states.shape[1] > 7 else -1
+                actual_pos = robot.get_joint_positions()
+                actual_finger = float(actual_pos[right_finger_idx[0]]) if right_finger_idx else -1
                 if cube_prim:
                     xf = UsdGeom.Xformable(cube_prim)
                     mat = xf.ComputeLocalToWorldTransform(0)
@@ -2622,7 +2629,7 @@ def _run_pending_replay():
                     mat = xf.ComputeLocalToWorldTransform(0)
                     bp = mat.ExtractTranslation()
                     parts.append(f"bowl=({bp[0]:.3f},{bp[1]:.3f},{bp[2]:.3f})")
-                parts.append(f"finger={finger_val:.4f}")
+                parts.append(f"finger_tgt={finger_val:.4f} actual={actual_finger:.4f}")
                 print(f"[replay] f={frame_idx}/{total_frames} {' '.join(parts)}")
 
             # Throttle to match dataset FPS
