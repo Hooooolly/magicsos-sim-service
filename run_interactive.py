@@ -2392,7 +2392,12 @@ def _run_pending_replay():
 
         # Extract joint names from features
         state_feature = features.get("observation.state", {})
-        joint_names = state_feature.get("names", [])
+        raw_names = state_feature.get("names", [])
+        # LeRobot v3: names can be {"motors": [...]} or flat list
+        if isinstance(raw_names, dict):
+            joint_names = list(raw_names.get("motors", raw_names.get(list(raw_names.keys())[0], []))) if raw_names else []
+        else:
+            joint_names = list(raw_names) if raw_names else []
 
         chunk_index = episode_index // chunks_size
         if "{" in data_path_template:
@@ -2447,7 +2452,7 @@ def _run_pending_replay():
         robot = Articulation(robot_prims[0].GetPath().pathString)
         robot.initialize()
 
-        dof_names = robot.dof_names
+        dof_names = list(robot.dof_names)  # ensure plain Python list
         print(f"[replay] robot DOFs: {dof_names}")
 
         # Build index mapping: state array index → robot DOF index
