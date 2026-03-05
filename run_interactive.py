@@ -2528,16 +2528,16 @@ def _run_pending_replay():
                 print(f"[replay] stopped at frame {frame_idx}/{total_frames}")
                 break
 
-            # Set joint positions
-            current_positions = robot.get_joint_positions()
+            # Set joint position targets (PD control → generates forces for grasping)
+            targets = robot.get_joint_positions().copy()
             state_row = states[frame_idx]
             for src_idx, dst_idx, negate in dof_map:
                 if src_idx < len(state_row):
                     val = float(state_row[src_idx])
                     if negate:
                         val = -val
-                    current_positions[dst_idx] = val
-            robot.set_joint_positions(current_positions)
+                    targets[dst_idx] = val
+            robot.set_joint_position_targets(targets)
 
             # Step sim to render
             if world and PHYSICS_RUNNING:
