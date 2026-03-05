@@ -2593,18 +2593,21 @@ def _run_pending_replay():
             binding.Bind(UsdShade.Material(mat_prim), UsdShade.Tokens.weakerThanDescendants, "physics")
             print(f"[replay] applied friction material to cube: static=2.0 dynamic=2.0")
 
-        # Enable collision + friction on ALL finger prims (they may lack CollisionAPI)
-        finger_collision_added = 0
+        # Enable collision + friction on finger collision prims
+        # Robot structure: each link has visuals/ + collisions/ subdirs
+        # Finger prims: openarm_right_right_finger/collisions, openarm_right_left_finger/collisions
         for p in stage.Traverse():
-            name = p.GetName().lower()
-            if 'finger' in name and p.IsA(UsdGeom.Mesh):
+            path_str = str(p.GetPath())
+            # Target: collision prims under finger links
+            if 'finger' in path_str.lower() and 'collision' in path_str.lower():
+                has_col = p.HasAPI(UsdPhysics.CollisionAPI)
+                print(f"[replay] finger collision prim: {p.GetPath()} col={has_col} type={p.GetTypeName()}")
                 # Add CollisionAPI if missing
-                if not p.HasAPI(UsdPhysics.CollisionAPI):
+                if not has_col:
                     UsdPhysics.CollisionAPI.Apply(p)
-                    print(f"[replay] ADDED collision to finger: {p.GetPath()}")
-                    finger_collision_added += 1
-                # Add friction material
-                mat_path = str(p.GetPath()) + "/GripMaterial"
+                    print(f"[replay] ADDED CollisionAPI to: {p.GetPath()}")
+                # Add high friction
+                mat_path = path_str + "/GripMaterial"
                 mat_prim = stage.DefinePrim(mat_path, "Material")
                 UsdPhysics.MaterialAPI.Apply(mat_prim)
                 phys_mat = UsdPhysics.MaterialAPI(mat_prim)
@@ -2612,16 +2615,11 @@ def _run_pending_replay():
                 phys_mat.CreateDynamicFrictionAttr(2.0)
                 binding = UsdShade.MaterialBindingAPI.Apply(p)
                 binding.Bind(UsdShade.Material(mat_prim), UsdShade.Tokens.weakerThanDescendants, "physics")
-                print(f"[replay] applied friction to finger: {p.GetPath()}")
-        if finger_collision_added == 0:
-            print("[replay] WARNING: no finger meshes found without collision — checking all right-arm children")
-            for p in stage.Traverse():
-                name = p.GetName().lower()
-                path_str = str(p.GetPath()).lower()
-                if ('finger' in path_str or 'grip' in path_str) and p.IsA(UsdGeom.Gprim):
-                    if not p.HasAPI(UsdPhysics.CollisionAPI):
-                        UsdPhysics.CollisionAPI.Apply(p)
-                        print(f"[replay] ADDED collision to: {p.GetPath()}")
+                print(f"[replay] applied friction=2.0 to: {p.GetPath()}")
+            # Also check hand prims (may need collision too)
+            elif 'hand' in path_str.lower() and 'collision' in path_str.lower():
+                has_col = p.HasAPI(UsdPhysics.CollisionAPI)
+                print(f"[replay] hand collision prim: {p.GetPath()} col={has_col} type={p.GetTypeName()}")
 
         # Replay loop — all PD control with high finger gains for physical grip
         from omni.isaac.core.utils.types import ArticulationAction
