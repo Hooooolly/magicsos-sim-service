@@ -2579,47 +2579,34 @@ def _run_pending_replay():
         if bowl_prim:
             print(f"[replay] tracking bowl: {bowl_prim.GetPath()}")
 
-        # Add high-friction physics material to cube for firm grip
+        # Add very high-friction physics material to cube for firm grip
         if cube_prim:
             mat_path = str(cube_prim.GetPath()) + "/GripMaterial"
             mat_prim = stage.DefinePrim(mat_path, "Material")
             UsdPhysics.MaterialAPI.Apply(mat_prim)
             phys_mat = UsdPhysics.MaterialAPI(mat_prim)
-            phys_mat.CreateStaticFrictionAttr(2.0)
-            phys_mat.CreateDynamicFrictionAttr(2.0)
+            phys_mat.CreateStaticFrictionAttr(5.0)   # very high friction
+            phys_mat.CreateDynamicFrictionAttr(5.0)
             phys_mat.CreateRestitutionAttr(0.0)
             # Bind material to cube
             binding = UsdShade.MaterialBindingAPI.Apply(cube_prim)
             binding.Bind(UsdShade.Material(mat_prim), UsdShade.Tokens.weakerThanDescendants, "physics")
-            print(f"[replay] applied friction material to cube: static=2.0 dynamic=2.0")
+            print(f"[replay] applied friction material to cube: static=5.0 dynamic=5.0")
+            # Also reduce cube mass for easier grip
+            if cube_prim.HasAPI(UsdPhysics.MassAPI):
+                UsdPhysics.MassAPI(cube_prim).CreateMassAttr(0.02)  # 20g instead of 50g
+                print(f"[replay] reduced cube mass to 0.02 kg")
 
-        # Enable collision + friction on finger collision prims
-        # Robot structure: each link has visuals/ + collisions/ subdirs
-        # Finger prims: openarm_right_right_finger/collisions, openarm_right_left_finger/collisions
+        # Create a scene-level physics material with high friction
+        # (Can't modify instanceable robot prims directly)
+        # PhysX uses max(friction_A, friction_B) by default for contact pairs
+        # So high friction on cube alone should work for grip
+        print("[replay] finger collision check:")
         for p in stage.Traverse():
             path_str = str(p.GetPath())
-            # Target: collision prims under finger links
-            if 'finger' in path_str.lower() and 'collision' in path_str.lower():
+            if ('finger' in path_str.lower() or 'hand' in path_str.lower()) and 'collision' in path_str.lower():
                 has_col = p.HasAPI(UsdPhysics.CollisionAPI)
-                print(f"[replay] finger collision prim: {p.GetPath()} col={has_col} type={p.GetTypeName()}")
-                # Add CollisionAPI if missing
-                if not has_col:
-                    UsdPhysics.CollisionAPI.Apply(p)
-                    print(f"[replay] ADDED CollisionAPI to: {p.GetPath()}")
-                # Add high friction
-                mat_path = path_str + "/GripMaterial"
-                mat_prim = stage.DefinePrim(mat_path, "Material")
-                UsdPhysics.MaterialAPI.Apply(mat_prim)
-                phys_mat = UsdPhysics.MaterialAPI(mat_prim)
-                phys_mat.CreateStaticFrictionAttr(2.0)
-                phys_mat.CreateDynamicFrictionAttr(2.0)
-                binding = UsdShade.MaterialBindingAPI.Apply(p)
-                binding.Bind(UsdShade.Material(mat_prim), UsdShade.Tokens.weakerThanDescendants, "physics")
-                print(f"[replay] applied friction=2.0 to: {p.GetPath()}")
-            # Also check hand prims (may need collision too)
-            elif 'hand' in path_str.lower() and 'collision' in path_str.lower():
-                has_col = p.HasAPI(UsdPhysics.CollisionAPI)
-                print(f"[replay] hand collision prim: {p.GetPath()} col={has_col} type={p.GetTypeName()}")
+                print(f"  {p.GetPath()} col={has_col} type={p.GetTypeName()}")
 
         # Replay loop — all PD control with high finger gains for physical grip
         from omni.isaac.core.utils.types import ArticulationAction
