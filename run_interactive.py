@@ -2523,10 +2523,10 @@ def _run_pending_replay():
         stiffness, damping = ctrl.get_gains()
         # Arm: add 10% damping to prevent oscillation
         damping = np.where(stiffness > 0, stiffness * 0.1, damping)
-        # Finger: very high stiffness+damping for strong physical grip force
+        # Finger: moderate stiffness for contact-aware grip (not too high = won't push cube away)
         for fidx in right_finger_idx:
-            stiffness[fidx] = 500000.0   # very high → strong closing force
-            damping[fidx] = 50000.0      # high damping → no finger bounce
+            stiffness[fidx] = 100000.0   # firm but not aggressive
+            damping[fidx] = 10000.0      # enough to prevent bounce
         ctrl.set_gains(stiffness, damping)
         print(f"[replay] PD gains: arm stiff={stiffness[right_arm_idx[0]]:.0f} damp={damping[right_arm_idx[0]]:.0f}, "
               f"finger stiff={stiffness[right_finger_idx[0]]:.0f} damp={damping[right_finger_idx[0]]:.0f}")
@@ -2597,11 +2597,32 @@ def _run_pending_replay():
                     if negate:
                         val = -val
                     targets[dst_idx] = val
-            # Extra squeeze: when finger is closing (target < 0.02), push to 0.0
-            # This maximizes grip force through PD control
+
+            # Contact-aware finger control:
+            # When dataset says close (target < 0.03), gradually close finger.
+            # If actual finger stops moving (hit object), hold at contact width + squeeze.
             for fidx in right_finger_idx:
-                if targets[fidx] < 0.02:
-                    targets[fidx] = 0.0
+                data_tgt = targets[fidx]
+                if data_tgt < 0.03:  # dataset says grip
+                    actual = float(robot.get_joint_positions()[fidx])
+                    if not hasattr(_run_pending_replay, '_finger_contact'):
+                        _run_pending_replay._finger_contact = {}
+                    prev = _run_pending_replay._finger_contact.get(fidx)
+                    if prev is not None:
+                        # Contact detection: actual stopped decreasing despite target decreasing
+                        if actual > prev - 0.0005 and actual > data_tgt + 0.005:
+                            # Hit something — hold at contact width, squeeze 2mm for grip
+                            targets[fidx] = max(0.0, actual - 0.002)
+                        else:
+                            targets[fidx] = data_tgt  # still closing freely
+                    else:
+                        targets[fidx] = data_tgt  # first frame of closing
+                    _run_pending_replay._finger_contact[fidx] = actual
+                else:
+                    # Open — clear contact state
+                    if hasattr(_run_pending_replay, '_finger_contact'):
+                        _run_pending_replay._finger_contact.pop(fidx, None)
+
             action = ArticulationAction(joint_positions=np.array(targets))
             ctrl.apply_action(action)
 
