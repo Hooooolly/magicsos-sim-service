@@ -2540,15 +2540,22 @@ def _run_pending_replay():
 
         # Diagnostic: check collision on finger and cube prims
         from pxr import UsdGeom, UsdShade, UsdPhysics
-        # List ALL prims under /World/openarm to understand prim structure
-        print("[replay] openarm prim tree (Mesh/Gprim only):")
+        # List prim tree under the robot reference to find collision geometry
+        robot_root = robot_prims[0].GetPath().pathString
+        print(f"[replay] robot root: {robot_root}")
+        prim_count = 0
         for p in stage.Traverse():
             path_str = str(p.GetPath())
-            if '/openarm' in path_str.lower():
+            if path_str.startswith(robot_root):
                 tp = p.GetTypeName()
-                if tp in ('Mesh', 'Capsule', 'Sphere', 'Cube', 'Cylinder', 'Cone'):
-                    has_col = p.HasAPI(UsdPhysics.CollisionAPI)
-                    print(f"  {p.GetPath()} type={tp} col={has_col}")
+                has_col = p.HasAPI(UsdPhysics.CollisionAPI)
+                depth = path_str.count('/') - robot_root.count('/')
+                if depth <= 3 or has_col or p.IsA(UsdGeom.Gprim):
+                    print(f"  {'  '*depth}{p.GetName()} [{tp}] col={has_col}")
+                    prim_count += 1
+                    if prim_count > 60:
+                        print("  ... (truncated)")
+                        break
 
         # Find cube and bowl prims for position tracking
         cube_prim = bowl_prim = None
