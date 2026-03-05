@@ -2531,26 +2531,40 @@ def _run_pending_replay():
             print(f"[replay] DOF mapping ({len(dof_map)} joints): " +
                   ", ".join(f"{jn[s] if s < len(jn) else f'data[{s}]'}→{dof_names[d]}{'(neg)' if neg else ''}" for s, d, neg in dof_map))
 
-        # Replay loop
+        # Replay loop — hybrid control:
+        #   Arm joints: PD control (apply_action) for smooth motion with damping
+        #   Finger joints: kinematic (set_joint_positions) for firm grip force
+        from omni.isaac.core.utils.types import ArticulationAction
         frame_interval = 1.0 / (fps * speed) if fps > 0 and speed > 0 else 1.0 / 30.0
         for frame_idx in range(total_frames):
             if _replay_stop.is_set():
                 print(f"[replay] stopped at frame {frame_idx}/{total_frames}")
                 break
 
-            # All joints via PD: use current positions as base, override mapped joints
-            # No NaN — all joints get a target (unmapped keep current pos)
             state_row = states[frame_idx]
-            targets = robot.get_joint_positions().copy()
-            for src_idx, dst_idx, negate in dof_map:
+            cur_pos = robot.get_joint_positions().copy()
+
+            # 1) Arm PD: set targets for arm joints, keep current pos for others
+            arm_targets = cur_pos.copy()
+            for src_idx, dst_idx, negate in dof_map_arm:
                 if src_idx < len(state_row):
                     val = float(state_row[src_idx])
                     if negate:
                         val = -val
-                    targets[dst_idx] = val
-            from omni.isaac.core.utils.types import ArticulationAction
-            action = ArticulationAction(joint_positions=np.array(targets))
+                    arm_targets[dst_idx] = val
+            action = ArticulationAction(joint_positions=np.array(arm_targets))
             ctrl.apply_action(action)
+
+            # 2) Finger kinematic: direct position set for firm grip
+            if dof_map_finger:
+                finger_pos = cur_pos.copy()
+                for src_idx, dst_idx, negate in dof_map_finger:
+                    if src_idx < len(state_row):
+                        val = float(state_row[src_idx])
+                        if negate:
+                            val = -val
+                        finger_pos[dst_idx] = val
+                robot.set_joint_positions(finger_pos)
 
             # Step sim to render
             if world and PHYSICS_RUNNING:
