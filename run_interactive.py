@@ -2477,15 +2477,14 @@ def _run_pending_replay():
         if not robot_prims:
             raise RuntimeError("No robot (ArticulationRootAPI) found in scene")
 
-        # Ensure World is ready — Articulation.initialize() needs active physics
-        from omni.isaac.core import World as _World
-        _w = _World.instance()
-        if _w is None:
-            _recreate_world_for_open_stage("replay")
-            _w = _World.instance()
-        if _w is not None and _w.is_stopped():
-            print("[replay] resetting world to initialize physics...")
-            _w.reset()
+        # Ensure physics is running — Articulation.initialize() needs active physics
+        if world is not None and not PHYSICS_RUNNING:
+            print("[replay] starting physics for articulation init...")
+            world.play()
+            PHYSICS_RUNNING = True
+            _state["physics"] = True
+            # Step once so physics engine registers the articulation
+            world.step(render=True)
 
         from omni.isaac.core.articulations import Articulation
         robot = Articulation(robot_prims[0].GetPath().pathString)
