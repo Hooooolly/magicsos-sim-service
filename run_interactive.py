@@ -2493,57 +2493,33 @@ def _run_pending_replay():
         dof_names = list(robot.dof_names)  # ensure plain Python list
         print(f"[replay] robot DOFs: {dof_names}")
 
-        # Build index mapping: state array index → robot DOF index
+        # Build index mapping for OpenArm bimanual robot
+        # Dataset records 8 joints: openarm_joint1-7 + openarm_finger_joint1
+        # Sim right arm DOFs have different internal ordering
+        # data_to_sim[sim_j] = data_j: for sim joint sim_j, read data column data_j
+        data_to_sim = [0, 5, 1, 2, 3, 4, 6]  # joint reordering from all replay scripts
+        negate_joint = {6}  # sim joint 6 (wrist) needs sign flip
+
+        # Find right arm joint DOF indices in the articulation
+        right_arm_idx = [i for i, n in enumerate(dof_names) if 'right' in n and 'joint' in n and 'finger' not in n]
+        right_arm_idx.sort(key=lambda i: dof_names[i])  # sort by name → joint1, joint2, ...
+        right_finger_idx = [i for i, n in enumerate(dof_names) if 'right' in n and 'finger' in n]
+
+        # dof_map: list of (data_col, sim_dof_idx, negate)
         dof_map = []
-        mapped_dofs = set()
-        for i, name in enumerate(joint_names if joint_names else [f"joint_{j}" for j in range(states.shape[1])]):
-            # Try exact match first
-            if name in dof_names:
-                idx = dof_names.index(name)
-                dof_map.append((i, idx))
-                mapped_dofs.add(idx)
-                continue
-            # Try substring match
-            found = False
-            for dof_idx, dof_name in enumerate(dof_names):
-                if dof_idx in mapped_dofs:
-                    continue
-                if name in dof_name or dof_name.endswith(name):
-                    dof_map.append((i, dof_idx))
-                    mapped_dofs.add(dof_idx)
-                    found = True
-                    break
-            if found:
-                continue
-            # Suffix match: "openarm_joint1" → "joint1", prefer left arm
-            import re
-            m = re.search(r'((?:finger_)?joint\d+)$', name)
-            if m:
-                suffix = m.group(1)
-                # First try left arm (recording ee_link=openarm_left_hand)
-                for dof_idx, dof_name in enumerate(dof_names):
-                    if dof_idx in mapped_dofs:
-                        continue
-                    if dof_name.endswith(suffix) and 'left' in dof_name:
-                        dof_map.append((i, dof_idx))
-                        mapped_dofs.add(dof_idx)
-                        found = True
-                        break
-                if not found:
-                    # Fall back to any match
-                    for dof_idx, dof_name in enumerate(dof_names):
-                        if dof_idx in mapped_dofs:
-                            continue
-                        if dof_name.endswith(suffix):
-                            dof_map.append((i, dof_idx))
-                            mapped_dofs.add(dof_idx)
-                            break
+        for sim_j, data_j in enumerate(data_to_sim):
+            if sim_j < len(right_arm_idx) and data_j < states.shape[1]:
+                dof_map.append((data_j, right_arm_idx[sim_j], sim_j in negate_joint))
+        # Finger: data col 7 → right finger DOF
+        if right_finger_idx and states.shape[1] > 7:
+            dof_map.append((7, right_finger_idx[0], False))
 
         if not dof_map:
             print(f"[replay] WARNING: no DOF mapping found. joint_names={joint_names}, dof_names={dof_names}")
         else:
+            jn = joint_names or [f"data[{i}]" for i in range(states.shape[1])]
             print(f"[replay] DOF mapping ({len(dof_map)} joints): " +
-                  ", ".join(f"{joint_names[s]}→{dof_names[d]}" for s, d in dof_map))
+                  ", ".join(f"{jn[s] if s < len(jn) else f'data[{s}]'}→{dof_names[d]}{'(neg)' if neg else ''}" for s, d, neg in dof_map))
 
         # Replay loop
         frame_interval = 1.0 / (fps * speed) if fps > 0 and speed > 0 else 1.0 / 30.0
@@ -2555,9 +2531,12 @@ def _run_pending_replay():
             # Set joint positions
             current_positions = robot.get_joint_positions()
             state_row = states[frame_idx]
-            for src_idx, dst_idx in dof_map:
+            for src_idx, dst_idx, negate in dof_map:
                 if src_idx < len(state_row):
-                    current_positions[dst_idx] = float(state_row[src_idx])
+                    val = float(state_row[src_idx])
+                    if negate:
+                        val = -val
+                    current_positions[dst_idx] = val
             robot.set_joint_positions(current_positions)
 
             # Step sim to render
