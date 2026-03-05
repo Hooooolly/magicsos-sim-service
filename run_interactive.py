@@ -2517,12 +2517,19 @@ def _run_pending_replay():
                 dof_map_finger.append((7, fidx, False))
         dof_map = dof_map_arm + dof_map_finger
 
-        # Set damping on arm joints to prevent oscillation
+        # Tune PD gains: arm needs damping to prevent oscillation,
+        # finger needs high stiffness+damping for firm physical grip via friction
         ctrl = robot.get_articulation_controller()
         stiffness, damping = ctrl.get_gains()
+        # Arm: add 10% damping to prevent oscillation
         damping = np.where(stiffness > 0, stiffness * 0.1, damping)
+        # Finger: boost stiffness and damping for strong grip force
+        for fidx in right_finger_idx:
+            stiffness[fidx] = 200000.0   # high stiffness → strong closing force
+            damping[fidx] = 20000.0      # high damping → no finger bounce
         ctrl.set_gains(stiffness, damping)
-        print(f"[replay] set damping: arm={damping[1]:.1f}, finger={damping[16]:.1f}")
+        print(f"[replay] PD gains: arm stiff={stiffness[right_arm_idx[0]]:.0f} damp={damping[right_arm_idx[0]]:.0f}, "
+              f"finger stiff={stiffness[right_finger_idx[0]]:.0f} damp={damping[right_finger_idx[0]]:.0f}")
 
         if not dof_map:
             print(f"[replay] WARNING: no DOF mapping found. joint_names={joint_names}, dof_names={dof_names}")
@@ -2531,9 +2538,7 @@ def _run_pending_replay():
             print(f"[replay] DOF mapping ({len(dof_map)} joints): " +
                   ", ".join(f"{jn[s] if s < len(jn) else f'data[{s}]'}→{dof_names[d]}{'(neg)' if neg else ''}" for s, d, neg in dof_map))
 
-        # Replay loop — hybrid control:
-        #   Arm joints: PD control (apply_action) for smooth motion with damping
-        #   Finger joints: kinematic (set_joint_positions) for firm grip force
+        # Replay loop — all PD control with high finger gains for physical grip
         from omni.isaac.core.utils.types import ArticulationAction
         frame_interval = 1.0 / (fps * speed) if fps > 0 and speed > 0 else 1.0 / 30.0
         for frame_idx in range(total_frames):
@@ -2542,29 +2547,15 @@ def _run_pending_replay():
                 break
 
             state_row = states[frame_idx]
-            cur_pos = robot.get_joint_positions().copy()
-
-            # 1) Arm PD: set targets for arm joints, keep current pos for others
-            arm_targets = cur_pos.copy()
-            for src_idx, dst_idx, negate in dof_map_arm:
+            targets = robot.get_joint_positions().copy()
+            for src_idx, dst_idx, negate in dof_map:
                 if src_idx < len(state_row):
                     val = float(state_row[src_idx])
                     if negate:
                         val = -val
-                    arm_targets[dst_idx] = val
-            action = ArticulationAction(joint_positions=np.array(arm_targets))
+                    targets[dst_idx] = val
+            action = ArticulationAction(joint_positions=np.array(targets))
             ctrl.apply_action(action)
-
-            # 2) Finger kinematic: direct position set for firm grip
-            if dof_map_finger:
-                finger_pos = cur_pos.copy()
-                for src_idx, dst_idx, negate in dof_map_finger:
-                    if src_idx < len(state_row):
-                        val = float(state_row[src_idx])
-                        if negate:
-                            val = -val
-                        finger_pos[dst_idx] = val
-                robot.set_joint_positions(finger_pos)
 
             # Step sim to render
             if world and PHYSICS_RUNNING:
