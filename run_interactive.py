@@ -1655,8 +1655,8 @@ def scene_snapshot():
 ROBOT_USD_MAP = {
     "franka": "/home/user/magicphysics/MagicPhysics/packages/MagicSim/Assets/Robots/franka_umi.usd",
     "franka_umi": "/home/user/magicphysics/MagicPhysics/packages/MagicSim/Assets/Robots/franka_umi.usd",
-    "openarm": "/data/robots/openarm_bimanual/openarm_bimanual.usd",
-    "openarm_bimanual": "/data/robots/openarm_bimanual/openarm_bimanual.usd",
+    "openarm": "/data/embodied/asset/robots/openarm_bimanual/openarm_bimanual.usd",
+    "openarm_bimanual": "/data/embodied/asset/robots/openarm_bimanual/openarm_bimanual.usd",
 }
 
 @bridge.route("/robot/spawn", methods=["POST"])
