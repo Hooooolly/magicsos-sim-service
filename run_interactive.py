@@ -1655,8 +1655,8 @@ def scene_snapshot():
 ROBOT_USD_MAP = {
     "franka": "/home/user/magicphysics/MagicPhysics/packages/MagicSim/Assets/Robots/franka_umi.usd",
     "franka_umi": "/home/user/magicphysics/MagicPhysics/packages/MagicSim/Assets/Robots/franka_umi.usd",
-    "openarm": "/data/embodied/asset/robots/openarm_bimanual/openarm_bimanual.usd",
-    "openarm_bimanual": "/data/embodied/asset/robots/openarm_bimanual/openarm_bimanual.usd",
+    "openarm": "/data/embodied/asset/robots/openarm_bimanual/configuration/openarm_bimanual_base.usd",
+    "openarm_bimanual": "/data/embodied/asset/robots/openarm_bimanual/configuration/openarm_bimanual_base.usd",
 }
 
 @bridge.route("/robot/spawn", methods=["POST"])
@@ -1936,7 +1936,7 @@ print(f"[interactive] Ready. WebRTC port={WEBRTC_PORT}, Kit API=8011, Bridge={BR
 # ── Main-thread command processor ────────────────────────────
 def _process_commands():
     """Drain command queue and execute on main thread (called each frame)."""
-    global PHYSICS_RUNNING, _collect_request
+    global PHYSICS_RUNNING, _collect_request, _replay_request
     while not _cmd_queue.empty():
         try:
             cmd = _cmd_queue.get_nowait()
