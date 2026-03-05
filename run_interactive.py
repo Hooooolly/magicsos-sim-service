@@ -2540,22 +2540,31 @@ def _run_pending_replay():
 
         # Diagnostic: check collision on finger and cube prims
         from pxr import UsdGeom, UsdShade, UsdPhysics
-        # List prim tree under the robot reference to find collision geometry
-        robot_root = robot_prims[0].GetPath().pathString
-        print(f"[replay] robot root: {robot_root}")
+        # List prim tree to find collision geometry on robot
+        # Find the openarm reference prim
+        robot_path = robot_prims[0].GetPath().pathString
+        # Go up to the openarm root (e.g. /World/OpenArm)
+        parts = robot_path.split('/')
+        openarm_root = '/'.join(parts[:3]) if len(parts) >= 3 else robot_path
+        print(f"[replay] scanning prims under: {openarm_root}")
         prim_count = 0
         for p in stage.Traverse():
             path_str = str(p.GetPath())
-            if path_str.startswith(robot_root):
-                tp = p.GetTypeName()
-                has_col = p.HasAPI(UsdPhysics.CollisionAPI)
-                depth = path_str.count('/') - robot_root.count('/')
-                if depth <= 3 or has_col or p.IsA(UsdGeom.Gprim):
-                    print(f"  {'  '*depth}{p.GetName()} [{tp}] col={has_col}")
-                    prim_count += 1
-                    if prim_count > 60:
-                        print("  ... (truncated)")
-                        break
+            if not path_str.startswith(openarm_root):
+                continue
+            tp = p.GetTypeName()
+            has_col = p.HasAPI(UsdPhysics.CollisionAPI)
+            is_geom = p.IsA(UsdGeom.Gprim)
+            depth = path_str[len(openarm_root):].count('/')
+            # Show: all geometry, all collision, all joint-related, depth<=2
+            if is_geom or has_col or 'Joint' in tp or depth <= 2:
+                marker = "COL" if has_col else ("GEO" if is_geom else "   ")
+                print(f"  {marker} {'  '*min(depth,4)}{p.GetName()} [{tp}]")
+                prim_count += 1
+                if prim_count > 80:
+                    print("  ... (truncated)")
+                    break
+        print(f"[replay] total prims shown: {prim_count}")
 
         # Find cube and bowl prims for position tracking
         cube_prim = bowl_prim = None
