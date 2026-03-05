@@ -2291,6 +2291,21 @@ def _run_pending_collection():
             raise RuntimeError("World is unavailable before collection")
 
         os.makedirs(output_dir, exist_ok=True)
+
+        # Auto-save current scene before collection starts
+        scene_usd_path = None
+        try:
+            stage = _get_stage()
+            if stage and stage.GetRootLayer():
+                scene_usd_path = os.path.join(output_dir, "scene.usda")
+                if stage.GetRootLayer().Export(scene_usd_path):
+                    print(f"[collect] auto-saved scene: {scene_usd_path}")
+                else:
+                    scene_usd_path = None
+                    print("[collect] WARNING: scene auto-save failed")
+        except Exception as _save_exc:
+            print(f"[collect] WARNING: scene auto-save error: {_save_exc}")
+
         print(
             f"[collect] start main-thread run: skill={skill}, scene_mode={scene_mode}, "
             f"episodes={num_episodes}, steps_per_segment={steps_per_segment}, "
@@ -2336,6 +2351,20 @@ def _run_pending_collection():
             pass
 
         result = run_collection_in_process(**collect_kwargs)
+
+        # Inject scene_usd_path into dataset info.json
+        if scene_usd_path:
+            try:
+                info_path = os.path.join(output_dir, "meta", "info.json")
+                if os.path.exists(info_path):
+                    with open(info_path) as f:
+                        info = json.load(f)
+                    info["scene_usd_path"] = scene_usd_path
+                    with open(info_path, "w") as f:
+                        json.dump(info, f, indent=2)
+                    print(f"[collect] scene_usd_path written to info.json: {scene_usd_path}")
+            except Exception as _info_exc:
+                print(f"[collect] WARNING: failed to write scene to info.json: {_info_exc}")
 
         final_status = "stopped" if _collect_stop.is_set() else "done"
         try:
