@@ -2523,10 +2523,10 @@ def _run_pending_replay():
         stiffness, damping = ctrl.get_gains()
         # Arm: add 10% damping to prevent oscillation
         damping = np.where(stiffness > 0, stiffness * 0.1, damping)
-        # Finger: boost stiffness and damping for strong grip force
+        # Finger: very high stiffness+damping for strong physical grip force
         for fidx in right_finger_idx:
-            stiffness[fidx] = 200000.0   # high stiffness → strong closing force
-            damping[fidx] = 20000.0      # high damping → no finger bounce
+            stiffness[fidx] = 500000.0   # very high → strong closing force
+            damping[fidx] = 50000.0      # high damping → no finger bounce
         ctrl.set_gains(stiffness, damping)
         print(f"[replay] PD gains: arm stiff={stiffness[right_arm_idx[0]]:.0f} damp={damping[right_arm_idx[0]]:.0f}, "
               f"finger stiff={stiffness[right_finger_idx[0]]:.0f} damp={damping[right_finger_idx[0]]:.0f}")
@@ -2539,7 +2539,7 @@ def _run_pending_replay():
                   ", ".join(f"{jn[s] if s < len(jn) else f'data[{s}]'}→{dof_names[d]}{'(neg)' if neg else ''}" for s, d, neg in dof_map))
 
         # Find cube and bowl prims for position tracking
-        from pxr import UsdGeom
+        from pxr import UsdGeom, UsdShade, UsdPhysics
         cube_prim = bowl_prim = None
         for p in stage.Traverse():
             name_lower = p.GetName().lower()
@@ -2551,6 +2551,34 @@ def _run_pending_replay():
             print(f"[replay] tracking cube: {cube_prim.GetPath()}")
         if bowl_prim:
             print(f"[replay] tracking bowl: {bowl_prim.GetPath()}")
+
+        # Add high-friction physics material to cube for firm grip
+        if cube_prim:
+            mat_path = str(cube_prim.GetPath()) + "/GripMaterial"
+            mat_prim = stage.DefinePrim(mat_path, "Material")
+            UsdPhysics.MaterialAPI.Apply(mat_prim)
+            phys_mat = UsdPhysics.MaterialAPI(mat_prim)
+            phys_mat.CreateStaticFrictionAttr(2.0)
+            phys_mat.CreateDynamicFrictionAttr(2.0)
+            phys_mat.CreateRestitutionAttr(0.0)
+            # Bind material to cube
+            binding = UsdShade.MaterialBindingAPI.Apply(cube_prim)
+            binding.Bind(UsdShade.Material(mat_prim), UsdShade.Tokens.weakerThanDescendants, "physics")
+            print(f"[replay] applied friction material to cube: static=2.0 dynamic=2.0")
+
+        # Also add friction to finger meshes for grip
+        for p in stage.Traverse():
+            name = p.GetName().lower()
+            if 'finger' in name and 'right' in name and p.IsA(UsdGeom.Mesh):
+                mat_path = str(p.GetPath()) + "/GripMaterial"
+                mat_prim = stage.DefinePrim(mat_path, "Material")
+                UsdPhysics.MaterialAPI.Apply(mat_prim)
+                phys_mat = UsdPhysics.MaterialAPI(mat_prim)
+                phys_mat.CreateStaticFrictionAttr(2.0)
+                phys_mat.CreateDynamicFrictionAttr(2.0)
+                binding = UsdShade.MaterialBindingAPI.Apply(p)
+                binding.Bind(UsdShade.Material(mat_prim), UsdShade.Tokens.weakerThanDescendants, "physics")
+                print(f"[replay] applied friction to finger: {p.GetPath()}")
 
         # Replay loop — all PD control with high finger gains for physical grip
         from omni.isaac.core.utils.types import ArticulationAction
