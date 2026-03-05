@@ -2538,9 +2538,24 @@ def _run_pending_replay():
             print(f"[replay] DOF mapping ({len(dof_map)} joints): " +
                   ", ".join(f"{jn[s] if s < len(jn) else f'data[{s}]'}→{dof_names[d]}{'(neg)' if neg else ''}" for s, d, neg in dof_map))
 
+        # Find cube and bowl prims for position tracking
+        from pxr import UsdGeom
+        cube_prim = bowl_prim = None
+        for p in stage.Traverse():
+            name_lower = p.GetName().lower()
+            if 'cube' in name_lower or 'cuboid' in name_lower:
+                cube_prim = p
+            elif 'bowl' in name_lower:
+                bowl_prim = p
+        if cube_prim:
+            print(f"[replay] tracking cube: {cube_prim.GetPath()}")
+        if bowl_prim:
+            print(f"[replay] tracking bowl: {bowl_prim.GetPath()}")
+
         # Replay loop — all PD control with high finger gains for physical grip
         from omni.isaac.core.utils.types import ArticulationAction
         frame_interval = 1.0 / (fps * speed) if fps > 0 and speed > 0 else 1.0 / 30.0
+        log_every = max(1, int(fps))  # log every 1 second
         for frame_idx in range(total_frames):
             if _replay_stop.is_set():
                 print(f"[replay] stopped at frame {frame_idx}/{total_frames}")
@@ -2564,6 +2579,23 @@ def _run_pending_replay():
                 simulation_app.update()
 
             _state["replay_progress"]["current_frame"] = frame_idx + 1
+
+            # Log cube/bowl positions every second
+            if frame_idx % log_every == 0:
+                parts = []
+                finger_val = float(state_row[7]) if states.shape[1] > 7 else -1
+                if cube_prim:
+                    xf = UsdGeom.Xformable(cube_prim)
+                    mat = xf.ComputeLocalToWorldTransform(0)
+                    cp = mat.ExtractTranslation()
+                    parts.append(f"cube=({cp[0]:.3f},{cp[1]:.3f},{cp[2]:.3f})")
+                if bowl_prim:
+                    xf = UsdGeom.Xformable(bowl_prim)
+                    mat = xf.ComputeLocalToWorldTransform(0)
+                    bp = mat.ExtractTranslation()
+                    parts.append(f"bowl=({bp[0]:.3f},{bp[1]:.3f},{bp[2]:.3f})")
+                parts.append(f"finger={finger_val:.4f}")
+                print(f"[replay] f={frame_idx}/{total_frames} {' '.join(parts)}")
 
             # Throttle to match dataset FPS
             time.sleep(max(0, frame_interval - 0.001))
