@@ -2392,7 +2392,7 @@ def _run_pending_collection():
 
 def _run_pending_replay():
     """Run queued replay request on the main thread."""
-    global _replay_request
+    global _replay_request, PHYSICS_RUNNING
     if not _replay_request:
         return
 
