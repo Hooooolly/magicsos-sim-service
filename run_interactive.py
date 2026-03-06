@@ -1714,11 +1714,12 @@ def _drain_pending_commands(error_message: str) -> int:
 
 def _request_emergency_stop(reason: str = "manual_estop") -> dict:
     """Emergency-stop entrypoint safe to call from bridge thread."""
-    global _collect_request, _replay_request
+    global _collect_request, _replay_request, _replay_record_request
     _collect_stop.set()
     _collect_request = None
     _replay_stop.set()
     _replay_request = None
+    _replay_record_request = None
     _estop_event.set()
     _state["estop_requested"] = True
     _state["last_estop_reason"] = str(reason)
@@ -1773,6 +1774,7 @@ _collect_stop = threading.Event()
 _collect_request = None
 _replay_request = None
 _replay_stop = threading.Event()
+_replay_record_request = None
 
 @bridge.route("/collect/start", methods=["POST"])
 def collect_start():
@@ -1896,6 +1898,47 @@ def replay_stop():
     return jsonify({"status": "stopping"})
 
 
+@bridge.route("/replay/record", methods=["POST"])
+def replay_record():
+    """Replay ALL episodes from a dataset with wrist camera recording.
+
+    Produces a new LeRobot v3 dataset with observation.images.left_wrist_cam
+    and observation.images.right_wrist_cam video streams.
+
+    Body JSON:
+        source_dataset: str — path to source LeRobot dataset
+        output_dataset: str — path for new dataset (default: source + "_sim_cam")
+        episodes: list[int] | null — episode indices to record (null = all)
+        speed: float — replay speed multiplier (default 1.0)
+        camera_meta: str — path to camera_meta.yaml (default: auto-detect)
+    """
+    if _state["collecting"] or _collect_request is not None:
+        return jsonify({"error": "Cannot record while collecting"}), 400
+    if _replay_request is not None or _state.get("replaying"):
+        return jsonify({"error": "Replay already running"}), 400
+    if _replay_record_request is not None:
+        return jsonify({"error": "Replay record already queued"}), 400
+
+    data = flask_request.get_json(silent=True) or {}
+    source_dataset = data.get("source_dataset", "")
+    if not source_dataset:
+        return jsonify({"error": "source_dataset is required"}), 400
+
+    output_dataset = data.get("output_dataset", "") or (source_dataset.rstrip("/") + "_sim_cam")
+    episodes = data.get("episodes")  # None = all
+    speed = float(data.get("speed", 1.0))
+    camera_meta_path = data.get("camera_meta", "/data/embodied/asset/robots/openarm_bimanual/camera_meta.yaml")
+
+    return _enqueue_cmd(
+        "replay_record",
+        source_dataset=source_dataset,
+        output_dataset=output_dataset,
+        episodes=episodes,
+        speed=speed,
+        camera_meta=camera_meta_path,
+    )
+
+
 @bridge.route("/emergency_stop", methods=["POST"])
 def emergency_stop():
     """Immediate kill-switch: stop collect + cancel queued commands + pause physics on next frame."""
@@ -1936,7 +1979,7 @@ print(f"[interactive] Ready. WebRTC port={WEBRTC_PORT}, Kit API=8011, Bridge={BR
 # ── Main-thread command processor ────────────────────────────
 def _process_commands():
     """Drain command queue and execute on main thread (called each frame)."""
-    global PHYSICS_RUNNING, _collect_request, _replay_request
+    global PHYSICS_RUNNING, _collect_request, _replay_request, _replay_record_request
     while not _cmd_queue.empty():
         try:
             cmd = _cmd_queue.get_nowait()
@@ -2248,6 +2291,35 @@ def _process_commands():
                         "speed": speed,
                     }
                     print(f"[replay] queued: dataset={dataset_path}, ep={episode_index}, speed={speed}")
+
+            elif cmd_type == "replay_record":
+                if _state["collecting"] or _collect_request is not None:
+                    cmd["error"] = "Cannot record while collecting"
+                elif _replay_request is not None or _state.get("replaying"):
+                    cmd["error"] = "Replay already running"
+                elif _replay_record_request is not None:
+                    cmd["error"] = "Replay record already queued"
+                else:
+                    _replay_stop.clear()
+                    _state["replaying"] = True
+                    _state["replay_progress"] = {
+                        "source_dataset": cmd["source_dataset"],
+                        "output_dataset": cmd["output_dataset"],
+                        "status": "loading",
+                        "current_episode": 0,
+                        "total_episodes": 0,
+                        "current_frame": 0,
+                        "total_frames": 0,
+                    }
+                    _replay_record_request = {
+                        "source_dataset": cmd["source_dataset"],
+                        "output_dataset": cmd["output_dataset"],
+                        "episodes": cmd.get("episodes"),
+                        "speed": float(cmd.get("speed", 1.0)),
+                        "camera_meta": cmd.get("camera_meta"),
+                    }
+                    cmd["result"] = {"status": "started", "output_dataset": cmd["output_dataset"]}
+                    print(f"[replay_record] queued: {cmd['source_dataset']} → {cmd['output_dataset']}")
 
             else:
                 cmd["error"] = f"Unknown command: {cmd_type}"
@@ -2699,6 +2771,339 @@ def _run_pending_replay():
         _state["replaying"] = False
 
 
+def _run_pending_replay_record():
+    """Replay all episodes with wrist camera recording → new LeRobot v3 dataset."""
+    global _replay_record_request, PHYSICS_RUNNING
+    if not _replay_record_request:
+        return
+
+    req = _replay_record_request
+    _replay_record_request = None
+    source_dataset = req["source_dataset"]
+    output_dataset = req["output_dataset"]
+    episode_list = req.get("episodes")
+    speed = float(req.get("speed", 1.0))
+    camera_meta_path = req.get("camera_meta")
+
+    try:
+        import numpy as np
+        import pandas as pd
+        import yaml as pyyaml
+
+        # ── Load camera meta ──
+        with open(camera_meta_path) as f:
+            camera_meta = pyyaml.safe_load(f)
+        cam_configs = camera_meta.get("wrist_cameras", {})
+        camera_names = list(cam_configs.keys())
+        first_cam = cam_configs[camera_names[0]]
+        cam_resolution = tuple(first_cam.get("resolution", [640, 480]))
+        print(f"[replay_record] cameras: {camera_names}, resolution: {cam_resolution}")
+
+        # ── Load source dataset meta ──
+        meta_path = os.path.join(source_dataset, "meta", "info.json")
+        if not os.path.exists(meta_path):
+            raise FileNotFoundError(f"Source dataset meta not found: {meta_path}")
+
+        with open(meta_path) as f:
+            meta = json.load(f)
+
+        fps = meta.get("fps", 30)
+        chunks_size = meta.get("chunks_size", 1000)
+        data_path_template = meta.get("data_path", "data")
+        features = meta.get("features", {})
+        total_episodes = meta.get("total_episodes", 0)
+
+        # Determine episodes to process
+        if episode_list is not None:
+            episodes = sorted(episode_list)
+        else:
+            episodes = list(range(total_episodes))
+        if not episodes:
+            # Fallback: scan parquet for episode indices
+            chunk_0 = os.path.join(source_dataset, "data", "chunk-000", "file-000.parquet")
+            if os.path.exists(chunk_0):
+                df_all = pd.read_parquet(chunk_0)
+                if "episode_index" in df_all.columns:
+                    episodes = sorted(df_all["episode_index"].unique().tolist())
+
+        print(f"[replay_record] {len(episodes)} episodes to record from {source_dataset}")
+        _state["replay_progress"]["total_episodes"] = len(episodes)
+
+        # Extract joint names
+        state_feature = features.get("observation.state", {})
+        raw_names = state_feature.get("names", [])
+        if isinstance(raw_names, dict):
+            joint_names = list(raw_names.get("motors", list(raw_names.values())[0] if raw_names else []))
+        else:
+            joint_names = list(raw_names) if raw_names else []
+        state_dim = state_feature.get("shape", [8])[0] if state_feature else 8
+
+        # ── Setup robot ──
+        from pxr import UsdPhysics, UsdGeom, UsdShade
+        stage = _get_stage()
+        if stage is None:
+            raise RuntimeError("No USD stage")
+
+        robot_prims = []
+        for prim in stage.Traverse():
+            if prim.HasAPI(UsdPhysics.ArticulationRootAPI):
+                robot_prims.append(prim)
+        if not robot_prims:
+            raise RuntimeError("No robot (ArticulationRootAPI) found in scene")
+
+        if world is not None and not PHYSICS_RUNNING:
+            print("[replay_record] starting physics...")
+            world.play()
+            PHYSICS_RUNNING = True
+            _state["physics"] = True
+            world.step(render=True)
+
+        from omni.isaac.core.articulations import Articulation
+        robot = Articulation(robot_prims[0].GetPath().pathString)
+        robot.initialize()
+        dof_names = list(robot.dof_names)
+        print(f"[replay_record] robot DOFs: {dof_names}")
+
+        # DOF mapping (same as replay)
+        data_to_sim = [0, 5, 1, 2, 3, 4, 6]
+        negate_joint = {6}
+        right_arm_idx = sorted(
+            [i for i, n in enumerate(dof_names) if 'right' in n and 'joint' in n and 'finger' not in n],
+            key=lambda i: dof_names[i]
+        )
+        right_finger_idx = [i for i, n in enumerate(dof_names) if 'right' in n and 'finger' in n]
+
+        dof_map_arm = []
+        for sim_j, data_j in enumerate(data_to_sim):
+            if sim_j < len(right_arm_idx):
+                dof_map_arm.append((data_j, right_arm_idx[sim_j], sim_j in negate_joint))
+        dof_map_finger = []
+        for fidx in right_finger_idx:
+            dof_map_finger.append((7, fidx, False))
+        dof_map = dof_map_arm + dof_map_finger
+
+        # PD gains (same as replay)
+        ctrl = robot.get_articulation_controller()
+        stiffness, damping = ctrl.get_gains()
+        damping = np.where(stiffness > 0, stiffness * 0.1, damping)
+        for fidx in right_finger_idx:
+            stiffness[fidx] = 100000.0
+            damping[fidx] = 10000.0
+        ctrl.set_gains(stiffness, damping)
+
+        # Friction on cube (same as replay)
+        cube_prim = None
+        for p in stage.Traverse():
+            if 'cube' in p.GetName().lower() or 'cuboid' in p.GetName().lower():
+                cube_prim = p
+                break
+        if cube_prim:
+            mat_path = str(cube_prim.GetPath()) + "/GripMaterial"
+            mat_prim = stage.DefinePrim(mat_path, "Material")
+            UsdPhysics.MaterialAPI.Apply(mat_prim)
+            phys_mat = UsdPhysics.MaterialAPI(mat_prim)
+            phys_mat.CreateStaticFrictionAttr(10.0)
+            phys_mat.CreateDynamicFrictionAttr(10.0)
+            phys_mat.CreateRestitutionAttr(0.0)
+            binding = UsdShade.MaterialBindingAPI.Apply(cube_prim)
+            binding.Bind(UsdShade.Material(mat_prim), UsdShade.Tokens.weakerThanDescendants, "physics")
+            if cube_prim.HasAPI(UsdPhysics.MassAPI):
+                UsdPhysics.MassAPI(cube_prim).CreateMassAttr(0.01)
+
+        # ── Setup camera render products + annotators ──
+        import omni.replicator.core as rep
+
+        annotators = {}
+        render_products = []
+        robot_path = robot_prims[0].GetPath().pathString
+        parts = robot_path.split('/')
+        openarm_root = '/'.join(parts[:3]) if len(parts) >= 3 else robot_path
+
+        for cam_name, cam_cfg in cam_configs.items():
+            mount_link = cam_cfg["mount_link"]
+            prim_name = cam_cfg.get("prim_name", "wrist_cam")
+            cam_prim_path = f"{openarm_root}/{mount_link}/{prim_name}"
+
+            # Verify camera prim exists
+            cam_prim = stage.GetPrimAtPath(cam_prim_path)
+            if not cam_prim.IsValid():
+                print(f"[replay_record] WARNING: camera not found at {cam_prim_path}, creating...")
+                from pxr import Gf
+                cam = UsdGeom.Camera.Define(stage, cam_prim_path)
+                xf = UsdGeom.Xformable(cam.GetPrim())
+                t = cam_cfg["translate"]
+                xf.AddTranslateOp().Set(Gf.Vec3d(*t))
+                q = cam_cfg["orient_quat_xyzw"]
+                xf.AddOrientOp().Set(Gf.Quatf(q[3], q[0], q[1], q[2]))  # w,x,y,z
+                cam.GetFocalLengthAttr().Set(cam_cfg.get("focal_length", 24.0))
+                clip = cam_cfg.get("clipping_range", [0.01, 2.0])
+                cam.GetClippingRangeAttr().Set(Gf.Vec2f(*clip))
+
+            rp = rep.create.render_product(cam_prim_path, cam_resolution)
+            render_products.append(rp)
+
+            ann = rep.AnnotatorRegistry.get_annotator("rgb")
+            ann.attach([rp])
+            annotators[cam_name] = ann
+            print(f"[replay_record] attached annotator to {cam_prim_path}")
+
+        # Warm up: step a few frames so annotators initialize
+        for _ in range(3):
+            world.step(render=True)
+
+        # ── Setup writer ──
+        from lerobot_writer import SimLeRobotWriter
+        writer = SimLeRobotWriter(
+            output_dir=output_dataset,
+            repo_id=f"local/{os.path.basename(output_dataset)}",
+            fps=fps,
+            robot_type="openarm",
+            state_dim=state_dim,
+            action_dim=state_dim,
+            camera_names=camera_names,
+            camera_resolution=(cam_resolution[1], cam_resolution[0]),  # (h, w)
+            state_names=joint_names if joint_names else None,
+            action_names=joint_names if joint_names else None,
+        )
+
+        # ── Replay each episode ──
+        from omni.isaac.core.utils.types import ArticulationAction
+        finger_contact = {}
+        global_frame = 0
+
+        for ep_seq, episode_index in enumerate(episodes):
+            if _replay_stop.is_set():
+                print(f"[replay_record] stopped before episode {episode_index}")
+                break
+
+            _state["replay_progress"]["current_episode"] = ep_seq
+            _state["replay_progress"]["status"] = f"recording episode {episode_index}"
+
+            # Load episode data
+            chunk_index = episode_index // chunks_size
+            if "{" in data_path_template:
+                parquet_rel = data_path_template.format(chunk_index=chunk_index, file_index=0)
+            else:
+                parquet_rel = os.path.join(data_path_template, f"chunk-{chunk_index:03d}", "file-000.parquet")
+
+            parquet_path = os.path.join(source_dataset, parquet_rel)
+            df = pd.read_parquet(parquet_path)
+            if "episode_index" in df.columns:
+                df = df[df["episode_index"] == episode_index]
+            if len(df) == 0:
+                print(f"[replay_record] episode {episode_index} empty, skipping")
+                continue
+
+            states = None
+            if "observation.state" in df.columns:
+                states = np.stack(df["observation.state"].values)
+            elif "action" in df.columns:
+                states = np.stack(df["action"].values)
+            if states is None or len(states) == 0:
+                print(f"[replay_record] episode {episode_index} no state data, skipping")
+                continue
+
+            total_frames = len(states)
+            _state["replay_progress"]["total_frames"] = total_frames
+            _state["replay_progress"]["current_frame"] = 0
+
+            # Reset cube position if possible (reload scene state)
+            # For now we rely on the scene being in initial state
+
+            finger_contact.clear()
+
+            for frame_idx in range(total_frames):
+                if _replay_stop.is_set():
+                    break
+
+                state_row = states[frame_idx]
+                targets = robot.get_joint_positions().copy()
+                for src_idx, dst_idx, negate in dof_map:
+                    if src_idx < len(state_row):
+                        val = float(state_row[src_idx])
+                        if negate:
+                            val = -val
+                        targets[dst_idx] = val
+
+                # Contact-aware finger control (same as replay)
+                for fidx in right_finger_idx:
+                    data_tgt = targets[fidx]
+                    if data_tgt < 0.03:
+                        actual = float(robot.get_joint_positions()[fidx])
+                        prev = finger_contact.get(fidx)
+                        if prev is not None:
+                            if actual > prev - 0.0005 and actual > data_tgt + 0.005:
+                                targets[fidx] = max(0.0, actual - 0.002)
+                            else:
+                                targets[fidx] = data_tgt
+                        else:
+                            targets[fidx] = data_tgt
+                        finger_contact[fidx] = actual
+                    else:
+                        finger_contact.pop(fidx, None)
+
+                action = ArticulationAction(joint_positions=np.array(targets))
+                ctrl.apply_action(action)
+                world.step(render=True)
+
+                # ── Capture camera frames ──
+                for cam_name, ann in annotators.items():
+                    rgb_data = ann.get_data()
+                    if rgb_data is not None:
+                        if rgb_data.ndim == 3 and rgb_data.shape[-1] == 4:
+                            rgb_data = rgb_data[..., :3]  # RGBA → RGB
+                        writer.add_video_frame(cam_name, rgb_data)
+
+                # ── Write tabular data ──
+                obs_state = state_row.astype(np.float32)
+                # Action = state of next frame (or same for last frame)
+                if frame_idx + 1 < total_frames:
+                    action_row = states[frame_idx + 1].astype(np.float32)
+                else:
+                    action_row = obs_state.copy()
+
+                writer.add_frame(
+                    episode_index=ep_seq,
+                    frame_index=frame_idx,
+                    observation_state=obs_state,
+                    action=action_row,
+                    timestamp=frame_idx / fps,
+                    next_done=(frame_idx == total_frames - 1),
+                )
+
+                _state["replay_progress"]["current_frame"] = frame_idx + 1
+
+                if frame_idx % fps == 0:
+                    print(f"[replay_record] ep={episode_index} f={frame_idx}/{total_frames}")
+
+            # Finish episode
+            writer.finish_episode(
+                episode_index=ep_seq,
+                length=total_frames,
+                task="pick_and_place",
+                success=True,
+            )
+            print(f"[replay_record] episode {episode_index} done ({total_frames} frames)")
+
+        # ── Finalize dataset ──
+        writer.finalize()
+
+        # Cleanup render products
+        for rp in render_products:
+            rp.destroy()
+
+        final_status = "stopped" if _replay_stop.is_set() else "done"
+        _state["replay_progress"]["status"] = final_status
+        print(f"[replay_record] {final_status}: {len(episodes)} episodes → {output_dataset}")
+
+    except Exception as exc:
+        traceback.print_exc()
+        _state["replay_progress"]["status"] = f"error: {exc}"
+        print(f"[replay_record] ERROR: {exc}")
+    finally:
+        _state["replaying"] = False
+
+
 def _apply_emergency_stop_if_requested():
     """Main-thread side effects for emergency stop (Isaac API calls)."""
     global PHYSICS_RUNNING
@@ -2724,6 +3129,8 @@ try:
         _process_commands()
         if _state["collecting"] and _collect_request is not None:
             _run_pending_collection()
+        elif _state.get("replaying") and _replay_record_request is not None:
+            _run_pending_replay_record()
         elif _state.get("replaying") and _replay_request is not None:
             _run_pending_replay()
         elif world and PHYSICS_RUNNING:
