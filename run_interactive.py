@@ -3347,7 +3347,8 @@ def _run_deferred_inference_init():
                     with open(meta_path) as f:
                         meta = _yaml.safe_load(f)
                     stage = _get_stage()
-                    for cam_name, cam_cfg in meta.get("cameras", {}).items():
+                    cams = meta.get("wrist_cameras") or meta.get("cameras") or {}
+                    for cam_name, cam_cfg in cams.items():
                         if "wrist" not in cam_name.lower():
                             continue
                         mount_link = cam_cfg.get("mount_link", "")
