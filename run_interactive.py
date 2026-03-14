@@ -2195,17 +2195,13 @@ def _process_commands():
 
             elif cmd_type == "inf_obs":
                 # Read joint positions + camera images on main thread
-                dc_iface, art_handle, prim_path = _inf_dc
                 import base64 as _b64
                 import io as _obs_io
                 from PIL import Image as _PILImage
-                dof_states = dc_iface.get_articulation_dof_states(art_handle, 1)
-                n_dof = dc_iface.get_articulation_dof_count(art_handle)
-                positions = [float(s["pos"]) for s in dof_states] if dof_states is not None else []
-                names = []
-                for i in range(n_dof):
-                    dof_h = dc_iface.get_articulation_dof(art_handle, i)
-                    names.append(dc_iface.get_dof_name(dof_h))
+                import numpy as _np
+                positions = _inf_dc.get_joint_positions()
+                pos_list = positions.tolist() if positions is not None else []
+                names = [str(n) for n in _inf_dc.dof_names] if _inf_dc.dof_names is not None else []
                 images = {}
                 for cam_name, (rp, annot) in _inf_cameras.items():
                     try:
@@ -2218,20 +2214,20 @@ def _process_commands():
                     except Exception as e:
                         pass
                 cmd["result"] = {
-                    "positions": positions, "names": names,
+                    "positions": pos_list, "names": names,
                     "timestamp": time.time(), "images": images,
                 }
 
             elif cmd_type == "inf_action":
                 # Set joint position targets on main thread
-                dc_iface, art_handle, prim_path = _inf_dc
-                target = list(cmd["positions"])
-                n_dof = dc_iface.get_articulation_dof_count(art_handle)
+                import numpy as _np
+                target = _np.array(cmd["positions"], dtype=_np.float32)
+                n_dof = _inf_dc.num_dof
                 if len(target) < n_dof:
-                    target.extend([0.0] * (n_dof - len(target)))
+                    target = _np.pad(target, (0, n_dof - len(target)))
                 elif len(target) > n_dof:
                     target = target[:n_dof]
-                dc_iface.set_articulation_dof_position_targets(art_handle, target)
+                _inf_dc.set_joint_positions(target)
                 cmd["result"] = {"success": True}
 
             elif cmd_type == "code_execute":
@@ -3311,11 +3307,11 @@ def _run_deferred_inference_init():
             return  # let main loop step the world
 
         elif _inf_init_phase == 1:
-            # Phase 1: wait for physics to fully register articulation
-            # PhysX needs many frames to discover and register articulations
-            if _inf_init_step_count < 60:
-                return  # keep stepping
-            print("[init_inference] Phase 1: getting articulation via DC interface...")
+            # Phase 1: initialize articulation using Articulation class
+            # (same approach as working collection code)
+            if _inf_init_step_count < 5:
+                return  # let physics step a few frames first
+            print("[init_inference] Phase 1: initializing articulation...")
             art_prim = _find_robot_articulation()
             if art_prim is None:
                 _inf_init_error = "No ArticulationRootAPI found in scene"
@@ -3324,35 +3320,14 @@ def _run_deferred_inference_init():
             _inf_robot_prim = art_prim
             prim_path = art_prim.GetPath().pathString
             print(f"[init_inference] Found ArticulationRoot: {prim_path}")
-            # DC needs the root prim or a link prim, not the joint prim
-            # Try the prim itself, its parent, and common root paths
-            from omni.isaac.dynamic_control import _dynamic_control
-            dc_iface = _dynamic_control.acquire_dynamic_control_interface()
-            candidates = [prim_path]
-            # Add parent path (e.g. /World/Robot/root_joint -> /World/Robot)
-            parent_path = "/".join(prim_path.split("/")[:-1])
-            if parent_path and parent_path != prim_path:
-                candidates.insert(0, parent_path)
-            art_handle = None
-            used_path = None
-            for try_path in candidates:
-                h = dc_iface.get_articulation(try_path)
-                if h and h != 0:
-                    art_handle = h
-                    used_path = try_path
-                    print(f"[init_inference] DC handle found at: {try_path}")
-                    break
-                else:
-                    print(f"[init_inference] DC: no handle at {try_path}")
-            if not art_handle or art_handle == 0:
-                _inf_init_error = f"DC could not get articulation handle (tried: {candidates})"
-                _inf_init_pending = False
-                return
-            prim_path = used_path
-            # Store both DC interface and handle
-            _inf_dc = (dc_iface, art_handle, prim_path)
-            n_dof = dc_iface.get_articulation_dof_count(art_handle)
-            print(f"[init_inference] DC handle acquired: {n_dof} DOF")
+            # Step world once (same pattern as collection code line 2717)
+            world.step(render=True)
+            from omni.isaac.core.articulations import Articulation as _Art
+            art = _Art(prim_path)
+            art.initialize()
+            _inf_dc = art
+            names = [str(n) for n in art.dof_names] if art.dof_names is not None else []
+            print(f"[init_inference] Articulation initialized: {len(names)} DOF")
             _inf_init_phase = 2
             _inf_init_step_count = 0
             return
@@ -3409,14 +3384,9 @@ def _run_deferred_inference_init():
             # Phase 3: warm up render products
             if _inf_init_step_count < 8:
                 return
-            dc_iface, art_handle, prim_path = _inf_dc
-            n_dof = dc_iface.get_articulation_dof_count(art_handle)
-            names = []
-            for i in range(n_dof):
-                dof = dc_iface.get_articulation_dof(art_handle, i)
-                names.append(dc_iface.get_dof_name(dof))
-            dof_states = dc_iface.get_articulation_dof_states(art_handle, 1)
-            pos_list = [float(s["pos"]) for s in dof_states] if dof_states is not None else []
+            names = [str(n) for n in _inf_dc.dof_names] if _inf_dc.dof_names is not None else []
+            positions = _inf_dc.get_joint_positions()
+            pos_list = positions.tolist() if positions is not None else []
             _inf_init_result = {
                 "n_dof": n_dof, "names": names,
                 "positions": pos_list, "cameras": list(_inf_cameras.keys()),
