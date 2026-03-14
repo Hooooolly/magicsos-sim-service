@@ -3388,7 +3388,7 @@ def _run_deferred_inference_init():
             positions = _inf_dc.get_joint_positions()
             pos_list = positions.tolist() if positions is not None else []
             _inf_init_result = {
-                "n_dof": n_dof, "names": names,
+                "n_dof": len(names), "names": names,
                 "positions": pos_list, "cameras": list(_inf_cameras.keys()),
             }
             _inf_init_phase = 4
