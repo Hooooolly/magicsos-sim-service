@@ -1545,6 +1545,35 @@ def scene_info():
     })
 
 
+@bridge.route("/viewport/reset", methods=["POST"])
+def viewport_reset():
+    """Reset viewport camera to default overview angle."""
+    stage = _get_stage()
+    if not stage:
+        return jsonify({"error": "No stage"}), 500
+    cam = stage.GetPrimAtPath("/OmniverseKit_Persp")
+    if not cam.IsValid():
+        return jsonify({"error": "Persp camera not found"}), 404
+    xf = UsdGeom.Xformable(cam)
+    xf.ClearXformOpOrder()
+    eye = Gf.Vec3d(0.7, 0.6, 0.7)
+    target = Gf.Vec3d(0.1, 0.0, 0.3)
+    up = Gf.Vec3d(0, 0, 1)
+    fwd = (target - eye).GetNormalized()
+    right = Gf.Cross(fwd, up).GetNormalized()
+    new_up = Gf.Cross(right, fwd).GetNormalized()
+    rot_mtx = Gf.Matrix4d()
+    rot_mtx.SetRow(0, Gf.Vec4d(right[0], right[1], right[2], 0))
+    rot_mtx.SetRow(1, Gf.Vec4d(new_up[0], new_up[1], new_up[2], 0))
+    rot_mtx.SetRow(2, Gf.Vec4d(-fwd[0], -fwd[1], -fwd[2], 0))
+    rot_mtx.SetRow(3, Gf.Vec4d(eye[0], eye[1], eye[2], 1))
+    xform_op = xf.AddTransformOp()
+    xform_op.Set(rot_mtx)
+    cam_api = UsdGeom.Camera(cam)
+    cam_api.GetFocalLengthAttr().Set(20.0)
+    return jsonify({"success": True, "camera": "reset to default view"})
+
+
 @bridge.route("/scene/snapshot", methods=["GET"])
 def scene_snapshot():
     """Rich scene snapshot for save: objects with position, physics, bbox, lighting, cameras."""
@@ -1658,6 +1687,94 @@ ROBOT_USD_MAP = {
     "openarm": "/data/embodied/asset/robots/openarm_bimanual/configuration/openarm_bimanual_base.usd",
     "openarm_bimanual": "/data/embodied/asset/robots/openarm_bimanual/configuration/openarm_bimanual_base.usd",
 }
+
+# ── Inference routes ──────────────────────────────────────────
+
+_inf_cameras = {}        # {cam_name: (render_product, annotator)}
+_inf_cam_resolution = (640, 480)
+_inf_robot_prim = None   # cached ArticulationRootAPI prim
+_inf_dc = None           # cached dc interface
+_inf_init_pending = False  # deferred init flag
+_inf_init_phase = 0        # 0=idle, 1=play+step, 2=init_art, 3=cameras, 4=done
+_inf_init_result = None    # result dict when done
+_inf_init_error = None     # error string if failed
+_inf_init_step_count = 0   # frame counter for phased init
+
+
+def _find_robot_articulation():
+    """Find first ArticulationRootAPI prim in the scene."""
+    from pxr import UsdPhysics
+    stage = _get_stage()
+    if not stage:
+        return None
+    for prim in stage.Traverse():
+        if prim.HasAPI(UsdPhysics.ArticulationRootAPI):
+            return prim
+    return None
+
+
+@bridge.route("/robot/init_inference", methods=["POST"])
+def robot_init_inference():
+    """Trigger deferred inference init on main thread.
+
+    Sets a flag — main loop picks it up and runs the actual init.
+    Returns immediately. Poll GET /robot/init_inference for status.
+    CRITICAL: No Isaac Sim imports or API calls here (Flask thread).
+    """
+    global _inf_init_pending, _inf_init_phase, _inf_init_result, _inf_init_error, _inf_init_step_count
+    if _inf_dc is not None and not _inf_init_pending:
+        return jsonify({"status": "ready", **(_inf_init_result or {})})
+    if _inf_init_pending and _inf_init_phase < 4:
+        return jsonify({"status": "initializing", "phase": _inf_init_phase})
+    if _inf_init_error:
+        return jsonify({"status": "error", "error": _inf_init_error}), 500
+    _inf_init_pending = True
+    _inf_init_phase = 0
+    _inf_init_result = None
+    _inf_init_error = None
+    _inf_init_step_count = 0
+    return jsonify({"status": "started"})
+
+
+@bridge.route("/robot/init_inference", methods=["GET"])
+def robot_init_inference_status():
+    """Poll init status. No Isaac Sim calls here (Flask thread)."""
+    if _inf_init_error:
+        return jsonify({"status": "error", "error": _inf_init_error}), 500
+    if _inf_dc is not None and _inf_init_result:
+        return jsonify({"status": "ready", **_inf_init_result})
+    if _inf_init_pending:
+        return jsonify({"status": "initializing", "phase": _inf_init_phase})
+    return jsonify({"status": "not_initialized"})
+
+
+@bridge.route("/robot/obs", methods=["GET"])
+def robot_obs():
+    """Get robot joint positions + camera images for inference.
+
+    Delegates to main thread via _enqueue_cmd to avoid GIL/PhysX deadlock.
+    """
+    if _inf_dc is None:
+        return jsonify({"error": "Robot not initialized. Call /robot/init_inference first."}), 400
+    return _enqueue_cmd("inf_obs")
+
+
+@bridge.route("/robot/action", methods=["POST"])
+def robot_action():
+    """Send joint position targets to robot.
+
+    Delegates to main thread via _enqueue_cmd to avoid GIL/PhysX deadlock.
+    """
+    if _inf_dc is None:
+        return jsonify({"error": "Robot not initialized"}), 400
+
+    data = flask_request.get_json(silent=True) or {}
+    positions = data.get("positions")
+    if positions is None:
+        return jsonify({"error": "positions required"}), 400
+
+    return _enqueue_cmd("inf_action", positions=positions)
+
 
 @bridge.route("/robot/spawn", methods=["POST"])
 def robot_spawn():
@@ -2075,6 +2192,47 @@ def _process_commands():
                     print(f"[interactive] Spawned {cmd['robot_type']} at {cmd['prim_path']}")
                     cmd["result"] = {"success": True, "prim_path": cmd["prim_path"],
                                      "robot_type": cmd["robot_type"]}
+
+            elif cmd_type == "inf_obs":
+                # Read joint positions + camera images on main thread
+                dc_iface, art_handle, prim_path = _inf_dc
+                import base64 as _b64
+                import io as _obs_io
+                from PIL import Image as _PILImage
+                dof_states = dc_iface.get_articulation_dof_states(art_handle, 1)
+                n_dof = dc_iface.get_articulation_dof_count(art_handle)
+                positions = [float(s["pos"]) for s in dof_states] if dof_states is not None else []
+                names = []
+                for i in range(n_dof):
+                    dof_h = dc_iface.get_articulation_dof(art_handle, i)
+                    names.append(dc_iface.get_dof_name(dof_h))
+                images = {}
+                for cam_name, (rp, annot) in _inf_cameras.items():
+                    try:
+                        rgba = annot.get_data()
+                        if rgba is not None and hasattr(rgba, "shape") and len(rgba.shape) >= 2 and rgba.size > 0:
+                            img = _PILImage.fromarray(rgba[:, :, :3])
+                            buf = _obs_io.BytesIO()
+                            img.save(buf, format="JPEG", quality=80)
+                            images[cam_name] = _b64.b64encode(buf.getvalue()).decode()
+                    except Exception as e:
+                        pass
+                cmd["result"] = {
+                    "positions": positions, "names": names,
+                    "timestamp": time.time(), "images": images,
+                }
+
+            elif cmd_type == "inf_action":
+                # Set joint position targets on main thread
+                dc_iface, art_handle, prim_path = _inf_dc
+                target = list(cmd["positions"])
+                n_dof = dc_iface.get_articulation_dof_count(art_handle)
+                if len(target) < n_dof:
+                    target.extend([0.0] * (n_dof - len(target)))
+                elif len(target) > n_dof:
+                    target = target[:n_dof]
+                dc_iface.set_articulation_dof_position_targets(art_handle, target)
+                cmd["result"] = {"success": True}
 
             elif cmd_type == "code_execute":
                 import io as _io
@@ -3121,12 +3279,167 @@ def _apply_emergency_stop_if_requested():
     print(f"[estop] Applied emergency stop (reason={_state.get('last_estop_reason')})")
 
 
+def _run_deferred_inference_init():
+    """Phased inference init — runs one phase per main-loop frame to avoid blocking.
+
+    Phases:
+      0 → start physics if needed, step a few frames
+      1 → find articulation + initialize
+      2 → setup cameras
+      3 → warm up render products
+      4 → done
+    """
+    global _inf_init_phase, _inf_init_pending, _inf_init_result, _inf_init_error
+    global _inf_init_step_count, _inf_robot_prim, _inf_dc, _inf_cameras
+    global PHYSICS_RUNNING
+
+    _inf_init_step_count += 1
+
+    try:
+        if _inf_init_phase == 0:
+            # Phase 0: ensure physics is playing
+            print("[init_inference] Phase 0: starting physics...")
+            if not PHYSICS_RUNNING:
+                stage = _get_stage()
+                if stage:
+                    _sanitize_franka_root_rigidbody(stage)
+                world.play()
+                PHYSICS_RUNNING = True
+                _state["physics"] = True
+            _inf_init_phase = 1
+            _inf_init_step_count = 0
+            return  # let main loop step the world
+
+        elif _inf_init_phase == 1:
+            # Phase 1: wait a few frames for physics to settle, then get DC handle
+            if _inf_init_step_count < 10:
+                return  # keep stepping
+            print("[init_inference] Phase 1: getting articulation via DC interface...")
+            art_prim = _find_robot_articulation()
+            if art_prim is None:
+                _inf_init_error = "No ArticulationRootAPI found in scene"
+                _inf_init_pending = False
+                return
+            _inf_robot_prim = art_prim
+            prim_path = art_prim.GetPath().pathString
+            print(f"[init_inference] Found ArticulationRoot: {prim_path}")
+            # DC needs the root prim or a link prim, not the joint prim
+            # Try the prim itself, its parent, and common root paths
+            from omni.isaac.dynamic_control import _dynamic_control
+            dc_iface = _dynamic_control.acquire_dynamic_control_interface()
+            candidates = [prim_path]
+            # Add parent path (e.g. /World/Robot/root_joint -> /World/Robot)
+            parent_path = "/".join(prim_path.split("/")[:-1])
+            if parent_path and parent_path != prim_path:
+                candidates.insert(0, parent_path)
+            art_handle = None
+            used_path = None
+            for try_path in candidates:
+                h = dc_iface.get_articulation(try_path)
+                if h and h != 0:
+                    art_handle = h
+                    used_path = try_path
+                    print(f"[init_inference] DC handle found at: {try_path}")
+                    break
+                else:
+                    print(f"[init_inference] DC: no handle at {try_path}")
+            if not art_handle or art_handle == 0:
+                _inf_init_error = f"DC could not get articulation handle (tried: {candidates})"
+                _inf_init_pending = False
+                return
+            prim_path = used_path
+            # Store both DC interface and handle
+            _inf_dc = (dc_iface, art_handle, prim_path)
+            n_dof = dc_iface.get_articulation_dof_count(art_handle)
+            print(f"[init_inference] DC handle acquired: {n_dof} DOF")
+            _inf_init_phase = 2
+            _inf_init_step_count = 0
+            return
+
+        elif _inf_init_phase == 2:
+            # Phase 2: wait a few frames, then setup cameras
+            if _inf_init_step_count < 5:
+                return
+            print("[init_inference] Phase 2: setting up cameras...")
+            _inf_cameras.clear()
+            camera_names = []
+            try:
+                import omni.replicator.core as rep
+                import yaml as _yaml
+                meta_path = "/data/embodied/asset/robots/openarm_bimanual/camera_meta.yaml"
+                if os.path.exists(meta_path):
+                    with open(meta_path) as f:
+                        meta = _yaml.safe_load(f)
+                    stage = _get_stage()
+                    for cam_name, cam_cfg in meta.get("cameras", {}).items():
+                        if "wrist" not in cam_name.lower():
+                            continue
+                        mount_link = cam_cfg.get("mount_link", "")
+                        mount_prim = None
+                        for p in stage.Traverse():
+                            if p.GetName() == mount_link:
+                                mount_prim = p
+                                break
+                        if mount_prim is None:
+                            print(f"[init_inference] Camera {cam_name}: mount_link '{mount_link}' not found")
+                            continue
+                        cam_path = mount_prim.GetPath().pathString + f"/{cam_name}"
+                        if not stage.GetPrimAtPath(cam_path).IsValid():
+                            cam_p = UsdGeom.Camera.Define(stage, cam_path)
+                            translate = cam_cfg.get("translate", [0, 0, 0])
+                            xf = UsdGeom.Xformable(cam_p.GetPrim())
+                            xf.ClearXformOpOrder()
+                            t_op = xf.AddTranslateOp()
+                            t_op.Set(Gf.Vec3d(*translate))
+                            cam_p.GetFocalLengthAttr().Set(cam_cfg.get("focal_length", 24.0))
+                        rp = rep.create.render_product(cam_path, _inf_cam_resolution)
+                        annot = rep.AnnotatorRegistry.get_annotator("rgb")
+                        annot.attach([rp])
+                        _inf_cameras[cam_name] = (rp, annot)
+                        camera_names.append(cam_name)
+                        print(f"[init_inference] Camera: {cam_name} at {cam_path}")
+            except Exception as e:
+                logger.warning(f"Camera setup: {e}")
+            _inf_init_phase = 3
+            _inf_init_step_count = 0
+            return
+
+        elif _inf_init_phase == 3:
+            # Phase 3: warm up render products
+            if _inf_init_step_count < 8:
+                return
+            dc_iface, art_handle, prim_path = _inf_dc
+            n_dof = dc_iface.get_articulation_dof_count(art_handle)
+            names = []
+            for i in range(n_dof):
+                dof = dc_iface.get_articulation_dof(art_handle, i)
+                names.append(dc_iface.get_dof_name(dof))
+            dof_states = dc_iface.get_articulation_dof_states(art_handle, 1)
+            pos_list = [float(s["pos"]) for s in dof_states] if dof_states is not None else []
+            _inf_init_result = {
+                "n_dof": n_dof, "names": names,
+                "positions": pos_list, "cameras": list(_inf_cameras.keys()),
+            }
+            _inf_init_phase = 4
+            _inf_init_pending = False
+            print(f"[init_inference] Complete: {len(names)} DOF, cameras={list(_inf_cameras.keys())}")
+
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        _inf_init_error = str(e)
+        _inf_init_pending = False
+        print(f"[init_inference] ERROR: {e}")
+
+
 # ── Main render loop ─────────────────────────────────────────
 step = 0
 try:
     while simulation_app.is_running():
         _apply_emergency_stop_if_requested()
         _process_commands()
+        if _inf_init_pending and _inf_init_phase < 4 and _inf_init_error is None:
+            _run_deferred_inference_init()
         if _state["collecting"] and _collect_request is not None:
             _run_pending_collection()
         elif _state.get("replaying") and _replay_record_request is not None:
