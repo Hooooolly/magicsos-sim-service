@@ -3311,8 +3311,9 @@ def _run_deferred_inference_init():
             return  # let main loop step the world
 
         elif _inf_init_phase == 1:
-            # Phase 1: wait a few frames for physics to settle, then get DC handle
-            if _inf_init_step_count < 10:
+            # Phase 1: wait for physics to fully register articulation
+            # PhysX needs many frames to discover and register articulations
+            if _inf_init_step_count < 60:
                 return  # keep stepping
             print("[init_inference] Phase 1: getting articulation via DC interface...")
             art_prim = _find_robot_articulation()
