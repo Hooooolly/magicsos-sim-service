@@ -169,6 +169,8 @@ AUTOSAVE_DIR = os.path.join("/data", "sim_sessions", SIM_SESSION_NAME)
 AUTOSAVE_STAGE_PATH = os.path.join(AUTOSAVE_DIR, "last_stage.usda")
 AUTOSAVE_META_PATH = os.path.join(AUTOSAVE_DIR, "last_stage_meta.json")
 EMBODIED_DATASETS_ROOT = os.environ.get("EMBODIED_DATASETS_ROOT", "/data/embodied/dataset/sim")
+ROBOT_ASSET_ROOT = Path(os.environ.get("SIM_ROBOT_ASSET_ROOT", "/data/embodied/asset/robots"))
+DEFAULT_ROBOT_TYPE = os.environ.get("SIM_DEFAULT_ROBOT_TYPE", "openarm_bimanual").strip() or "openarm_bimanual"
 LEGACY_COLLECT_OUTPUT_DIRS = {
     "/data/collections/latest",
     "/data/embodied/datasets/sim_collect_latest",
@@ -368,6 +370,7 @@ _state = {
     "physics": False,
     "scene": None,
     "robots": {},
+    "active_robot_type": os.environ.get("SIM_ROBOT_TYPE", "").strip() or DEFAULT_ROBOT_TYPE,
     "step": 0,
     "collecting": False,
     "collect_progress": None,
@@ -448,6 +451,78 @@ bridge.config["JSONIFY_PRETTYPRINT_REGULAR"] = False
 def _get_stage():
     ctx = omni.usd.get_context()
     return ctx.get_stage() if ctx else None
+
+
+def _get_active_robot_type(preferred: str = "") -> str:
+    if preferred:
+        return str(preferred).strip()
+
+    active = str(_state.get("active_robot_type", "") or "").strip()
+    if active:
+        return active
+
+    robots = _state.get("robots") or {}
+    for robot in robots.values():
+        if isinstance(robot, dict):
+            robot_type = str(robot.get("type", "") or "").strip()
+            if robot_type:
+                return robot_type
+
+    return DEFAULT_ROBOT_TYPE
+
+
+def _robot_asset_candidates(filename: str, robot_type: str = "", explicit_path: str = "", sibling_of: str = "") -> list[str]:
+    filename = str(filename or "").strip()
+    if not filename:
+        return []
+
+    resolved_robot_type = _get_active_robot_type(robot_type)
+    candidates: list[str] = []
+
+    explicit = str(explicit_path or "").strip()
+    if explicit:
+        candidates.append(str(Path(explicit).expanduser()))
+
+    sibling = str(sibling_of or "").strip()
+    if sibling:
+        sibling_path = Path(sibling).expanduser()
+        if sibling_path.name == filename:
+            candidates.append(str(sibling_path))
+        else:
+            candidates.append(str(sibling_path.parent / filename))
+
+    if resolved_robot_type:
+        candidates.append(str(ROBOT_ASSET_ROOT / resolved_robot_type / filename))
+
+    if resolved_robot_type == DEFAULT_ROBOT_TYPE:
+        candidates.append(str(Path(__file__).resolve().parent / filename))
+
+    return _unique_preserve_order(candidates)
+
+
+def _load_robot_asset_yaml(filename: str, robot_type: str = "", explicit_path: str = "", sibling_of: str = ""):
+    import yaml as _yaml
+
+    candidates = _robot_asset_candidates(
+        filename=filename,
+        robot_type=robot_type,
+        explicit_path=explicit_path,
+        sibling_of=sibling_of,
+    )
+    load_errors = []
+    for candidate in candidates:
+        if not candidate or not os.path.exists(candidate):
+            continue
+        try:
+            with open(candidate, encoding="utf-8") as f:
+                return candidate, (_yaml.safe_load(f) or {}), candidates
+        except Exception as exc:
+            load_errors.append(f"{candidate}: {exc}")
+
+    if load_errors:
+        raise RuntimeError("; ".join(load_errors))
+
+    return None, None, candidates
 
 
 def _contains_unsafe_franka_physics_code(code: str) -> bool:
@@ -1789,6 +1864,41 @@ def robot_action():
     return _enqueue_cmd("inf_action", positions=positions)
 
 
+@bridge.route("/robot/config", methods=["GET"])
+def robot_config():
+    robot_type = _get_active_robot_type(flask_request.args.get("robot_type", ""))
+    explicit_path = flask_request.args.get("robot_config", "") or flask_request.args.get("path", "")
+    camera_meta_path = flask_request.args.get("camera_meta", "")
+    try:
+        config_path, config, candidates = _load_robot_asset_yaml(
+            "robot_config.yaml",
+            robot_type=robot_type,
+            explicit_path=explicit_path,
+            sibling_of=camera_meta_path,
+        )
+    except Exception as exc:
+        return jsonify({
+            "error": f"Failed to load robot_config.yaml: {exc}",
+            "robot_type": robot_type,
+        }), 500
+
+    if config_path is None:
+        return jsonify({
+            "error": "robot_config.yaml not found",
+            "robot_type": robot_type,
+            "candidates": candidates,
+        }), 404
+
+    if not isinstance(config, dict):
+        return jsonify({
+            "error": "robot_config.yaml must parse to an object",
+            "robot_type": robot_type,
+            "path": config_path,
+        }), 500
+
+    return jsonify(config)
+
+
 @bridge.route("/robot/spawn", methods=["POST"])
 def robot_spawn():
     data = flask_request.get_json(silent=True) or {}
@@ -2205,6 +2315,7 @@ def _process_commands():
                         "position": cmd["position"],
                         "usd": cmd["usd_path"],
                     }
+                    _state["active_robot_type"] = cmd["robot_type"]
                     _save_autosave_stage("robot_spawn")
                     print(f"[interactive] Spawned {cmd['robot_type']} at {cmd['prim_path']}")
                     cmd["result"] = {"success": True, "prim_path": cmd["prim_path"],

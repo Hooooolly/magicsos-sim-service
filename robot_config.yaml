@@ -1,0 +1,9 @@
+robot_type: openarm_bimanual
+dof_count: 18
+active_arm: right
+active_arm_indices: [1, 3, 5, 7, 9, 11, 13]
+active_finger_indices: [16, 17]
+data_to_sim: [0, 5, 1, 2, 3, 4, 6]
+negate_joints: [6]
+homing_pose: [0, -0.4292, 0, 0.2138, 0, -0.2208, 0, 0.9299, 0, 0.2602, 0, -0.2055, 0, 1.0057, 0, 0, 0.04, 0.04]
+action_dim: 8
