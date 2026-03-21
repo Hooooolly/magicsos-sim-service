@@ -1,0 +1,21 @@
+# Franka Panda Camera Configuration
+# cam_high: fixed overhead camera (used in training data)
+# cam_wrist: end-effector mounted camera
+
+wrist_cameras:
+  cam_high:
+    mount_link: world
+    prim_name: cam_high
+    translate: [0.5, 0.0, 1.2]
+    orient_euler_xyz_deg: [180, -60, 0]
+    resolution: [512, 512]
+    focal_length: 24.0
+    clipping_range: [0.01, 5.0]
+  cam_wrist:
+    mount_link: panda_hand
+    prim_name: cam_wrist
+    translate: [0.04, 0.0, 0.06]
+    orient_euler_xyz_deg: [180, 15, -90]
+    resolution: [512, 512]
+    focal_length: 24.0
+    clipping_range: [0.01, 2.0]

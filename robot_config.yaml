@@ -1,9 +1,25 @@
+# OpenArm Bimanual Robot Config
+# Used by: bridge /robot/config endpoint, MonitorPanel, replay, inference
+
 robot_type: openarm_bimanual
 dof_count: 18
 active_arm: right
-active_arm_indices: [1, 3, 5, 7, 9, 11, 13]
-active_finger_indices: [16, 17]
-data_to_sim: [0, 5, 1, 2, 3, 4, 6]
-negate_joints: [6]
+active_arm_indices: [1, 3, 5, 7, 9, 11, 13]    # right arm DOF indices in 18-DOF articulation
+active_finger_indices: [16, 17]                   # right finger DOF indices
+data_to_sim: [0, 5, 1, 2, 3, 4, 6]              # dataset joint idx → sim joint idx mapping
+negate_joints: [6]                                # sim joint indices to negate (wrist rotation)
+action_dim: 8                                     # dataset action dimension (7 joints + 1 finger)
+
+# Homing pose (18-DOF): right arm at table-facing ready position, left arm at rest
 homing_pose: [0, -0.4292, 0, 0.2138, 0, -0.2208, 0, 0.9299, 0, 0.2602, 0, -0.2055, 0, 1.0057, 0, 0, 0.04, 0.04]
-action_dim: 8
+
+# Cameras for monitoring (same as camera_meta.yaml wrist_cameras section)
+cameras:
+  left_wrist_cam:
+    mount_link: openarm_left_link7
+    prim_name: wrist_cam
+    resolution: [640, 480]
+  right_wrist_cam:
+    mount_link: openarm_right_link7
+    prim_name: wrist_cam
+    resolution: [640, 480]
