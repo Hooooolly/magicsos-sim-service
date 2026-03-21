@@ -2157,7 +2157,8 @@ def _process_commands():
                             _inf_init_error = None
                             _inf_init_pending = False
                             _inf_init_phase = 0
-                            _inf_cameras = {}
+                            _inf_init_step_count = 0
+                            _inf_cameras.clear()
                             _save_autosave_stage("scene_load")
                             print(f"[interactive] Scene loaded: {usd_path} (inference state cleared)")
                             cmd["result"] = {"success": True, "scene": usd_path}
@@ -3390,8 +3391,8 @@ def _run_deferred_inference_init():
             return
 
         elif _inf_init_phase == 3:
-            # Phase 3: warm up render products
-            if _inf_init_step_count < 8:
+            # Phase 3: warm up render products (need enough frames for replicator to initialize)
+            if _inf_init_step_count < 30:
                 return
             names = [str(n) for n in _inf_dc.dof_names] if _inf_dc.dof_names is not None else []
             positions = _inf_dc.get_joint_positions()
