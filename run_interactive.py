@@ -1993,6 +1993,7 @@ def replay_start():
     episode_index = data.get("episode_index", 0)
     speed = data.get("speed", 1.0)
     scene_usd_path = data.get("scene_usd_path", "")
+    camera_meta_path = data.get("camera_meta", "")
 
     if not dataset_path:
         return jsonify({"error": "dataset_path is required"}), 400
@@ -2009,6 +2010,7 @@ def replay_start():
         episode_index=episode_index,
         speed=speed,
         scene_usd_path=scene_usd_path,
+        camera_meta=camera_meta_path,
     )
 
 
@@ -2451,6 +2453,7 @@ def _process_commands():
                     episode_index = int(cmd.get("episode_index", 0))
                     speed = float(cmd.get("speed", 1.0))
                     scene_usd_path = cmd.get("scene_usd_path", "")
+                    camera_meta_path = str(cmd.get("camera_meta", "") or "").strip()
 
                     _replay_stop.clear()
                     _state["replaying"] = True
@@ -2467,6 +2470,7 @@ def _process_commands():
                         "episode_index": episode_index,
                         "speed": speed,
                         "scene_usd_path": scene_usd_path,
+                        "camera_meta": camera_meta_path,
                     }
                     cmd["result"] = {
                         "status": "started",
@@ -2658,14 +2662,20 @@ def _run_pending_replay():
     episode_index = int(req.get("episode_index", 0))
     speed = float(req.get("speed", 1.0))
     scene_usd_path = req.get("scene_usd_path", "")
+    camera_meta_path = str(req.get("camera_meta", "") or "").strip()
+    replay_cameras = {}  # {cam_name: (render_product, annotator)}
 
     # Invalidate monitor's cached articulation — scene reload makes it stale
     _inf_dc = None
     _inf_init_result = None
 
     try:
+        import base64 as _b64
+        import io as _obs_io
         import pandas as pd
         import numpy as np
+        import yaml as pyyaml
+        from PIL import Image as _PILImage
 
         # Reload scene to reset object positions (cube, bowl, etc.)
         if scene_usd_path and os.path.exists(scene_usd_path):
@@ -2741,7 +2751,6 @@ def _run_pending_replay():
         _state["replay_progress"]["status"] = "playing"
 
         # Find robot articulation
-        from omni.isaac.core.utils.stage import get_stage_units
         stage = _get_stage()
         if stage is None:
             raise RuntimeError("No USD stage")
@@ -2785,7 +2794,6 @@ def _run_pending_replay():
         right_finger_idx = [i for i, n in enumerate(dof_names) if 'right' in n and 'finger' in n]
 
         # Split mapping: arm (PD) vs finger (kinematic)
-        import numpy as np
         dof_map_arm = []
         dof_map_finger = []
         for sim_j, data_j in enumerate(data_to_sim):
@@ -2807,8 +2815,17 @@ def _run_pending_replay():
             stiffness[fidx] = 100000.0   # firm but not aggressive
             damping[fidx] = 10000.0      # enough to prevent bounce
         ctrl.set_gains(stiffness, damping)
-        print(f"[replay] PD gains: arm stiff={stiffness[right_arm_idx[0]]:.0f} damp={damping[right_arm_idx[0]]:.0f}, "
-              f"finger stiff={stiffness[right_finger_idx[0]]:.0f} damp={damping[right_finger_idx[0]]:.0f}")
+        arm_gain_dbg = (
+            f"stiff={stiffness[right_arm_idx[0]]:.0f} damp={damping[right_arm_idx[0]]:.0f}"
+            if right_arm_idx
+            else "n/a"
+        )
+        finger_gain_dbg = (
+            f"stiff={stiffness[right_finger_idx[0]]:.0f} damp={damping[right_finger_idx[0]]:.0f}"
+            if right_finger_idx
+            else "n/a"
+        )
+        print(f"[replay] PD gains: arm {arm_gain_dbg}, finger {finger_gain_dbg}")
 
         if not dof_map:
             print(f"[replay] WARNING: no DOF mapping found. joint_names={joint_names}, dof_names={dof_names}")
@@ -2897,17 +2914,135 @@ def _run_pending_replay():
                 has_col = p.HasAPI(UsdPhysics.CollisionAPI)
                 print(f"  {p.GetPath()} col={has_col} type={p.GetTypeName()}")
 
+        # Setup wrist camera render products + annotators for replay MonitorPanel stream.
+        camera_meta = {}
+        camera_meta_candidates = []
+        if camera_meta_path:
+            camera_meta_candidates.append(camera_meta_path)
+        camera_meta_candidates.extend(
+            [
+                "/Users/holly/Documents/code/sim/sim-service/camera_meta.yaml",
+                os.path.join(os.path.dirname(__file__), "camera_meta.yaml"),
+                "/data/embodied/asset/robots/openarm_bimanual/camera_meta.yaml",
+            ]
+        )
+        camera_meta_used = None
+        for candidate in camera_meta_candidates:
+            if not candidate or not os.path.exists(candidate):
+                continue
+            try:
+                with open(candidate) as f:
+                    camera_meta = pyyaml.safe_load(f) or {}
+                camera_meta_used = candidate
+                break
+            except Exception as meta_exc:
+                print(f"[replay] WARNING: failed to load camera meta {candidate}: {meta_exc}")
+
+        if camera_meta_used:
+            print(f"[replay] camera_meta: {camera_meta_used}")
+        else:
+            print("[replay] WARNING: camera_meta.yaml not found, replay images disabled")
+
+        cam_configs = {}
+        if isinstance(camera_meta, dict):
+            cam_configs = camera_meta.get("wrist_cameras") or camera_meta.get("cameras") or {}
+
+        if cam_configs:
+            import omni.replicator.core as rep
+
+            for cam_name, cam_cfg in cam_configs.items():
+                if not isinstance(cam_cfg, dict):
+                    continue
+                if "wrist" not in str(cam_name).lower():
+                    continue
+
+                mount_link = str(cam_cfg.get("mount_link", "") or "").strip()
+                prim_name = str(cam_cfg.get("prim_name", "wrist_cam") or "wrist_cam").strip()
+                cam_resolution_raw = cam_cfg.get("resolution", [640, 480])
+                try:
+                    cam_resolution = (
+                        int(cam_resolution_raw[0]),
+                        int(cam_resolution_raw[1]),
+                    )
+                except Exception:
+                    cam_resolution = (640, 480)
+
+                mount_prim = None
+                if mount_link:
+                    if mount_link.startswith("/"):
+                        p = stage.GetPrimAtPath(mount_link)
+                        if p.IsValid():
+                            mount_prim = p
+                    if mount_prim is None:
+                        for p in stage.Traverse():
+                            p_path = p.GetPath().pathString
+                            if p.GetName() == mount_link or p_path.endswith("/" + mount_link):
+                                mount_prim = p
+                                break
+
+                cam_prim_path = None
+                if mount_prim is not None:
+                    existing_cam = mount_prim.GetPath().pathString + f"/{prim_name}"
+                    fallback_cam = mount_prim.GetPath().pathString + f"/{cam_name}"
+                    if stage.GetPrimAtPath(existing_cam).IsValid():
+                        cam_prim_path = existing_cam
+                    elif stage.GetPrimAtPath(fallback_cam).IsValid():
+                        cam_prim_path = fallback_cam
+
+                if cam_prim_path is None:
+                    for key in ("camera_prim", "camera_path", "prim_path", "path"):
+                        candidate = str(cam_cfg.get(key, "") or "").strip()
+                        if candidate and stage.GetPrimAtPath(candidate).IsValid():
+                            cam_prim_path = candidate
+                            break
+
+                if cam_prim_path is None:
+                    print(f"[replay] WARNING: wrist camera '{cam_name}' prim not found (mount_link={mount_link})")
+                    continue
+
+                try:
+                    rp = rep.create.render_product(cam_prim_path, cam_resolution)
+                    annot = rep.AnnotatorRegistry.get_annotator("rgb")
+                    annot.attach([rp])
+                    replay_cameras[cam_name] = (rp, annot)
+                    print(f"[replay] camera attached: {cam_name} -> {cam_prim_path} @ {cam_resolution}")
+                except Exception as cam_exc:
+                    print(f"[replay] WARNING: camera setup failed for {cam_name}: {cam_exc}")
+
+            if replay_cameras:
+                # Warm-up frames so annotators start returning valid data.
+                for _ in range(3):
+                    if world and PHYSICS_RUNNING:
+                        world.step(render=True)
+                    else:
+                        simulation_app.update()
+        else:
+            print("[replay] WARNING: no wrist camera configs found in camera_meta")
+
         # Replay loop — all PD control with high finger gains for physical grip
         from omni.isaac.core.utils.types import ArticulationAction
         frame_interval = 1.0 / (fps * speed) if fps > 0 and speed > 0 else 1.0 / 30.0
         log_every = max(1, int(fps))  # log every 1 second
+        finger_contact = {}
+
+        # Seed from an observed post-step state to avoid reading articulation before stepping.
+        if world and PHYSICS_RUNNING:
+            world.step(render=True)
+        else:
+            simulation_app.update()
+        last_actual_positions = robot.get_joint_positions()
+        if last_actual_positions is None:
+            last_actual_positions = np.zeros(len(dof_names), dtype=np.float32)
+        else:
+            last_actual_positions = np.array(last_actual_positions, dtype=np.float32, copy=True)
+
         for frame_idx in range(total_frames):
             if _replay_stop.is_set():
                 print(f"[replay] stopped at frame {frame_idx}/{total_frames}")
                 break
 
             state_row = states[frame_idx]
-            targets = robot.get_joint_positions().copy()
+            targets = np.array(last_actual_positions, dtype=np.float32, copy=True)
             for src_idx, dst_idx, negate in dof_map:
                 if src_idx < len(state_row):
                     val = float(state_row[src_idx])
@@ -2921,10 +3056,8 @@ def _run_pending_replay():
             for fidx in right_finger_idx:
                 data_tgt = targets[fidx]
                 if data_tgt < 0.03:  # dataset says grip
-                    actual = float(robot.get_joint_positions()[fidx])
-                    if not hasattr(_run_pending_replay, '_finger_contact'):
-                        _run_pending_replay._finger_contact = {}
-                    prev = _run_pending_replay._finger_contact.get(fidx)
+                    actual = float(last_actual_positions[fidx])
+                    prev = finger_contact.get(fidx)
                     if prev is not None:
                         # Contact detection: actual stopped decreasing despite target decreasing
                         if actual > prev - 0.0005 and actual > data_tgt + 0.005:
@@ -2934,11 +3067,10 @@ def _run_pending_replay():
                             targets[fidx] = data_tgt  # still closing freely
                     else:
                         targets[fidx] = data_tgt  # first frame of closing
-                    _run_pending_replay._finger_contact[fidx] = actual
+                    finger_contact[fidx] = actual
                 else:
                     # Open — clear contact state
-                    if hasattr(_run_pending_replay, '_finger_contact'):
-                        _run_pending_replay._finger_contact.pop(fidx, None)
+                    finger_contact.pop(fidx, None)
 
             action = ArticulationAction(joint_positions=np.array(targets))
             ctrl.apply_action(action)
@@ -2951,13 +3083,40 @@ def _run_pending_replay():
 
             _state["replay_progress"]["current_frame"] = frame_idx + 1
 
-            # Update replay_obs for MonitorPanel (reads from Flask thread)
+            # Read updated articulation state and camera frames after stepping.
             try:
-                _replay_pos = robot.get_joint_positions()
+                actual_pos = robot.get_joint_positions()
+                if actual_pos is not None:
+                    last_actual_positions = np.array(actual_pos, dtype=np.float32, copy=True)
+            except Exception:
+                pass
+
+            images = {}
+            for cam_name, (_rp, annot) in replay_cameras.items():
+                try:
+                    rgba = annot.get_data()
+                    if rgba is None:
+                        continue
+                    rgba = np.asarray(rgba)
+                    if rgba.ndim != 3 or rgba.shape[-1] < 3 or rgba.size == 0:
+                        continue
+                    rgb = rgba[:, :, :3]
+                    if rgb.dtype != np.uint8:
+                        rgb = np.clip(rgb, 0, 255).astype(np.uint8)
+                    img = _PILImage.fromarray(rgb)
+                    buf = _obs_io.BytesIO()
+                    img.save(buf, format="JPEG", quality=80)
+                    images[cam_name] = _b64.b64encode(buf.getvalue()).decode("ascii")
+                except Exception as img_exc:
+                    print(f"[replay] WARNING: image capture failed for {cam_name}: {img_exc}")
+
+            # Update replay_obs for MonitorPanel (reads from Flask thread).
+            try:
                 _state["replay_obs"] = {
-                    "positions": _replay_pos.tolist() if _replay_pos is not None else [],
+                    "positions": last_actual_positions.tolist() if last_actual_positions is not None else [],
                     "names": dof_names,
-                    "images": {},
+                    "images": images,
+                    "timestamp": time.time(),
                 }
             except Exception:
                 pass
@@ -2969,8 +3128,7 @@ def _run_pending_replay():
             if should_log:
                 parts = []
                 finger_val = float(state_row[7]) if states.shape[1] > 7 else -1
-                actual_pos = robot.get_joint_positions()
-                actual_finger = float(actual_pos[right_finger_idx[0]]) if right_finger_idx else -1
+                actual_finger = float(last_actual_positions[right_finger_idx[0]]) if right_finger_idx else -1
                 if cube_prim:
                     xf = UsdGeom.Xformable(cube_prim)
                     mat = xf.ComputeLocalToWorldTransform(0)
@@ -2996,6 +3154,17 @@ def _run_pending_replay():
         _state["replay_progress"]["status"] = f"error: {exc}"
         print(f"[replay] ERROR: {exc}")
     finally:
+        for cam_name, (rp, annot) in replay_cameras.items():
+            try:
+                annot.detach([rp])
+            except Exception:
+                pass
+            try:
+                rp.destroy()
+            except Exception:
+                pass
+        if replay_cameras:
+            print(f"[replay] cleaned up {len(replay_cameras)} replay camera render products")
         _state["replaying"] = False
         _state.pop("replay_obs", None)
         # Clear monitor's cached articulation so MonitorPanel re-inits cleanly
