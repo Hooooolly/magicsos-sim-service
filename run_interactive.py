@@ -1987,6 +1987,7 @@ def replay_start():
     dataset_path = data.get("dataset_path", "")
     episode_index = data.get("episode_index", 0)
     speed = data.get("speed", 1.0)
+    scene_usd_path = data.get("scene_usd_path", "")
 
     if not dataset_path:
         return jsonify({"error": "dataset_path is required"}), 400
@@ -2002,6 +2003,7 @@ def replay_start():
         dataset_path=dataset_path,
         episode_index=episode_index,
         speed=speed,
+        scene_usd_path=scene_usd_path,
     )
 
 
@@ -2443,6 +2445,7 @@ def _process_commands():
                     dataset_path = cmd["dataset_path"]
                     episode_index = int(cmd.get("episode_index", 0))
                     speed = float(cmd.get("speed", 1.0))
+                    scene_usd_path = cmd.get("scene_usd_path", "")
 
                     _replay_stop.clear()
                     _state["replaying"] = True
@@ -2458,6 +2461,7 @@ def _process_commands():
                         "dataset_path": dataset_path,
                         "episode_index": episode_index,
                         "speed": speed,
+                        "scene_usd_path": scene_usd_path,
                     }
                     cmd["result"] = {
                         "status": "started",
@@ -2639,7 +2643,7 @@ def _run_pending_collection():
 
 def _run_pending_replay():
     """Run queued replay request on the main thread."""
-    global _replay_request, PHYSICS_RUNNING
+    global _replay_request, PHYSICS_RUNNING, _inf_dc, _inf_init_result
     if not _replay_request:
         return
 
@@ -2648,10 +2652,33 @@ def _run_pending_replay():
     dataset_path = req["dataset_path"]
     episode_index = int(req.get("episode_index", 0))
     speed = float(req.get("speed", 1.0))
+    scene_usd_path = req.get("scene_usd_path", "")
+
+    # Invalidate monitor's cached articulation — scene reload makes it stale
+    _inf_dc = None
+    _inf_init_result = None
 
     try:
         import pandas as pd
         import numpy as np
+
+        # Reload scene to reset object positions (cube, bowl, etc.)
+        if scene_usd_path and os.path.exists(scene_usd_path):
+            print(f"[replay] reloading scene: {scene_usd_path}")
+            ctx = omni.usd.get_context()
+            ok = ctx.open_stage(scene_usd_path)
+            if ok:
+                for _ in range(300):
+                    simulation_app.update()
+                    if ctx.get_stage_state() == omni.usd.StageState.OPENED:
+                        break
+                    time.sleep(0.05)
+                _recreate_world_for_open_stage("replay_scene_reload")
+                PHYSICS_RUNNING = False
+                _state["physics"] = False
+                print(f"[replay] scene reloaded successfully")
+            else:
+                print(f"[replay] WARNING: scene reload failed, continuing with current state")
 
         # Find parquet file
         meta_path = os.path.join(dataset_path, "meta", "info.json")
@@ -2954,6 +2981,10 @@ def _run_pending_replay():
         print(f"[replay] ERROR: {exc}")
     finally:
         _state["replaying"] = False
+        # Clear monitor's cached articulation so MonitorPanel re-inits cleanly
+        _inf_dc = None
+        _inf_init_result = None
+        print("[replay] cleared _inf_dc for monitor re-init")
 
 
 def _run_pending_replay_record():
