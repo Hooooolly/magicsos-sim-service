@@ -2097,6 +2097,7 @@ print(f"[interactive] Ready. WebRTC port={WEBRTC_PORT}, Kit API=8011, Bridge={BR
 def _process_commands():
     """Drain command queue and execute on main thread (called each frame)."""
     global PHYSICS_RUNNING, _collect_request, _replay_request, _replay_record_request
+    global _inf_dc, _inf_init_result, _inf_init_error, _inf_init_pending, _inf_init_phase, _inf_cameras, _inf_init_step_count
     while not _cmd_queue.empty():
         try:
             cmd = _cmd_queue.get_nowait()
@@ -2150,8 +2151,15 @@ def _process_commands():
                             _state["scene"] = usd_path
                             _state["robots"] = {}
                             _state["physics"] = False
+                            # Clear inference state — old articulation/cameras are stale
+                            _inf_dc = None
+                            _inf_init_result = None
+                            _inf_init_error = None
+                            _inf_init_pending = False
+                            _inf_init_phase = 0
+                            _inf_cameras = {}
                             _save_autosave_stage("scene_load")
-                            print(f"[interactive] Scene loaded: {usd_path}")
+                            print(f"[interactive] Scene loaded: {usd_path} (inference state cleared)")
                             cmd["result"] = {"success": True, "scene": usd_path}
 
             elif cmd_type == "scene_save":
