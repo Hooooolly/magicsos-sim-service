@@ -2097,7 +2097,6 @@ print(f"[interactive] Ready. WebRTC port={WEBRTC_PORT}, Kit API=8011, Bridge={BR
 def _process_commands():
     """Drain command queue and execute on main thread (called each frame)."""
     global PHYSICS_RUNNING, _collect_request, _replay_request, _replay_record_request
-    global _inf_dc, _inf_init_result, _inf_init_error, _inf_init_pending, _inf_init_phase, _inf_cameras, _inf_init_step_count
     while not _cmd_queue.empty():
         try:
             cmd = _cmd_queue.get_nowait()
@@ -2151,16 +2150,8 @@ def _process_commands():
                             _state["scene"] = usd_path
                             _state["robots"] = {}
                             _state["physics"] = False
-                            # Clear inference state — old articulation/cameras are stale
-                            _inf_dc = None
-                            _inf_init_result = None
-                            _inf_init_error = None
-                            _inf_init_pending = False
-                            _inf_init_phase = 0
-                            _inf_init_step_count = 0
-                            _inf_cameras.clear()
                             _save_autosave_stage("scene_load")
-                            print(f"[interactive] Scene loaded: {usd_path} (inference state cleared)")
+                            print(f"[interactive] Scene loaded: {usd_path}")
                             cmd["result"] = {"success": True, "scene": usd_path}
 
             elif cmd_type == "scene_save":
@@ -2216,12 +2207,17 @@ def _process_commands():
                     try:
                         rgba = annot.get_data()
                         if rgba is not None and hasattr(rgba, "shape") and len(rgba.shape) >= 2 and rgba.size > 0:
+                            avg_px = float(rgba[:,:,:3].mean())
+                            if avg_px < 1.0:
+                                print(f"[inf_obs] WARNING: {cam_name} is BLACK (avg_pixel={avg_px:.2f}, shape={rgba.shape})")
                             img = _PILImage.fromarray(rgba[:, :, :3])
                             buf = _obs_io.BytesIO()
                             img.save(buf, format="JPEG", quality=80)
                             images[cam_name] = _b64.b64encode(buf.getvalue()).decode()
+                        else:
+                            print(f"[inf_obs] WARNING: {cam_name} annotator returned None or empty")
                     except Exception as e:
-                        pass
+                        print(f"[inf_obs] ERROR {cam_name}: {e}")
                 cmd["result"] = {
                     "positions": pos_list, "names": names,
                     "timestamp": time.time(), "images": images,
@@ -3369,8 +3365,14 @@ def _run_deferred_inference_init():
                         if mount_prim is None:
                             print(f"[init_inference] Camera {cam_name}: mount_link '{mount_link}' not found")
                             continue
+                        # Prefer existing camera prim from sensor.usd (e.g. wrist_cam)
+                        prim_name = cam_cfg.get("prim_name", cam_name)
+                        existing_cam = mount_prim.GetPath().pathString + f"/{prim_name}"
                         cam_path = mount_prim.GetPath().pathString + f"/{cam_name}"
-                        if not stage.GetPrimAtPath(cam_path).IsValid():
+                        if stage.GetPrimAtPath(existing_cam).IsValid():
+                            cam_path = existing_cam
+                            print(f"[init_inference] Using existing camera prim: {cam_path}")
+                        elif not stage.GetPrimAtPath(cam_path).IsValid():
                             cam_p = UsdGeom.Camera.Define(stage, cam_path)
                             translate = cam_cfg.get("translate", [0, 0, 0])
                             xf = UsdGeom.Xformable(cam_p.GetPrim())
@@ -3378,6 +3380,10 @@ def _run_deferred_inference_init():
                             t_op = xf.AddTranslateOp()
                             t_op.Set(Gf.Vec3d(*translate))
                             cam_p.GetFocalLengthAttr().Set(cam_cfg.get("focal_length", 24.0))
+                            clip = cam_cfg.get("clipping_range", [0.01, 10.0])
+                            from pxr import Gf as _Gf
+                            cam_p.GetClippingRangeAttr().Set(_Gf.Vec2f(*clip))
+                            print(f"[init_inference] Created new camera: {cam_path}")
                         rp = rep.create.render_product(cam_path, _inf_cam_resolution)
                         annot = rep.AnnotatorRegistry.get_annotator("rgb")
                         annot.attach([rp])
