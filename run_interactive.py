@@ -1760,8 +1760,13 @@ def robot_init_inference_status():
 def robot_obs():
     """Get robot joint positions + camera images for inference.
 
-    Delegates to main thread via _enqueue_cmd to avoid GIL/PhysX deadlock.
+    During replay, reads from _replay_obs (updated each frame by replay loop).
+    Otherwise, delegates to main thread via _enqueue_cmd.
     """
+    # During replay, return cached obs from replay loop (main thread is blocked)
+    replay_obs = _state.get("replay_obs")
+    if _state.get("replaying") and replay_obs:
+        return jsonify(replay_obs)
     if _inf_dc is None:
         return jsonify({"error": "Robot not initialized. Call /robot/init_inference first."}), 400
     return _enqueue_cmd("inf_obs")
@@ -2946,6 +2951,17 @@ def _run_pending_replay():
 
             _state["replay_progress"]["current_frame"] = frame_idx + 1
 
+            # Update replay_obs for MonitorPanel (reads from Flask thread)
+            try:
+                _replay_pos = robot.get_joint_positions()
+                _state["replay_obs"] = {
+                    "positions": _replay_pos.tolist() if _replay_pos is not None else [],
+                    "names": dof_names,
+                    "images": {},
+                }
+            except Exception:
+                pass
+
             # Log cube/bowl positions + actual finger pos
             # Dense logging (every 5 frames) during grip phase (frame 230-350), else every second
             in_grip_phase = 230 <= frame_idx <= 350
@@ -2981,6 +2997,7 @@ def _run_pending_replay():
         print(f"[replay] ERROR: {exc}")
     finally:
         _state["replaying"] = False
+        _state.pop("replay_obs", None)
         # Clear monitor's cached articulation so MonitorPanel re-inits cleanly
         _inf_dc = None
         _inf_init_result = None
