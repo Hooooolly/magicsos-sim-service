@@ -1721,12 +1721,20 @@ def robot_init_inference():
     Returns immediately. Poll GET /robot/init_inference for status.
     CRITICAL: No Isaac Sim imports or API calls here (Flask thread).
     """
-    global _inf_init_pending, _inf_init_phase, _inf_init_result, _inf_init_error, _inf_init_step_count
+    global _inf_init_pending, _inf_init_phase, _inf_init_result, _inf_init_error, _inf_init_step_count, _inf_dc
+    data = flask_request.get_json(silent=True) or {}
+    force = data.get("force", False)
+    if force and _inf_dc is not None:
+        # Force re-init: clear cached state so main loop rebuilds everything
+        _inf_dc = None
+        _inf_init_result = None
+        _inf_cameras.clear()
+        print("[init_inference] force re-init requested")
     if _inf_dc is not None and not _inf_init_pending:
         return jsonify({"status": "ready", **(_inf_init_result or {})})
     if _inf_init_pending and _inf_init_phase < 4:
         return jsonify({"status": "initializing", "phase": _inf_init_phase})
-    if _inf_init_error:
+    if _inf_init_error and not force:
         return jsonify({"status": "error", "error": _inf_init_error}), 500
     _inf_init_pending = True
     _inf_init_phase = 0
@@ -2096,7 +2104,7 @@ print(f"[interactive] Ready. WebRTC port={WEBRTC_PORT}, Kit API=8011, Bridge={BR
 # ── Main-thread command processor ────────────────────────────
 def _process_commands():
     """Drain command queue and execute on main thread (called each frame)."""
-    global PHYSICS_RUNNING, _collect_request, _replay_request, _replay_record_request
+    global PHYSICS_RUNNING, _collect_request, _replay_request, _replay_record_request, _inf_dc, _inf_init_result
     while not _cmd_queue.empty():
         try:
             cmd = _cmd_queue.get_nowait()
@@ -2199,9 +2207,17 @@ def _process_commands():
                 import io as _obs_io
                 from PIL import Image as _PILImage
                 import numpy as _np
-                positions = _inf_dc.get_joint_positions()
-                pos_list = positions.tolist() if positions is not None else []
-                names = [str(n) for n in _inf_dc.dof_names] if _inf_dc.dof_names is not None else []
+                pos_list = []
+                names = []
+                try:
+                    positions = _inf_dc.get_joint_positions()
+                    pos_list = positions.tolist() if positions is not None else []
+                    names = [str(n) for n in _inf_dc.dof_names] if _inf_dc.dof_names is not None else []
+                except Exception as _obs_err:
+                    # Articulation invalid (e.g. after scene reload) — clear cache
+                    _inf_dc = None
+                    _inf_init_result = None
+                    print(f"[inf_obs] articulation read failed, cleared _inf_dc: {_obs_err}")
                 images = {}
                 for cam_name, (rp, annot) in _inf_cameras.items():
                     try:
@@ -2809,6 +2825,16 @@ def _run_pending_replay():
             print(f"[replay] tracking cube: {cube_prim.GetPath()}")
         if bowl_prim:
             print(f"[replay] tracking bowl: {bowl_prim.GetPath()}")
+            # Fix bowl collision: convex hull seals the concave opening.
+            # Set child meshes to triangle mesh collision so cube can fall inside.
+            for child in Usd.PrimRange(bowl_prim):
+                if child.IsA(UsdGeom.Mesh):
+                    if not child.HasAPI(UsdPhysics.CollisionAPI):
+                        UsdPhysics.CollisionAPI.Apply(child)
+                    if not child.HasAPI(UsdPhysics.MeshCollisionAPI):
+                        UsdPhysics.MeshCollisionAPI.Apply(child)
+                    child.GetAttribute("physics:approximation").Set("none")
+            print(f"[replay] fixed bowl collision to triangle mesh")
 
         # Add very high-friction physics material to cube for firm grip
         if cube_prim:
