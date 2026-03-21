@@ -3070,12 +3070,13 @@ def _run_pending_replay():
                 prim_name = str(cam_cfg.get("prim_name", "wrist_cam") or "wrist_cam").strip()
                 cam_resolution_raw = cam_cfg.get("resolution", [640, 480])
                 try:
+                    # Use half resolution for replay monitoring (full res too slow)
                     cam_resolution = (
-                        int(cam_resolution_raw[0]),
-                        int(cam_resolution_raw[1]),
+                        int(cam_resolution_raw[0]) // 2,
+                        int(cam_resolution_raw[1]) // 2,
                     )
                 except Exception:
-                    cam_resolution = (640, 480)
+                    cam_resolution = (320, 240)
 
                 mount_prim = None
                 if mount_link:
@@ -3201,31 +3202,35 @@ def _run_pending_replay():
             except Exception:
                 pass
 
-            images = {}
-            for cam_name, (_rp, annot) in replay_cameras.items():
-                try:
-                    rgba = annot.get_data()
-                    if rgba is None:
-                        continue
-                    rgba = np.asarray(rgba)
-                    if rgba.ndim != 3 or rgba.shape[-1] < 3 or rgba.size == 0:
-                        continue
-                    rgb = rgba[:, :, :3]
-                    if rgb.dtype != np.uint8:
-                        rgb = np.clip(rgb, 0, 255).astype(np.uint8)
-                    img = _PILImage.fromarray(rgb)
-                    buf = _obs_io.BytesIO()
-                    img.save(buf, format="JPEG", quality=80)
-                    images[cam_name] = _b64.b64encode(buf.getvalue()).decode("ascii")
-                except Exception as img_exc:
-                    print(f"[replay] WARNING: image capture failed for {cam_name}: {img_exc}")
+            # Camera: sample every 5 frames to reduce overhead (joints every frame)
+            if replay_cameras and frame_idx % 5 == 0:
+                _replay_images = {}
+                for cam_name, (_rp, annot) in replay_cameras.items():
+                    try:
+                        rgba = annot.get_data()
+                        if rgba is None:
+                            continue
+                        rgba = np.asarray(rgba)
+                        if rgba.ndim != 3 or rgba.shape[-1] < 3 or rgba.size == 0:
+                            continue
+                        rgb = rgba[:, :, :3]
+                        if rgb.dtype != np.uint8:
+                            rgb = np.clip(rgb, 0, 255).astype(np.uint8)
+                        img = _PILImage.fromarray(rgb)
+                        buf = _obs_io.BytesIO()
+                        img.save(buf, format="JPEG", quality=60)
+                        _replay_images[cam_name] = _b64.b64encode(buf.getvalue()).decode("ascii")
+                    except Exception as img_exc:
+                        print(f"[replay] WARNING: image capture failed for {cam_name}: {img_exc}")
+                # Store latest images for non-camera frames
+                _state["_replay_latest_images"] = _replay_images
 
             # Update replay_obs for MonitorPanel (reads from Flask thread).
             try:
                 _state["replay_obs"] = {
                     "positions": last_actual_positions.tolist() if last_actual_positions is not None else [],
                     "names": dof_names,
-                    "images": images,
+                    "images": _state.get("_replay_latest_images", {}),
                     "timestamp": time.time(),
                 }
             except Exception:
@@ -3277,6 +3282,7 @@ def _run_pending_replay():
             print(f"[replay] cleaned up {len(replay_cameras)} replay camera render products")
         _state["replaying"] = False
         _state.pop("replay_obs", None)
+        _state.pop("_replay_latest_images", None)
         # Clear monitor's cached articulation so MonitorPanel re-inits cleanly
         _inf_dc = None
         _inf_init_result = None
