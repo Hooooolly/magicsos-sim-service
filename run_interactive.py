@@ -3324,15 +3324,21 @@ def _run_deferred_inference_init():
 
     try:
         if _inf_init_phase == 0:
-            # Phase 0: ensure physics is playing
+            # Phase 0: ensure physics is playing + reset to create physics views
             print("[init_inference] Phase 0: starting physics...")
+            stage = _get_stage()
+            if stage:
+                _sanitize_franka_root_rigidbody(stage)
             if not PHYSICS_RUNNING:
-                stage = _get_stage()
-                if stage:
-                    _sanitize_franka_root_rigidbody(stage)
                 world.play()
                 PHYSICS_RUNNING = True
                 _state["physics"] = True
+            # Reset world to create fresh physics simulation views
+            try:
+                world.reset()
+                print("[init_inference] world.reset() done")
+            except Exception as _reset_err:
+                print(f"[init_inference] world.reset() failed: {_reset_err}")
             _inf_init_phase = 1
             _inf_init_step_count = 0
             return  # let main loop step the world
