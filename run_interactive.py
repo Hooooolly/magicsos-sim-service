@@ -3337,6 +3337,14 @@ def _run_deferred_inference_init():
             try:
                 world.reset()
                 print("[init_inference] world.reset() done")
+                # Restore NVCF streaming readiness (world.reset can break it)
+                try:
+                    import omni.services.livestream.nvcf.services.api as _nvcf_api
+                    _nvcf_api.app_ready = True
+                    _nvcf_api.rtx_ready = True
+                    print("[init_inference] NVCF readiness restored")
+                except Exception:
+                    pass
             except Exception as _reset_err:
                 print(f"[init_inference] world.reset() failed: {_reset_err}")
             _inf_init_phase = 1
