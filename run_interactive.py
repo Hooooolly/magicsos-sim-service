@@ -2921,7 +2921,6 @@ def _run_pending_replay():
             camera_meta_candidates.append(camera_meta_path)
         camera_meta_candidates.extend(
             [
-                "/Users/holly/Documents/code/sim/sim-service/camera_meta.yaml",
                 os.path.join(os.path.dirname(__file__), "camera_meta.yaml"),
                 "/data/embodied/asset/robots/openarm_bimanual/camera_meta.yaml",
             ]
