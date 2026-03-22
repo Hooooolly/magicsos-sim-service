@@ -1365,15 +1365,40 @@ def _setup_scene_context(
 
     stage = _find_stage(simulation_app)
     robot_prim_path = _select_robot_prim(stage)
-    # Physics must be playing for Articulation.initialize() to work
+    # Match Franka collector pattern: create Articulation, add to world scene,
+    # reset world (creates PhysicsSimulationViews), step, then initialize.
+    import time as _time_mod
+    robot = Articulation(robot_prim_path, name=f"openarm_collect_{int(_time_mod.time())}")
     if world is not None:
-        world.play()
-        world.step(render=True)
+        world.scene.add(robot)
+        try:
+            world.reset()
+        except RuntimeError as _reset_exc:
+            if "expired" in str(_reset_exc).lower():
+                LOG.warning("world.reset() expired prim — clearing registry and retrying")
+                reg = getattr(world.scene, "_scene_registry", None)
+                if reg is not None:
+                    for attr in list(vars(reg)):
+                        v = getattr(reg, attr, None)
+                        if isinstance(v, dict):
+                            v.clear()
+                world.reset()
+            else:
+                raise
+        for _ in range(30):
+            world.step(render=True)
+        LOG.info("world.reset() + 30 steps done")
+    else:
+        for _ in range(30):
+            simulation_app.update()
 
-    robot = Articulation(robot_prim_path)
     if hasattr(robot, "initialize"):
-        robot.initialize()
-    _step_world(world, simulation_app, render=True, steps=2)
+        try:
+            robot.initialize()
+        except Exception as _init_exc:
+            LOG.warning("robot.initialize() failed: %s", _init_exc)
+    _step_world(world, simulation_app, render=True, steps=5)
+    LOG.info("robot DOFs: %d names: %s", robot.num_dof, list(robot.dof_names)[:5])
 
     openarm_root = _openarm_root_from_robot_path(robot_prim_path)
     camera_cfg = _load_right_wrist_camera_cfg()
