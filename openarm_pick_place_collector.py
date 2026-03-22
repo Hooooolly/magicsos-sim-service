@@ -36,7 +36,7 @@ STATE_DIM = 8
 ACTION_DIM = 8
 FPS = 30
 STEPS_PER_SEGMENT = 24
-CAMERA_NAMES = ["right_wrist_cam"]
+CAMERA_NAMES = ["left_wrist_cam", "right_wrist_cam"]
 CAMERA_RENDER_RESOLUTION = (640, 480)  # (width, height) for replicator
 CAMERA_RESOLUTION = (480, 640)  # (height, width) for LeRobot metadata
 ROBOT_TYPE = "openarm_bimanual"
@@ -170,6 +170,9 @@ class CollectorContext:
     right_wrist_camera_path: str
     right_wrist_render_product: Any
     right_wrist_annotator: Any
+    left_wrist_camera_path: Optional[str] = None
+    left_wrist_render_product: Any = None
+    left_wrist_annotator: Any = None
     cube_base_pos: np.ndarray
     bowl_base_pos: np.ndarray
     pose_samples: dict[str, PoseSample]
@@ -864,6 +867,8 @@ def _record_frame(
         next_done=next_done,
     )
     writer.add_video_frame("right_wrist_cam", _capture_rgb(ctx.right_wrist_annotator))
+    if ctx.left_wrist_annotator is not None:
+        writer.add_video_frame("left_wrist_cam", _capture_rgb(ctx.left_wrist_annotator))
     return frame_index + 1
 
 
@@ -1548,6 +1553,28 @@ def _setup_scene_context(
     _configure_bowl_collision(stage, bowl_prim_path)
 
     render_product, annotator = _setup_right_wrist_camera(stage, right_camera_path, camera_cfg)
+
+    # Setup left wrist camera (overview cam)
+    left_rp, left_annot, left_cam_path = None, None, None
+    try:
+        import omni.replicator.core as rep
+        left_mount = f"{openarm_root}/openarm_left_link7"
+        left_cam_candidates = [f"{left_mount}/wrist_cam", f"{left_mount}/left_wrist_cam"]
+        for cand in left_cam_candidates:
+            if stage.GetPrimAtPath(cand).IsValid():
+                left_cam_path = cand
+                break
+        if left_cam_path:
+            res = camera_cfg.get("resolution", [640, 480])
+            left_rp = rep.create.render_product(left_cam_path, (int(res[0]), int(res[1])))
+            left_annot = rep.AnnotatorRegistry.get_annotator("rgb")
+            left_annot.attach([left_rp])
+            LOG.info("Left wrist camera: %s", left_cam_path)
+        else:
+            LOG.warning("Left wrist camera prim not found")
+    except Exception as _left_exc:
+        LOG.warning("Left wrist camera setup failed: %s", _left_exc)
+
     _step_world(world, simulation_app, render=True, steps=3)
     pose_samples = _sample_pose_references(world, simulation_app, robot, stage, right_eef_prim_path)
     curobo_state = _init_openarm_curobo(
@@ -1569,6 +1596,9 @@ def _setup_scene_context(
         right_wrist_camera_path=right_camera_path,
         right_wrist_render_product=render_product,
         right_wrist_annotator=annotator,
+        left_wrist_camera_path=left_cam_path,
+        left_wrist_render_product=left_rp,
+        left_wrist_annotator=left_annot,
         cube_base_pos=np.asarray(cube_base_pos, dtype=np.float32),
         bowl_base_pos=np.asarray(bowl_base_pos, dtype=np.float32),
         pose_samples=pose_samples,
@@ -1963,6 +1993,20 @@ def _run_episode(
                             if rgb.dtype != np.uint8:
                                 rgb = np.clip(rgb, 0, 255).astype(np.uint8)
                             writer.add_video_frame("right_wrist_cam", rgb)
+                except Exception:
+                    pass
+
+            # Left wrist camera (overview)
+            if ctx.left_wrist_annotator is not None:
+                try:
+                    rgba = ctx.left_wrist_annotator.get_data()
+                    if rgba is not None:
+                        rgba = np.asarray(rgba)
+                        if rgba.ndim == 3 and rgba.shape[-1] >= 3:
+                            rgb = rgba[:, :, :3]
+                            if rgb.dtype != np.uint8:
+                                rgb = np.clip(rgb, 0, 255).astype(np.uint8)
+                            writer.add_video_frame("left_wrist_cam", rgb)
                 except Exception:
                     pass
 
