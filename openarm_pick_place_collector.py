@@ -99,13 +99,33 @@ DEFAULT_RIGHT_CAMERA_CFG = {
     "focal_length": 15.0,
 }
 
-# Hand-tuned sim-order right-arm waypoints. Small per-episode offsets are added
-# based on cube/bowl XY deviations so the collector stays simple and deterministic.
-BASE_APPROACH_RIGHT = np.array([-0.56, 0.22, 0.08, 1.18, 0.02, 0.50, 0.78], dtype=np.float32)
-BASE_GRASP_RIGHT = np.array([-0.58, 0.36, 0.14, 0.98, 0.02, 0.72, 0.80], dtype=np.float32)
-BASE_LIFT_RIGHT = np.array([-0.56, 0.12, 0.08, 1.28, 0.02, 0.45, 0.80], dtype=np.float32)
-BASE_BOWL_RIGHT = np.array([-0.20, 0.16, 0.00, 1.22, -0.02, 0.48, 0.50], dtype=np.float32)
-BASE_PLACE_RIGHT = np.array([-0.12, 0.28, 0.02, 1.05, -0.02, 0.66, 0.50], dtype=np.float32)
+# Waypoints extracted from successful replay data (ep0 of openarm_pick_sim_cam)
+# Dataset joint order: [j1, j3, j4, j5, j6, j2, j7, finger]
+WP_HOME = np.array([-0.0399, 0.0299, -0.0429, 0.0135, -0.4461, 0.0357, -1.4796, 0.0397], dtype=np.float32)
+WP_APPROACH = np.array([-0.0937, -0.1349, 0.5159, 0.0505, -0.2317, 0.1345, -1.1534, 0.0396], dtype=np.float32)
+WP_PRE_GRASP = np.array([-0.0055, -0.2199, 0.5159, 0.0517, -0.2241, 0.1375, -1.0065, 0.0396], dtype=np.float32)
+WP_GRASP = np.array([-0.0055, -0.2470, 0.5159, 0.0525, -0.2237, 0.1379, -0.9657, 0.0212], dtype=np.float32)
+WP_CLOSE = np.array([-0.0055, -0.2470, 0.5159, 0.0521, -0.2237, 0.1379, -0.9607, 0.0140], dtype=np.float32)
+WP_LIFT = np.array([0.0673, -0.4568, 1.0771, 0.0559, -0.2241, 0.1520, -0.6456, 0.0134], dtype=np.float32)
+WP_MOVE_BOWL = np.array([0.2470, -0.6949, 0.8532, 0.0689, -0.2058, 0.1287, -0.6464, 0.0395], dtype=np.float32)
+WP_PLACE = np.array([-0.2424, -0.3904, 1.1427, 0.0711, -0.2165, 0.2211, -0.6666, 0.0398], dtype=np.float32)
+WP_OPEN = np.array([-0.2806, -0.3325, 1.1427, 0.0746, -0.2169, 0.2207, -0.7414, 0.0398], dtype=np.float32)
+WP_RETRACT = np.array([-0.4137, -0.2150, 1.0260, 0.1959, -0.2173, 0.2180, -0.9600, 0.0398], dtype=np.float32)
+
+# Waypoint sequence: (name, dataset-order-8dim, steps_per_transition)
+PICK_PLACE_WAYPOINTS = [
+    ("HOME", WP_HOME, 30),
+    ("APPROACH", WP_APPROACH, 50),
+    ("PRE_GRASP", WP_PRE_GRASP, 40),
+    ("GRASP", WP_GRASP, 30),
+    ("CLOSE", WP_CLOSE, 40),        # gripper closing
+    ("LIFT", WP_LIFT, 50),
+    ("MOVE_BOWL", WP_MOVE_BOWL, 50),
+    ("PLACE", WP_PLACE, 40),
+    ("OPEN", WP_OPEN, 30),          # gripper opening
+    ("RETRACT", WP_RETRACT, 30),
+    ("HOME_END", WP_HOME, 40),
+]
 
 DEFAULT_CUROBO_CONFIG_PATH = Path("/data/embodied/asset/robots/openarm_bimanual/openarm.yml")
 DEFAULT_CUROBO_URDF_PATH = Path("/data/embodied/asset/robots/openarm_bimanual/openarm_bimanual.urdf")
@@ -1556,7 +1576,7 @@ def _setup_scene_context(
     )
 
 
-def _run_episode(
+def _run_episode_simple(
     episode_index: int,
     world: Any,
     simulation_app: Any,
@@ -1821,6 +1841,150 @@ def _run_episode(
     _remove_prim_if_exists(ctx.stage, ATTACHMENT_JOINT_PATH)
     _step_world(world, simulation_app, render=True, steps=6)
     return frame_index, False, _episode_success(ctx.stage, ctx.cube_prim_path, ctx.bowl_prim_path)
+
+
+def _run_episode(
+    episode_index: int,
+    world: Any,
+    simulation_app: Any,
+    ctx: CollectorContext,
+    writer: SimLeRobotWriter,
+    fps: int,
+    steps_per_segment: int,
+    rng: np.random.Generator,
+    stop_event: threading.Event,
+    episode_timeout_sec: float,
+    object_position_noise: float,
+) -> tuple[int, bool, bool]:
+    """Simple waypoint interpolation episode using replay-derived joint angles."""
+    _remove_prim_if_exists(ctx.stage, ATTACHMENT_JOINT_PATH)
+    _world_reset(world, simulation_app)
+
+    # Randomize cube position
+    _move_cube_for_episode(
+        stage=ctx.stage,
+        cube_prim_path=ctx.cube_prim_path,
+        cube_base_pos=ctx.cube_base_pos,
+        rng=rng,
+        object_position_noise=object_position_noise,
+    )
+    _step_world(world, simulation_app, render=True, steps=6)
+
+    current = _to_numpy(ctx.robot.get_joint_positions())
+    if current.size < 18:
+        raise RuntimeError(f"Expected OpenArm articulation with 18 DOF, got {current.size}.")
+
+    frame_index = 0
+    episode_start = time.time()
+    stopped = False
+
+    def timeout_fn():
+        return episode_timeout_sec > 0 and (time.time() - episode_start) > episode_timeout_sec
+
+    # Convert dataset-order waypoint to 18-DOF sim target
+    def wp_to_full(wp_data: np.ndarray) -> np.ndarray:
+        current_full = _to_numpy(ctx.robot.get_joint_positions())
+        arm_7 = np.zeros(7, dtype=np.float32)
+        for sim_j in range(7):
+            data_j = DATA_TO_SIM[sim_j]
+            val = float(wp_data[data_j])
+            if sim_j in NEGATED_SIM_JOINTS:
+                val = -val
+            arm_7[sim_j] = val
+        target = current_full.copy()
+        for i, idx in enumerate(RIGHT_ARM_INDICES):
+            target[idx] = arm_7[i]
+        finger_val = float(wp_data[7])
+        for idx in RIGHT_FINGER_INDICES:
+            target[idx] = finger_val
+        # Set left arm to homing
+        left_indices = [0, 2, 4, 6, 8, 10, 12, 14, 15]
+        left_home = [HOME_FULL[i] for i in left_indices]
+        for i, idx in enumerate(left_indices):
+            target[idx] = left_home[i]
+        return target
+
+    # Execute waypoint transitions with joint interpolation
+    prev_wp = PICK_PLACE_WAYPOINTS[0]
+    prev_full = wp_to_full(prev_wp[1])
+    _apply_joint_targets(ctx.robot, prev_full, physics_control=False)
+    _step_world(world, simulation_app, render=True, steps=10)
+    LOG.info("Episode %d: starting from HOME", episode_index + 1)
+
+    for wp_idx in range(1, len(PICK_PLACE_WAYPOINTS)):
+        if stopped or timeout_fn():
+            break
+        if stop_event is not None and stop_event.is_set():
+            stopped = True
+            break
+
+        wp_name, wp_data, n_steps = PICK_PLACE_WAYPOINTS[wp_idx]
+        target_full = wp_to_full(wp_data)
+        start_full = _to_numpy(ctx.robot.get_joint_positions())
+
+        LOG.info("Episode %d: %s (%d steps)", episode_index + 1, wp_name, n_steps)
+
+        for step in range(n_steps):
+            if timeout_fn() or (stop_event is not None and stop_event.is_set()):
+                stopped = True
+                break
+
+            alpha = float(step + 1) / float(n_steps)
+            interp = ((1.0 - alpha) * start_full + alpha * target_full).astype(np.float32)
+
+            from omni.isaac.core.utils.types import ArticulationAction
+            ctrl = ctx.robot.get_articulation_controller()
+            ctrl.apply_action(ArticulationAction(joint_positions=interp))
+            world.step(render=True)
+
+            # Record frame
+            obs_state = _full_to_dataset_state(_to_numpy(ctx.robot.get_joint_positions()))
+            act_state = _full_to_dataset_state(interp)
+            is_last = (wp_idx == len(PICK_PLACE_WAYPOINTS) - 1 and step == n_steps - 1)
+
+            frame_data = {
+                "observation.state": obs_state.tolist(),
+                "action": act_state.tolist(),
+                "timestamp": [time.time()],
+                "next.done": [is_last],
+                "index": [frame_index],
+                "episode_index": [episode_index],
+                "frame_index": [frame_index],
+            }
+
+            # Camera image
+            if ctx.right_wrist_annotator is not None:
+                try:
+                    rgba = ctx.right_wrist_annotator.get_data()
+                    if rgba is not None:
+                        rgba = np.asarray(rgba)
+                        if rgba.ndim == 3 and rgba.shape[-1] >= 3:
+                            rgb = rgba[:, :, :3]
+                            if rgb.dtype != np.uint8:
+                                rgb = np.clip(rgb, 0, 255).astype(np.uint8)
+                            frame_data["observation.images.right_wrist_cam"] = rgb
+                except Exception:
+                    pass
+
+            writer.add_frame(frame_data)
+            frame_index += 1
+
+        # After CLOSE phase, create attachment joint
+        if wp_name == "CLOSE" and ctx.cube_prim_path and not _prim_exists(ctx.stage, ATTACHMENT_JOINT_PATH):
+            _create_attachment_joint(ctx.stage, ctx.right_eef_prim_path, ctx.cube_prim_path)
+            _step_world(world, simulation_app, render=True, steps=2)
+            LOG.info("Episode %d: attached cube", episode_index + 1)
+
+        # After OPEN phase, remove attachment
+        if wp_name == "OPEN":
+            _remove_prim_if_exists(ctx.stage, ATTACHMENT_JOINT_PATH)
+            _step_world(world, simulation_app, render=True, steps=2)
+            LOG.info("Episode %d: released cube", episode_index + 1)
+
+    LOG.info("Episode %d: done, %d frames", episode_index + 1, frame_index)
+    _remove_prim_if_exists(ctx.stage, ATTACHMENT_JOINT_PATH)
+    _step_world(world, simulation_app, render=True, steps=6)
+    return frame_index, stopped, _episode_success(ctx.stage, ctx.cube_prim_path, ctx.bowl_prim_path)
 
 
 def run_collection_in_process(
