@@ -1964,9 +1964,8 @@ def _run_episode(
             alpha = float(step + 1) / float(n_steps)
             interp = ((1.0 - alpha) * start_full + alpha * target_full).astype(np.float32)
 
-            from omni.isaac.core.utils.types import ArticulationAction
-            ctrl = ctx.robot.get_articulation_controller()
-            ctrl.apply_action(ArticulationAction(joint_positions=interp))
+            # Teleport mode: directly set joint positions (no PD oscillation)
+            ctx.robot.set_joint_positions(interp)
             world.step(render=True)
 
             # Record frame
