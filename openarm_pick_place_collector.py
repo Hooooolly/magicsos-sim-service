@@ -113,9 +113,12 @@ DEFAULT_CUROBO_TO_SIM_ARM = np.array([0, 2, 4, 6, 8, 10, 12, 1, 3, 5, 7, 9, 11, 
 RIGHT_ARM_CUROBO_SLICE = slice(7, 14)
 LEFT_ARM_CUROBO_SLICE = slice(0, 7)
 CUROBO_RIGHT_EE_LINK = "openarm_right_hand"
-TOP_DOWN_QUAT_WXYZ = np.array([0.0, 1.0, 0.0, 0.0], dtype=np.float32)
-PRE_GRASP_OFFSET = np.array([0.0, 0.0, 0.12], dtype=np.float32)
-GRASP_OFFSET = np.array([0.0, 0.0, 0.02], dtype=np.float32)
+# Grasp orientation from replay data frame 260 (side-approach, not top-down)
+# ee_link quat when gripper is at cube: wxyz = (0.0505, 0.7232, 0.1517, 0.6719)
+GRASP_QUAT_WXYZ = np.array([0.0505, 0.7232, 0.1517, 0.6719], dtype=np.float32)
+# Pre-grasp: offset back along approach direction (not straight up)
+PRE_GRASP_OFFSET = np.array([-0.08, 0.0, 0.06], dtype=np.float32)  # back + up from cube
+GRASP_OFFSET = np.array([0.0, 0.0, 0.0], dtype=np.float32)  # at cube position
 LIFT_OFFSET = np.array([0.0, 0.0, 0.15], dtype=np.float32)
 BOWL_APPROACH_OFFSET = np.array([0.0, 0.0, 0.15], dtype=np.float32)
 PLACE_LOWER_OFFSET = np.array([0.0, 0.0, 0.05], dtype=np.float32)
@@ -1596,7 +1599,7 @@ def _run_episode(
     attach_state = {"attached": False}
     episode_start = time.time()
     robot_base_pos, robot_base_quat = _get_prim_world_pose(ctx.stage, ctx.robot_prim_path)
-    top_down_quat = TOP_DOWN_QUAT_WXYZ.copy()
+    grasp_quat = GRASP_QUAT_WXYZ.copy()
     pre_grasp_pos = (cube_pos + PRE_GRASP_OFFSET).astype(np.float32)
     grasp_pos = (cube_pos + GRASP_OFFSET).astype(np.float32)
     lift_pos = (grasp_pos + LIFT_OFFSET).astype(np.float32)
@@ -1634,7 +1637,7 @@ def _run_episode(
             curobo_state=ctx.curobo_state,
             current_full=_to_numpy(ctx.robot.get_joint_positions()),
             target_pos_world=pre_grasp_pos,
-            target_quat_world=top_down_quat,
+            target_quat_world=grasp_quat,
             robot_base_pos=robot_base_pos,
             robot_base_quat=robot_base_quat,
         )
@@ -1659,7 +1662,7 @@ def _run_episode(
             stage=ctx.stage,
             eef_prim_path=ctx.right_eef_prim_path,
             target_pos_world=grasp_pos,
-            target_quat_world=top_down_quat,
+            target_quat_world=grasp_quat,
             robot_base_pos=robot_base_pos,
             robot_base_quat=robot_base_quat,
             n_waypoints=LINEAR_CARTESIAN_WAYPOINTS,
@@ -1700,7 +1703,7 @@ def _run_episode(
             stage=ctx.stage,
             eef_prim_path=ctx.right_eef_prim_path,
             target_pos_world=lift_pos,
-            target_quat_world=top_down_quat,
+            target_quat_world=grasp_quat,
             robot_base_pos=robot_base_pos,
             robot_base_quat=robot_base_quat,
             n_waypoints=LINEAR_CARTESIAN_WAYPOINTS,
@@ -1724,7 +1727,7 @@ def _run_episode(
             curobo_state=ctx.curobo_state,
             current_full=_to_numpy(ctx.robot.get_joint_positions()),
             target_pos_world=bowl_approach_pos,
-            target_quat_world=top_down_quat,
+            target_quat_world=grasp_quat,
             robot_base_pos=robot_base_pos,
             robot_base_quat=robot_base_quat,
         )
@@ -1749,7 +1752,7 @@ def _run_episode(
             stage=ctx.stage,
             eef_prim_path=ctx.right_eef_prim_path,
             target_pos_world=place_pos,
-            target_quat_world=top_down_quat,
+            target_quat_world=grasp_quat,
             robot_base_pos=robot_base_pos,
             robot_base_quat=robot_base_quat,
             n_waypoints=LINEAR_CARTESIAN_WAYPOINTS,
