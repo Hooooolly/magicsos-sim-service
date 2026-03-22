@@ -10,11 +10,12 @@ data_to_sim: [0, 5, 1, 2, 3, 4, 6]              # dataset joint idx → sim join
 negate_joints: [6]                                # sim joint indices to negate (wrist rotation)
 action_dim: 8                                     # dataset action dimension (7 joints + 1 finger)
 
-# Homing pose (18-DOF interleaved L/R): Sinan teleop init position
-# Both arms mirrored: J1=±45°, J4=90°, J7=±45°, elbows bent forward
-# Both wrist cameras face the table workspace
-#         L1      R1      L2   R2   L3   R3    L4      R4      L5   R5   L6   R6    L7      R7     Lf1  Lf2  Rf1  Rf2
-homing_pose: [0.7854, -0.7854, 0.0, 0.0, 0.0, 0.0, 1.5708, 1.5708, 0.0, 0.0, 0.0, 0.0, -0.7854, 0.7854, 0.0, 0.0, 0.04, 0.04]
+# Homing pose (18-DOF interleaved L/R): Sinan teleop init + left wrist as overview cam
+# Right arm: Sinan homing (J1=-45°, J4=90°, J7=45°)
+# Left arm: Sinan homing + J6=-0.7 (wrist yaw rotated right to see workspace)
+# Left wrist cam acts as "head camera" seeing cube+bowl+table overview
+#         L1      R1      L2   R2   L3   R3    L4      R4      L5   R5    L6    R6    L7      R7     Lf1  Lf2  Rf1  Rf2
+homing_pose: [0.7854, -0.7854, 0.0, 0.0, 0.0, 0.0, 1.5708, 1.5708, 0.0, 0.0, -0.7, 0.0, -0.7854, 0.7854, 0.0, 0.0, 0.04, 0.04]
 
 # Cameras for monitoring (same as camera_meta.yaml wrist_cameras section)
 cameras:
