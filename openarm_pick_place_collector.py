@@ -776,14 +776,16 @@ def _sample_pose_references(
     stage: Any,
     eef_prim_path: str,
 ) -> dict[str, PoseSample]:
+    # Pose samples not needed for simple waypoint collector
+    return {}
     current_full = _to_numpy(robot.get_joint_positions())
     samples = {
         "home": _sample_pose_at_arm_target(robot, stage, eef_prim_path, world, simulation_app, HOME_RIGHT_ARM, GRIPPER_OPEN),
-        "pre_grasp": _sample_pose_at_arm_target(robot, stage, eef_prim_path, world, simulation_app, BASE_APPROACH_RIGHT, GRIPPER_OPEN),
-        "grasp": _sample_pose_at_arm_target(robot, stage, eef_prim_path, world, simulation_app, BASE_GRASP_RIGHT, GRIPPER_OPEN),
-        "lift": _sample_pose_at_arm_target(robot, stage, eef_prim_path, world, simulation_app, BASE_LIFT_RIGHT, GRIPPER_CLOSED),
-        "bowl": _sample_pose_at_arm_target(robot, stage, eef_prim_path, world, simulation_app, BASE_BOWL_RIGHT, GRIPPER_CLOSED),
-        "place": _sample_pose_at_arm_target(robot, stage, eef_prim_path, world, simulation_app, BASE_PLACE_RIGHT, GRIPPER_CLOSED),
+        "pre_grasp": None,
+        "grasp": None,
+        "lift": None,
+        "bowl": None,
+        "place": None,
     }
     _apply_joint_targets(robot, current_full, physics_control=False)
     _step_world(world, simulation_app, render=True, steps=4)
