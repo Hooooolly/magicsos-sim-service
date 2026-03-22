@@ -1942,8 +1942,17 @@ def _run_episode(
             act_state = _full_to_dataset_state(interp)
             is_last = (wp_idx == len(PICK_PLACE_WAYPOINTS) - 1 and step == n_steps - 1)
 
-            # Camera image as extras
-            extras = {}
+            # Record tabular data
+            writer.add_frame(
+                episode_index=episode_index,
+                frame_index=frame_index,
+                observation_state=obs_state,
+                action=act_state,
+                timestamp=time.time(),
+                next_done=is_last,
+            )
+
+            # Record camera frame separately (stored as video)
             if ctx.right_wrist_annotator is not None:
                 try:
                     rgba = ctx.right_wrist_annotator.get_data()
@@ -1953,19 +1962,10 @@ def _run_episode(
                             rgb = rgba[:, :, :3]
                             if rgb.dtype != np.uint8:
                                 rgb = np.clip(rgb, 0, 255).astype(np.uint8)
-                            extras["observation.images.right_wrist_cam"] = rgb
+                            writer.add_video_frame("right_wrist_cam", rgb)
                 except Exception:
                     pass
 
-            writer.add_frame(
-                episode_index=episode_index,
-                frame_index=frame_index,
-                observation_state=obs_state,
-                action=act_state,
-                timestamp=time.time(),
-                next_done=is_last,
-                extras=extras if extras else None,
-            )
             frame_index += 1
 
         # After CLOSE phase, create attachment joint
