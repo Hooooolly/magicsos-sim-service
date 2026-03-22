@@ -2632,9 +2632,16 @@ def _process_commands():
 
 def _run_pending_collection():
     """Run queued collection request on the main thread."""
-    global _collect_request
+    global _collect_request, _inf_dc, _inf_init_result
     if not _collect_request:
         return
+
+    # Clear init_inference state to prevent MonitorPanel obs polling from
+    # reading camera annotators during collection (causes segfault with cuRobo).
+    if _inf_dc is not None:
+        _inf_dc = None
+        _inf_init_result = None
+        print("[collect] cleared _inf_dc to avoid annotator conflict during collection")
 
     req = _collect_request
     _collect_request = None
