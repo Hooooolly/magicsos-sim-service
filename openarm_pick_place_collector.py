@@ -170,13 +170,13 @@ class CollectorContext:
     right_wrist_camera_path: str
     right_wrist_render_product: Any
     right_wrist_annotator: Any
-    left_wrist_camera_path: Optional[str] = None
-    left_wrist_render_product: Any = None
-    left_wrist_annotator: Any = None
     cube_base_pos: np.ndarray
     bowl_base_pos: np.ndarray
     pose_samples: dict[str, PoseSample]
     curobo_state: Optional[dict[str, Any]]
+    left_wrist_camera_path: Optional[str] = None
+    left_wrist_render_product: Any = None
+    left_wrist_annotator: Any = None
 
 
 def _to_numpy(value: Any, dtype: Any = np.float32) -> np.ndarray:
