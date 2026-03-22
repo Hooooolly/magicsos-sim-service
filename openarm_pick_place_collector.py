@@ -1969,7 +1969,7 @@ def _run_episode(
             frame_index += 1
 
         # After CLOSE phase, create attachment joint
-        if wp_name == "CLOSE" and ctx.cube_prim_path and not _prim_exists(ctx.stage, ATTACHMENT_JOINT_PATH):
+        if wp_name == "CLOSE" and ctx.cube_prim_path and not ctx.stage.GetPrimAtPath(ATTACHMENT_JOINT_PATH).IsValid():
             _create_attachment_joint(ctx.stage, ctx.right_eef_prim_path, ctx.cube_prim_path)
             _step_world(world, simulation_app, render=True, steps=2)
             LOG.info("Episode %d: attached cube", episode_index + 1)
