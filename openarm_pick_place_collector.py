@@ -1365,6 +1365,11 @@ def _setup_scene_context(
 
     stage = _find_stage(simulation_app)
     robot_prim_path = _select_robot_prim(stage)
+    # Physics must be playing for Articulation.initialize() to work
+    if world is not None:
+        world.play()
+        world.step(render=True)
+
     robot = Articulation(robot_prim_path)
     if hasattr(robot, "initialize"):
         robot.initialize()
