@@ -2687,9 +2687,19 @@ def _run_pending_collection():
         import importlib
         import lerobot_writer as _lrw_mod
         importlib.reload(_lrw_mod)
-        import isaac_pick_place_collector as _ipc_mod
-        importlib.reload(_ipc_mod)
-        from isaac_pick_place_collector import run_collection_in_process
+
+        # Select collector based on robot type in scene
+        _active_robot_type = _state.get("active_robot_type", "").lower()
+        if "openarm" in _active_robot_type:
+            import openarm_pick_place_collector as _ipc_mod
+            importlib.reload(_ipc_mod)
+            from openarm_pick_place_collector import run_collection_in_process
+            print(f"[collect] using OpenArm collector (robot_type={_active_robot_type})")
+        else:
+            import isaac_pick_place_collector as _ipc_mod
+            importlib.reload(_ipc_mod)
+            from isaac_pick_place_collector import run_collection_in_process
+            print(f"[collect] using Franka collector (robot_type={_active_robot_type})")
 
         collect_kwargs = {
             "world": world,
