@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import sys
 import threading
 import time
@@ -105,6 +106,23 @@ BASE_LIFT_RIGHT = np.array([-0.56, 0.12, 0.08, 1.28, 0.02, 0.45, 0.80], dtype=np
 BASE_BOWL_RIGHT = np.array([-0.20, 0.16, 0.00, 1.22, -0.02, 0.48, 0.50], dtype=np.float32)
 BASE_PLACE_RIGHT = np.array([-0.12, 0.28, 0.02, 1.05, -0.02, 0.66, 0.50], dtype=np.float32)
 
+DEFAULT_CUROBO_CONFIG_PATH = Path("/data/embodied/asset/robots/openarm_bimanual/openarm.yml")
+DEFAULT_CUROBO_URDF_PATH = Path("/data/embodied/asset/robots/openarm_bimanual/openarm_bimanual.urdf")
+DEFAULT_CUROBO_TO_SIM_ARM = np.array([0, 2, 4, 6, 8, 10, 12, 1, 3, 5, 7, 9, 11, 13], dtype=np.int64)
+RIGHT_ARM_CUROBO_SLICE = slice(7, 14)
+LEFT_ARM_CUROBO_SLICE = slice(0, 7)
+CUROBO_RIGHT_EE_LINK = "openarm_right_hand"
+PRE_GRASP_IK_WAYPOINTS = 14
+LIFT_IK_WAYPOINTS = 12
+PLACE_IK_WAYPOINTS = 12
+CUROBO_SETTLE_STEPS = 6
+
+
+@dataclass(frozen=True)
+class PoseSample:
+    position_world: np.ndarray
+    orientation: np.ndarray
+
 
 @dataclass
 class CollectorContext:
@@ -115,11 +133,14 @@ class CollectorContext:
     right_eef_prim_path: str
     cube_prim_path: Optional[str]
     bowl_prim_path: Optional[str]
+    table_prim_path: Optional[str]
     right_wrist_camera_path: str
     right_wrist_render_product: Any
     right_wrist_annotator: Any
     cube_base_pos: np.ndarray
     bowl_base_pos: np.ndarray
+    pose_samples: dict[str, PoseSample]
+    curobo_state: Optional[dict[str, Any]]
 
 
 def _to_numpy(value: Any, dtype: Any = np.float32) -> np.ndarray:
@@ -401,6 +422,338 @@ def _capture_rgb(annotator: Any) -> np.ndarray:
     return rgb
 
 
+def _normalize_quat_wxyz(quat: np.ndarray) -> np.ndarray:
+    q = _to_numpy(quat, dtype=np.float32).reshape(-1)
+    if q.size < 4:
+        return np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32)
+    q4 = q[:4].astype(np.float32, copy=False)
+    if not np.all(np.isfinite(q4)):
+        return np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32)
+    norm = float(np.linalg.norm(q4))
+    if not np.isfinite(norm) or norm < 1e-6:
+        return np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32)
+    return (q4 / norm).astype(np.float32)
+
+
+def _quat_mul_wxyz(a: np.ndarray, b: np.ndarray) -> np.ndarray:
+    aw, ax, ay, az = _normalize_quat_wxyz(a)
+    bw, bx, by, bz = _normalize_quat_wxyz(b)
+    return _normalize_quat_wxyz(
+        np.array(
+            [
+                aw * bw - ax * bx - ay * by - az * bz,
+                aw * bx + ax * bw + ay * bz - az * by,
+                aw * by - ax * bz + ay * bw + az * bx,
+                aw * bz + ax * by - ay * bx + az * bw,
+            ],
+            dtype=np.float32,
+        )
+    )
+
+
+def _quat_to_rot_wxyz(quat: np.ndarray) -> np.ndarray:
+    w, x, y, z = _normalize_quat_wxyz(quat)
+    xx, yy, zz = x * x, y * y, z * z
+    xy, xz, yz = x * y, x * z, y * z
+    wx, wy, wz = w * x, w * y, w * z
+    return np.array(
+        [
+            [1.0 - 2.0 * (yy + zz), 2.0 * (xy - wz), 2.0 * (xz + wy)],
+            [2.0 * (xy + wz), 1.0 - 2.0 * (xx + zz), 2.0 * (yz - wx)],
+            [2.0 * (xz - wy), 2.0 * (yz + wx), 1.0 - 2.0 * (xx + yy)],
+        ],
+        dtype=np.float32,
+    )
+
+
+def _slerp_quat(q0: np.ndarray, q1: np.ndarray, t: float) -> np.ndarray:
+    q0 = _normalize_quat_wxyz(q0).astype(np.float64)
+    q1 = _normalize_quat_wxyz(q1).astype(np.float64)
+    dot = float(np.dot(q0, q1))
+    if dot < 0.0:
+        q1 = -q1
+        dot = -dot
+    dot = min(dot, 1.0)
+    if dot > 0.9995:
+        result = q0 + t * (q1 - q0)
+        return _normalize_quat_wxyz(result.astype(np.float32))
+    theta = np.arccos(dot)
+    sin_theta = np.sin(theta)
+    result = (np.sin((1.0 - t) * theta) / sin_theta) * q0 + (np.sin(t * theta) / sin_theta) * q1
+    return _normalize_quat_wxyz(result.astype(np.float32))
+
+
+def _world_to_robot_frame(
+    target_pos_world: np.ndarray,
+    target_quat_world: np.ndarray,
+    robot_base_pos: np.ndarray,
+    robot_base_quat: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    rot_inv = _quat_to_rot_wxyz(robot_base_quat).T
+    pos_robot = (rot_inv @ (_to_numpy(target_pos_world, dtype=np.float32)[:3] - robot_base_pos[:3])).astype(np.float32)
+    base_q_inv = _normalize_quat_wxyz(robot_base_quat).copy()
+    base_q_inv[1:] *= -1.0
+    quat_robot = _quat_mul_wxyz(base_q_inv, target_quat_world)
+    return pos_robot, quat_robot
+
+
+def _compute_prim_bbox(stage: Any, prim_path: str) -> Optional[tuple[np.ndarray, np.ndarray]]:
+    from pxr import Gf, Usd, UsdGeom
+
+    prim = stage.GetPrimAtPath(prim_path)
+    if not prim or not prim.IsValid():
+        return None
+
+    tc = Usd.TimeCode.Default()
+
+    def _xform_extent_corners(lo: Any, hi: Any, tf: Any) -> Optional[tuple[np.ndarray, np.ndarray]]:
+        corners = [
+            Gf.Vec3d(lo[0], lo[1], lo[2]),
+            Gf.Vec3d(hi[0], lo[1], lo[2]),
+            Gf.Vec3d(lo[0], hi[1], lo[2]),
+            Gf.Vec3d(lo[0], lo[1], hi[2]),
+            Gf.Vec3d(hi[0], hi[1], lo[2]),
+            Gf.Vec3d(hi[0], lo[1], hi[2]),
+            Gf.Vec3d(lo[0], hi[1], hi[2]),
+            Gf.Vec3d(hi[0], hi[1], hi[2]),
+        ]
+        pts = [tf.Transform(corner) for corner in corners]
+        xs = [float(p[0]) for p in pts]
+        ys = [float(p[1]) for p in pts]
+        zs = [float(p[2]) for p in pts]
+        mn = np.array([min(xs), min(ys), min(zs)], dtype=np.float32)
+        mx = np.array([max(xs), max(ys), max(zs)], dtype=np.float32)
+        if not np.all(np.isfinite(mn)) or not np.all(np.isfinite(mx)):
+            return None
+        return mn, mx
+
+    def _try_extent(prim_obj: Any) -> Optional[tuple[np.ndarray, np.ndarray]]:
+        xform = UsdGeom.Xformable(prim_obj)
+        wtf = xform.ComputeLocalToWorldTransform(tc)
+        if prim_obj.IsA(UsdGeom.Cube):
+            cube = UsdGeom.Cube(prim_obj)
+            size_val = cube.GetSizeAttr().Get(tc)
+            if size_val is None:
+                size_val = 2.0
+            half = float(size_val) / 2.0
+            return _xform_extent_corners(Gf.Vec3d(-half, -half, -half), Gf.Vec3d(half, half, half), wtf)
+        extent_attr = prim_obj.GetAttribute("extent")
+        if not extent_attr or not extent_attr.HasValue():
+            return None
+        extent_val = extent_attr.Get(tc)
+        if extent_val is None or len(extent_val) < 2:
+            return None
+        lo = Gf.Vec3d(float(extent_val[0][0]), float(extent_val[0][1]), float(extent_val[0][2]))
+        hi = Gf.Vec3d(float(extent_val[1][0]), float(extent_val[1][1]), float(extent_val[1][2]))
+        return _xform_extent_corners(lo, hi, wtf)
+
+    result = _try_extent(prim)
+    if result is not None:
+        return result
+
+    merged_min: Optional[np.ndarray] = None
+    merged_max: Optional[np.ndarray] = None
+    for child in Usd.PrimRange(prim):
+        if child == prim or not child.IsValid():
+            continue
+        child_bbox = _try_extent(child)
+        if child_bbox is None:
+            continue
+        child_min, child_max = child_bbox
+        merged_min = child_min if merged_min is None else np.minimum(merged_min, child_min)
+        merged_max = child_max if merged_max is None else np.maximum(merged_max, child_max)
+    if merged_min is None or merged_max is None:
+        return None
+    return merged_min.astype(np.float32), merged_max.astype(np.float32)
+
+
+def _joint_side_and_index(name: str) -> tuple[Optional[str], Optional[int]]:
+    low = str(name or "").lower()
+    if "finger" in low:
+        return None, None
+    side: Optional[str] = None
+    if "left" in low:
+        side = "left"
+    elif "right" in low:
+        side = "right"
+    match = re.search(r"joint[_]?(\d+)", low) or re.search(r"(\d+)$", low)
+    index = int(match.group(1)) if match else None
+    return side, index
+
+
+def _joint_key(name: str) -> Optional[str]:
+    side, index = _joint_side_and_index(name)
+    if side is None or index is None:
+        return None
+    return f"{side}_{index}"
+
+
+def _get_robot_dof_names(robot: Any) -> list[str]:
+    names = getattr(robot, "dof_names", None)
+    if names is None:
+        return []
+    return [str(name) for name in names]
+
+
+def _resolve_openarm_arm_mapping(robot: Any, curobo_joint_names: Sequence[str]) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    sim_name_to_index: dict[str, int] = {}
+    for index, name in enumerate(_get_robot_dof_names(robot)):
+        key = _joint_key(name)
+        if key is not None:
+            sim_name_to_index[key] = index
+
+    mapped: list[int] = []
+    left_indices: list[int] = []
+    right_indices: list[int] = []
+    mapping_ok = True
+    for curobo_index, name in enumerate(curobo_joint_names):
+        key = _joint_key(str(name))
+        sim_index = sim_name_to_index.get(key) if key is not None else None
+        if sim_index is None:
+            mapping_ok = False
+            break
+        mapped.append(sim_index)
+        if key.startswith("left_"):
+            left_indices.append(curobo_index)
+        elif key.startswith("right_"):
+            right_indices.append(curobo_index)
+
+    if mapping_ok and mapped:
+        return (
+            np.asarray(mapped, dtype=np.int64),
+            np.asarray(left_indices, dtype=np.int64),
+            np.asarray(right_indices, dtype=np.int64),
+        )
+
+    LOG.warning("Falling back to default OpenArm sim↔cuRobo joint order mapping.")
+    return (
+        DEFAULT_CUROBO_TO_SIM_ARM.copy(),
+        np.arange(LEFT_ARM_CUROBO_SLICE.start, LEFT_ARM_CUROBO_SLICE.stop, dtype=np.int64),
+        np.arange(RIGHT_ARM_CUROBO_SLICE.start, RIGHT_ARM_CUROBO_SLICE.stop, dtype=np.int64),
+    )
+
+
+def _resolve_openarm_curobo_paths() -> tuple[Path, Optional[Path]]:
+    config_candidates = [
+        Path(os.environ.get("OPENARM_CUROBO_CONFIG", "")).expanduser() if os.environ.get("OPENARM_CUROBO_CONFIG") else None,
+        DEFAULT_CUROBO_CONFIG_PATH,
+        SCRIPT_DIR / "openarm.yml",
+    ]
+    config_path = next((path for path in config_candidates if path is not None and path.exists()), None)
+    if config_path is None:
+        raise FileNotFoundError(f"OpenArm cuRobo config not found. Tried: {[str(p) for p in config_candidates if p is not None]}")
+
+    urdf_candidates = [
+        Path(os.environ.get("OPENARM_CUROBO_URDF", "")).expanduser() if os.environ.get("OPENARM_CUROBO_URDF") else None,
+        DEFAULT_CUROBO_URDF_PATH,
+        config_path.parent / "openarm_bimanual.urdf",
+        config_path.parent / "robot" / "openarm_config" / "openarm_bimanual.urdf",
+    ]
+    urdf_path = next((path for path in urdf_candidates if path is not None and path.exists()), None)
+    return config_path, urdf_path
+
+
+def _build_openarm_curobo_robot_cfg(config_path: Path, urdf_path: Optional[Path], left_lock_joints: dict[str, float]) -> dict[str, Any]:
+    from curobo.util_file import load_yaml
+
+    robot_yaml = load_yaml(str(config_path))
+    robot_cfg = dict(robot_yaml.get("robot_cfg") or {})
+    kin_cfg = dict(robot_cfg.get("kinematics") or {})
+    kin_cfg["ee_link"] = CUROBO_RIGHT_EE_LINK
+    kin_cfg["link_names"] = [CUROBO_RIGHT_EE_LINK]
+    kin_cfg["lock_joints"] = {str(name): float(value) for name, value in left_lock_joints.items()}
+    kin_cfg["asset_root_path"] = str(config_path.parent)
+    if urdf_path is not None:
+        kin_cfg["urdf_path"] = str(urdf_path)
+    robot_cfg["kinematics"] = kin_cfg
+    return robot_cfg
+
+
+def _extract_curobo_world_config(
+    stage: Any,
+    robot_prim_path: str,
+    table_prim_path: Optional[str],
+    include_table: bool = True,
+) -> Any:
+    from curobo.geom.types import Cuboid, WorldConfig
+
+    cuboids: list[Cuboid] = []
+    robot_pos, robot_quat = _get_prim_world_pose(stage, robot_prim_path)
+    rot_inv = _quat_to_rot_wxyz(robot_quat).T
+
+    if include_table and table_prim_path:
+        bbox = _compute_prim_bbox(stage, table_prim_path)
+        if bbox is not None:
+            mn, mx = bbox
+            dims = (mx - mn).astype(np.float32)
+            center_world = 0.5 * (mn + mx)
+            center_robot = (rot_inv @ (center_world - robot_pos[:3])).astype(np.float32)
+            center_robot[2] -= 0.02
+            cuboids.append(
+                Cuboid(
+                    name="table",
+                    pose=[
+                        float(center_robot[0]),
+                        float(center_robot[1]),
+                        float(center_robot[2]),
+                        1.0,
+                        0.0,
+                        0.0,
+                        0.0,
+                    ],
+                    dims=[float(dims[0]), float(dims[1]), float(dims[2])],
+                )
+            )
+
+    if not cuboids:
+        cuboids.append(
+            Cuboid(
+                name="dummy",
+                pose=[0.0, 0.0, -5.0, 1.0, 0.0, 0.0, 0.0],
+                dims=[0.01, 0.01, 0.01],
+            )
+        )
+    return WorldConfig(cuboid=cuboids)
+
+
+def _sample_pose_at_arm_target(
+    robot: Any,
+    stage: Any,
+    eef_prim_path: str,
+    world: Any,
+    simulation_app: Any,
+    arm_target: np.ndarray,
+    finger_target: float = GRIPPER_OPEN,
+) -> PoseSample:
+    current_full = _to_numpy(robot.get_joint_positions())
+    full_target = _compose_full_target(current_full, arm_target, finger_target)
+    _apply_joint_targets(robot, full_target, physics_control=False)
+    _step_world(world, simulation_app, render=True, steps=4)
+    pos, quat = _get_prim_world_pose(stage, eef_prim_path)
+    return PoseSample(position_world=pos.astype(np.float32), orientation=_normalize_quat_wxyz(quat))
+
+
+def _sample_pose_references(
+    world: Any,
+    simulation_app: Any,
+    robot: Any,
+    stage: Any,
+    eef_prim_path: str,
+) -> dict[str, PoseSample]:
+    current_full = _to_numpy(robot.get_joint_positions())
+    samples = {
+        "home": _sample_pose_at_arm_target(robot, stage, eef_prim_path, world, simulation_app, HOME_RIGHT_ARM, GRIPPER_OPEN),
+        "pre_grasp": _sample_pose_at_arm_target(robot, stage, eef_prim_path, world, simulation_app, BASE_APPROACH_RIGHT, GRIPPER_OPEN),
+        "grasp": _sample_pose_at_arm_target(robot, stage, eef_prim_path, world, simulation_app, BASE_GRASP_RIGHT, GRIPPER_OPEN),
+        "lift": _sample_pose_at_arm_target(robot, stage, eef_prim_path, world, simulation_app, BASE_LIFT_RIGHT, GRIPPER_CLOSED),
+        "bowl": _sample_pose_at_arm_target(robot, stage, eef_prim_path, world, simulation_app, BASE_BOWL_RIGHT, GRIPPER_CLOSED),
+        "place": _sample_pose_at_arm_target(robot, stage, eef_prim_path, world, simulation_app, BASE_PLACE_RIGHT, GRIPPER_CLOSED),
+    }
+    _apply_joint_targets(robot, current_full, physics_control=False)
+    _step_world(world, simulation_app, render=True, steps=4)
+    return samples
+
+
 def _sim_arm_to_dataset(arm_sim: np.ndarray) -> np.ndarray:
     arm_sim = np.asarray(arm_sim, dtype=np.float32).reshape(-1)
     if arm_sim.size < 7:
@@ -527,6 +880,424 @@ def _build_episode_waypoints(cube_pos: np.ndarray, bowl_pos: np.ndarray) -> list
     ]
 
 
+def _build_episode_cartesian_targets(
+    cube_pos: np.ndarray,
+    bowl_pos: np.ndarray,
+    pose_samples: dict[str, PoseSample],
+) -> dict[str, tuple[np.ndarray, np.ndarray]]:
+    def _sample_offset(sample_name: str, anchor: np.ndarray) -> np.ndarray:
+        return (pose_samples[sample_name].position_world - anchor).astype(np.float32)
+
+    cube_anchor = np.asarray(cube_pos, dtype=np.float32)
+    bowl_anchor = np.asarray(bowl_pos, dtype=np.float32)
+    return {
+        "pre_grasp": (
+            cube_anchor + _sample_offset("pre_grasp", DEFAULT_CUBE_POS),
+            pose_samples["pre_grasp"].orientation.copy(),
+        ),
+        "grasp": (
+            cube_anchor + _sample_offset("grasp", DEFAULT_CUBE_POS),
+            pose_samples["grasp"].orientation.copy(),
+        ),
+        "lift": (
+            cube_anchor + _sample_offset("lift", DEFAULT_CUBE_POS),
+            pose_samples["lift"].orientation.copy(),
+        ),
+        "bowl": (
+            bowl_anchor + _sample_offset("bowl", DEFAULT_BOWL_POS),
+            pose_samples["bowl"].orientation.copy(),
+        ),
+        "place": (
+            bowl_anchor + _sample_offset("place", DEFAULT_BOWL_POS),
+            pose_samples["place"].orientation.copy(),
+        ),
+    }
+
+
+def _init_openarm_curobo(
+    stage: Any,
+    robot: Any,
+    robot_prim_path: str,
+    table_prim_path: Optional[str],
+) -> Optional[dict[str, Any]]:
+    try:
+        import torch
+        from curobo.geom.sdf.world import CollisionCheckerType
+        from curobo.types.base import TensorDeviceType
+        from curobo.wrap.reacher.ik_solver import IKSolver, IKSolverConfig
+        from curobo.wrap.reacher.motion_gen import MotionGen, MotionGenConfig, MotionGenPlanConfig
+    except Exception as exc:
+        LOG.warning("cuRobo unavailable, using waypoint fallback only: %s", exc)
+        return None
+
+    try:
+        config_path, urdf_path = _resolve_openarm_curobo_paths()
+        sim_names = _get_robot_dof_names(robot)
+        left_lock_joints: dict[str, float] = {}
+        for sim_index, name in enumerate(sim_names):
+            side, joint_idx = _joint_side_and_index(name)
+            if side == "left" and joint_idx is not None and sim_index < HOME_FULL.size:
+                left_lock_joints[str(name)] = float(HOME_FULL[sim_index])
+
+        tensor_args = TensorDeviceType(device=torch.device("cuda:0"))
+        world_cfg = _extract_curobo_world_config(
+            stage=stage,
+            robot_prim_path=robot_prim_path,
+            table_prim_path=table_prim_path,
+            include_table=True,
+        )
+        robot_cfg = _build_openarm_curobo_robot_cfg(config_path, urdf_path, left_lock_joints)
+
+        mg_cfg = MotionGenConfig.load_from_robot_config(
+            robot_cfg,
+            [world_cfg],
+            tensor_args,
+            collision_checker_type=CollisionCheckerType.PRIMITIVE,
+            use_cuda_graph=False,
+            interpolation_dt=0.03,
+            collision_cache={"obb": 16, "mesh": 2},
+            collision_activation_distance=0.015,
+            maximum_trajectory_dt=0.25,
+            n_collision_envs=1,
+        )
+        motion_gen = MotionGen(mg_cfg)
+        motion_gen.warmup(warmup_js_trajopt=False)
+
+        ik_cfg = IKSolverConfig.load_from_robot_config(
+            robot_cfg,
+            world_cfg,
+            tensor_args=tensor_args,
+            collision_checker_type=CollisionCheckerType.PRIMITIVE,
+            use_cuda_graph=False,
+            num_seeds=32,
+            self_collision_check=True,
+            self_collision_opt=True,
+            position_threshold=0.005,
+            rotation_threshold=0.05,
+        )
+        ik_solver = IKSolver(ik_cfg)
+
+        curobo_joint_names = [str(name) for name in motion_gen.kinematics.joint_names]
+        curobo_to_sim_arm, left_curobo_indices, right_curobo_indices = _resolve_openarm_arm_mapping(
+            robot=robot,
+            curobo_joint_names=curobo_joint_names,
+        )
+        home_curobo = HOME_FULL[curobo_to_sim_arm].astype(np.float32, copy=True)
+
+        state = {
+            "motion_gen": motion_gen,
+            "ik_solver": ik_solver,
+            "plan_config": MotionGenPlanConfig(
+                enable_graph=True,
+                enable_graph_attempt=3,
+                max_attempts=16,
+                enable_finetune_trajopt=True,
+            ),
+            "tensor_args": tensor_args,
+            "curobo_joint_names": curobo_joint_names,
+            "curobo_to_sim_arm": curobo_to_sim_arm,
+            "left_curobo_indices": left_curobo_indices,
+            "right_curobo_indices": right_curobo_indices,
+            "home_curobo": home_curobo,
+            "config_path": str(config_path),
+            "urdf_path": str(urdf_path) if urdf_path is not None else None,
+        }
+        LOG.info(
+            "OpenArm cuRobo initialised: config=%s ee_link=%s joints=%s",
+            config_path,
+            CUROBO_RIGHT_EE_LINK,
+            curobo_joint_names,
+        )
+        return state
+    except Exception as exc:
+        LOG.warning("OpenArm cuRobo init failed, using waypoint fallback: %s", exc)
+        return None
+
+
+def _update_openarm_curobo_world(
+    curobo_state: dict[str, Any],
+    stage: Any,
+    robot_prim_path: str,
+    table_prim_path: Optional[str],
+) -> None:
+    world_cfg = _extract_curobo_world_config(
+        stage=stage,
+        robot_prim_path=robot_prim_path,
+        table_prim_path=table_prim_path,
+        include_table=True,
+    )
+    curobo_state["motion_gen"].world_coll_checker.load_collision_model(world_cfg, env_idx=0)
+    curobo_state["ik_solver"].world_coll_checker.load_collision_model(world_cfg, env_idx=0)
+
+
+def _full_to_curobo_arm_target(full_joint_positions: np.ndarray, curobo_state: dict[str, Any]) -> np.ndarray:
+    full_joint_positions = _to_numpy(full_joint_positions, dtype=np.float32).reshape(-1)
+    return full_joint_positions[curobo_state["curobo_to_sim_arm"]].astype(np.float32, copy=True)
+
+
+def _compose_full_target_from_curobo(
+    current_full: np.ndarray,
+    curobo_arm_target: np.ndarray,
+    curobo_state: dict[str, Any],
+    finger_target: float,
+) -> np.ndarray:
+    targets = _to_numpy(current_full, dtype=np.float32).copy()
+    targets[curobo_state["curobo_to_sim_arm"]] = _to_numpy(curobo_arm_target, dtype=np.float32)[: len(curobo_state["curobo_to_sim_arm"])]
+    targets[RIGHT_FINGER_INDICES] = float(finger_target)
+    return targets
+
+
+def _solve_openarm_curobo_ik(
+    curobo_state: dict[str, Any],
+    current_curobo: np.ndarray,
+    target_pos_world: np.ndarray,
+    target_quat_world: np.ndarray,
+    robot_base_pos: np.ndarray,
+    robot_base_quat: np.ndarray,
+) -> Optional[np.ndarray]:
+    from curobo.types.math import Pose
+
+    solver = curobo_state.get("ik_solver")
+    if solver is None:
+        return None
+
+    pos_robot, quat_robot = _world_to_robot_frame(
+        target_pos_world,
+        target_quat_world,
+        robot_base_pos,
+        robot_base_quat,
+    )
+    ta = curobo_state["tensor_args"]
+    retract = ta.to_device(_to_numpy(current_curobo, dtype=np.float32).tolist()).view(1, -1)
+    goal = Pose(
+        position=ta.to_device(pos_robot.tolist()).view(1, 3),
+        quaternion=ta.to_device(quat_robot.tolist()).view(1, 4),
+    )
+    try:
+        result = solver.solve_single(
+            goal,
+            retract_config=retract,
+            seed_config=retract.view(1, 1, -1),
+            return_seeds=1,
+            use_nn_seed=False,
+        )
+    except Exception as exc:
+        LOG.warning("OpenArm cuRobo IK exception: %s", exc)
+        return None
+
+    success = getattr(result, "success", None)
+    if success is None or not bool(_to_numpy(success).reshape(-1)[0]):
+        return None
+
+    solution = None
+    js_solution = getattr(result, "js_solution", None)
+    if js_solution is not None:
+        solution = getattr(js_solution, "position", None)
+    if solution is None:
+        solution = getattr(result, "solution", None)
+    solution_np = _to_numpy(solution, dtype=np.float32).reshape(-1)
+    if solution_np.size < len(curobo_state["curobo_joint_names"]):
+        return None
+    return solution_np[: len(curobo_state["curobo_joint_names"])].astype(np.float32, copy=True)
+
+
+def _plan_openarm_curobo_segment(
+    curobo_state: dict[str, Any],
+    current_full: np.ndarray,
+    target_pos_world: np.ndarray,
+    target_quat_world: np.ndarray,
+    robot_base_pos: np.ndarray,
+    robot_base_quat: np.ndarray,
+) -> Optional[np.ndarray]:
+    from curobo.types.math import Pose
+    from curobo.types.state import JointState
+
+    motion_gen = curobo_state["motion_gen"]
+    ta = curobo_state["tensor_args"]
+    current_curobo = _full_to_curobo_arm_target(current_full, curobo_state)
+    current_curobo[curobo_state["left_curobo_indices"]] = curobo_state["home_curobo"][curobo_state["left_curobo_indices"]]
+    pos_robot, quat_robot = _world_to_robot_frame(
+        target_pos_world,
+        target_quat_world,
+        robot_base_pos,
+        robot_base_quat,
+    )
+    joint_state = JointState(
+        position=ta.to_device(current_curobo.tolist()).view(1, -1),
+        velocity=ta.to_device((current_curobo * 0.0).tolist()).view(1, -1),
+        acceleration=ta.to_device((current_curobo * 0.0).tolist()).view(1, -1),
+        jerk=ta.to_device((current_curobo * 0.0).tolist()).view(1, -1),
+        joint_names=curobo_state["curobo_joint_names"],
+    )
+    goal = Pose(
+        position=ta.to_device(pos_robot.tolist()).view(1, 3),
+        quaternion=ta.to_device(quat_robot.tolist()).view(1, 4),
+    )
+    try:
+        result = motion_gen.plan_single(joint_state, goal, curobo_state["plan_config"].clone())
+    except Exception as exc:
+        LOG.warning("OpenArm cuRobo plan exception: %s", exc)
+        return None
+    if result.success is None or not bool(result.success.item()):
+        LOG.warning("OpenArm cuRobo plan failed: status=%s", getattr(result, "status", None))
+        return None
+    traj = motion_gen.get_full_js(result.get_interpolated_plan()).position.cpu().numpy().astype(np.float32)
+    traj[:, curobo_state["left_curobo_indices"]] = curobo_state["home_curobo"][curobo_state["left_curobo_indices"]]
+    return traj[:, : len(curobo_state["curobo_joint_names"])]
+
+
+def _plan_openarm_linear_ik_segment(
+    curobo_state: dict[str, Any],
+    current_full: np.ndarray,
+    stage: Any,
+    eef_prim_path: str,
+    target_pos_world: np.ndarray,
+    target_quat_world: np.ndarray,
+    robot_base_pos: np.ndarray,
+    robot_base_quat: np.ndarray,
+    n_waypoints: int,
+) -> Optional[np.ndarray]:
+    start_pos, start_quat = _get_prim_world_pose(stage, eef_prim_path)
+    prev_q = _full_to_curobo_arm_target(current_full, curobo_state)
+    prev_q[curobo_state["left_curobo_indices"]] = curobo_state["home_curobo"][curobo_state["left_curobo_indices"]]
+    waypoints: list[np.ndarray] = []
+    max_joint_jump = 0.5
+    for index in range(1, n_waypoints + 1):
+        alpha = float(index) / float(n_waypoints)
+        wp_pos = ((1.0 - alpha) * start_pos + alpha * _to_numpy(target_pos_world, dtype=np.float32)).astype(np.float32)
+        wp_quat = _slerp_quat(start_quat, target_quat_world, alpha)
+        q = _solve_openarm_curobo_ik(
+            curobo_state=curobo_state,
+            current_curobo=prev_q,
+            target_pos_world=wp_pos,
+            target_quat_world=wp_quat,
+            robot_base_pos=robot_base_pos,
+            robot_base_quat=robot_base_quat,
+        )
+        if q is None:
+            LOG.warning("OpenArm cuRobo linear IK failed at waypoint %d/%d", index, n_waypoints)
+            return None
+        jump = float(np.max(np.abs(q - prev_q)))
+        if jump > max_joint_jump:
+            q = prev_q + np.clip(q - prev_q, -max_joint_jump, max_joint_jump)
+        q[curobo_state["left_curobo_indices"]] = curobo_state["home_curobo"][curobo_state["left_curobo_indices"]]
+        waypoints.append(q.astype(np.float32, copy=True))
+        prev_q = q.astype(np.float32, copy=True)
+    return np.stack(waypoints, axis=0) if waypoints else None
+
+
+def _execute_openarm_curobo_trajectory(
+    robot: Any,
+    world: Any,
+    simulation_app: Any,
+    curobo_state: dict[str, Any],
+    trajectory: np.ndarray,
+    gripper_target: float,
+    record_fn: Callable[[np.ndarray, float, bool], None],
+    timeout_fn: Callable[[], bool],
+    stop_event: threading.Event,
+    settle_steps: int = CUROBO_SETTLE_STEPS,
+    mark_last: bool = False,
+) -> bool:
+    final_full_target: Optional[np.ndarray] = None
+    for index in range(trajectory.shape[0]):
+        if stop_event.is_set() or timeout_fn():
+            return False
+        current_full = _to_numpy(robot.get_joint_positions())
+        final_full_target = _compose_full_target_from_curobo(
+            current_full=current_full,
+            curobo_arm_target=trajectory[index],
+            curobo_state=curobo_state,
+            finger_target=gripper_target,
+        )
+        _apply_joint_targets(robot, final_full_target, physics_control=False)
+        _step_world(world, simulation_app, render=True, steps=1)
+        is_last = mark_last and index == (trajectory.shape[0] - 1) and settle_steps <= 0
+        record_fn(final_full_target[RIGHT_ARM_INDICES], gripper_target, is_last)
+
+    if final_full_target is None:
+        return False
+    for settle_index in range(settle_steps):
+        if stop_event.is_set() or timeout_fn():
+            return False
+        _apply_joint_targets(robot, final_full_target, physics_control=False)
+        _step_world(world, simulation_app, render=True, steps=1)
+        is_last = mark_last and settle_index == (settle_steps - 1)
+        record_fn(final_full_target[RIGHT_ARM_INDICES], gripper_target, is_last)
+    return True
+
+
+def _hold_current_pose(
+    robot: Any,
+    world: Any,
+    simulation_app: Any,
+    gripper_target: float,
+    hold_steps: int,
+    record_fn: Callable[[np.ndarray, float, bool], None],
+    timeout_fn: Callable[[], bool],
+    stop_event: threading.Event,
+    mark_last: bool = False,
+) -> bool:
+    current_full = _to_numpy(robot.get_joint_positions())
+    current_full[RIGHT_FINGER_INDICES] = float(gripper_target)
+    for step in range(max(1, int(hold_steps))):
+        if stop_event.is_set() or timeout_fn():
+            return False
+        _apply_joint_targets(robot, current_full, physics_control=False)
+        _step_world(world, simulation_app, render=True, steps=1)
+        is_last = mark_last and step == (max(1, int(hold_steps)) - 1)
+        record_fn(current_full[RIGHT_ARM_INDICES], gripper_target, is_last)
+    return True
+
+
+def _run_waypoint_fallback(
+    cube_pos: np.ndarray,
+    bowl_pos: np.ndarray,
+    ctx: CollectorContext,
+    world: Any,
+    simulation_app: Any,
+    steps_per_segment: int,
+    stop_event: threading.Event,
+    timeout_fn: Callable[[], bool],
+    record_fn: Callable[[np.ndarray, float, bool], None],
+    attach_state: dict[str, bool],
+) -> bool:
+    waypoints = _build_episode_waypoints(cube_pos=cube_pos, bowl_pos=bowl_pos)
+    current_full = _to_numpy(ctx.robot.get_joint_positions())
+    current_arm = current_full[RIGHT_ARM_INDICES].astype(np.float32, copy=True)
+    current_gripper = float(np.mean(current_full[RIGHT_FINGER_INDICES]))
+    fallback_points = [("current", current_arm, current_gripper, 12)] + waypoints
+
+    for transition_index, (start_wp, end_wp) in enumerate(zip(fallback_points[:-1], fallback_points[1:])):
+        _, start_arm, start_gripper, _ = start_wp
+        end_name, end_arm, end_gripper, end_steps = end_wp
+        seg_steps = max(
+            1,
+            int(round(float(end_steps) * float(steps_per_segment) / float(STEPS_PER_SEGMENT))),
+        )
+        for step in range(seg_steps):
+            if stop_event.is_set() or timeout_fn():
+                return False
+            alpha = float(step + 1) / float(seg_steps)
+            arm_target = ((1.0 - alpha) * start_arm + alpha * end_arm).astype(np.float32)
+            gripper_target = float((1.0 - alpha) * start_gripper + alpha * end_gripper)
+            current_full = _to_numpy(ctx.robot.get_joint_positions())
+            full_target = _compose_full_target(current_full, arm_target, gripper_target)
+            _apply_joint_targets(ctx.robot, full_target, physics_control=False)
+            _step_world(world, simulation_app, render=True, steps=1)
+            is_last = transition_index == (len(fallback_points) - 2) and step == (seg_steps - 1)
+            record_fn(arm_target, gripper_target, is_last)
+        if end_name == "close" and not attach_state["attached"] and _should_attach(ctx.stage, ctx.right_eef_prim_path, ctx.cube_prim_path):
+            if ctx.cube_prim_path:
+                attach_state["attached"] = _create_attachment_joint(ctx.stage, ctx.right_eef_prim_path, ctx.cube_prim_path)
+                _step_world(world, simulation_app, render=True, steps=4)
+        if end_name == "place_open" and attach_state["attached"]:
+            _remove_prim_if_exists(ctx.stage, ATTACHMENT_JOINT_PATH)
+            attach_state["attached"] = False
+            _step_world(world, simulation_app, render=True, steps=4)
+    return True
+
+
 def _create_attachment_joint(stage: Any, eef_prim_path: str, cube_prim_path: str) -> bool:
     from pxr import UsdPhysics
 
@@ -605,6 +1376,7 @@ def _setup_scene_context(
 
     cube_prim_path = _find_named_prim(stage, ("cube", "cuboid"))
     bowl_prim_path = _find_named_prim(stage, ("bowl",))
+    table_prim_path = _find_named_prim(stage, ("table", "desk", "bench", "work"))
 
     cube_base_pos = _get_prim_world_pose(stage, cube_prim_path)[0] if cube_prim_path else DEFAULT_CUBE_POS.copy()
     bowl_base_pos = _get_prim_world_pose(stage, bowl_prim_path)[0] if bowl_prim_path else DEFAULT_BOWL_POS.copy()
@@ -614,6 +1386,13 @@ def _setup_scene_context(
 
     render_product, annotator = _setup_right_wrist_camera(stage, right_camera_path, camera_cfg)
     _step_world(world, simulation_app, render=True, steps=3)
+    pose_samples = _sample_pose_references(world, simulation_app, robot, stage, right_eef_prim_path)
+    curobo_state = _init_openarm_curobo(
+        stage=stage,
+        robot=robot,
+        robot_prim_path=robot_prim_path,
+        table_prim_path=table_prim_path,
+    )
 
     return CollectorContext(
         stage=stage,
@@ -623,11 +1402,14 @@ def _setup_scene_context(
         right_eef_prim_path=right_eef_prim_path,
         cube_prim_path=cube_prim_path,
         bowl_prim_path=bowl_prim_path,
+        table_prim_path=table_prim_path,
         right_wrist_camera_path=right_camera_path,
         right_wrist_render_product=render_product,
         right_wrist_annotator=annotator,
         cube_base_pos=np.asarray(cube_base_pos, dtype=np.float32),
         bowl_base_pos=np.asarray(bowl_base_pos, dtype=np.float32),
+        pose_samples=pose_samples,
+        curobo_state=curobo_state,
     )
 
 
@@ -665,69 +1447,247 @@ def _run_episode(
     _apply_joint_targets(ctx.robot, home_targets, physics_control=False)
     _step_world(world, simulation_app, render=True, steps=10)
 
-    waypoints = _build_episode_waypoints(cube_pos=cube_pos, bowl_pos=bowl_pos)
     frame_index = 0
-    attached = False
+    attach_state = {"attached": False}
     episode_start = time.time()
+    robot_base_pos, robot_base_quat = _get_prim_world_pose(ctx.stage, ctx.robot_prim_path)
 
-    for transition_index, (start_wp, end_wp) in enumerate(zip(waypoints[:-1], waypoints[1:])):
-        start_name, start_arm, start_gripper, _ = start_wp
-        end_name, end_arm, end_gripper, end_steps = end_wp
-        seg_steps = max(
-            1,
-            int(round(float(end_steps) * float(steps_per_segment) / float(STEPS_PER_SEGMENT))),
+    def timeout_fn() -> bool:
+        if episode_timeout_sec <= 0.0:
+            return False
+        return (time.time() - episode_start) > episode_timeout_sec
+
+    def record_step(arm_target: np.ndarray, gripper_target: float, is_last: bool = False) -> None:
+        nonlocal frame_index
+        obs_state = _full_to_dataset_state(_to_numpy(ctx.robot.get_joint_positions()))
+        action = np.concatenate(
+            [_sim_arm_to_dataset(np.asarray(arm_target, dtype=np.float32)), np.array([gripper_target], dtype=np.float32)],
+            axis=0,
         )
+        writer.add_frame(
+            episode_index=episode_index,
+            frame_index=frame_index,
+            observation_state=obs_state,
+            action=action.astype(np.float32),
+            timestamp=frame_index / float(fps),
+            next_done=is_last,
+        )
+        writer.add_video_frame("right_wrist_cam", _capture_rgb(ctx.right_wrist_annotator))
+        frame_index += 1
 
-        for step in range(seg_steps):
-            if stop_event.is_set():
-                return frame_index, True, False
-            if episode_timeout_sec > 0.0 and (time.time() - episode_start) > episode_timeout_sec:
-                LOG.warning("Episode %d timed out after %.2fs", episode_index, time.time() - episode_start)
-                return frame_index, False, False
-
-            alpha = float(step + 1) / float(seg_steps)
-            arm_target = ((1.0 - alpha) * start_arm + alpha * end_arm).astype(np.float32)
-            gripper_target = float((1.0 - alpha) * start_gripper + alpha * end_gripper)
-            current_full = _to_numpy(ctx.robot.get_joint_positions())
-            full_target = _compose_full_target(current_full, arm_target, gripper_target)
-
-            _apply_joint_targets(ctx.robot, full_target, physics_control=False)
-            _step_world(world, simulation_app, render=True, steps=1)
-
-            obs_state = _full_to_dataset_state(_to_numpy(ctx.robot.get_joint_positions()))
-            action = np.concatenate(
-                [_sim_arm_to_dataset(arm_target), np.array([gripper_target], dtype=np.float32)],
-                axis=0,
+    used_curobo = False
+    if ctx.curobo_state is not None and ctx.pose_samples:
+        targets = _build_episode_cartesian_targets(cube_pos=cube_pos, bowl_pos=bowl_pos, pose_samples=ctx.pose_samples)
+        try:
+            _update_openarm_curobo_world(
+                curobo_state=ctx.curobo_state,
+                stage=ctx.stage,
+                robot_prim_path=ctx.robot_prim_path,
+                table_prim_path=ctx.table_prim_path,
             )
-            is_last = transition_index == (len(waypoints) - 2) and step == (seg_steps - 1)
-            writer.add_frame(
-                episode_index=episode_index,
-                frame_index=frame_index,
-                observation_state=obs_state,
-                action=action.astype(np.float32),
-                timestamp=frame_index / float(fps),
-                next_done=is_last,
+            traj_pre_grasp = _plan_openarm_curobo_segment(
+                curobo_state=ctx.curobo_state,
+                current_full=_to_numpy(ctx.robot.get_joint_positions()),
+                target_pos_world=targets["pre_grasp"][0],
+                target_quat_world=targets["pre_grasp"][1],
+                robot_base_pos=robot_base_pos,
+                robot_base_quat=robot_base_quat,
             )
-            writer.add_video_frame("right_wrist_cam", _capture_rgb(ctx.right_wrist_annotator))
-            frame_index += 1
+            if traj_pre_grasp is None:
+                raise RuntimeError("home->pre_grasp planning failed")
+            if not _execute_openarm_curobo_trajectory(
+                robot=ctx.robot,
+                world=world,
+                simulation_app=simulation_app,
+                curobo_state=ctx.curobo_state,
+                trajectory=traj_pre_grasp,
+                gripper_target=GRIPPER_OPEN,
+                record_fn=record_step,
+                timeout_fn=timeout_fn,
+                stop_event=stop_event,
+            ):
+                raise RuntimeError("home->pre_grasp execution failed")
 
-        if end_name == "close" and not attached and _should_attach(ctx.stage, ctx.right_eef_prim_path, ctx.cube_prim_path):
-            if ctx.cube_prim_path:
-                attached = _create_attachment_joint(ctx.stage, ctx.right_eef_prim_path, ctx.cube_prim_path)
+            traj_grasp = _plan_openarm_linear_ik_segment(
+                curobo_state=ctx.curobo_state,
+                current_full=_to_numpy(ctx.robot.get_joint_positions()),
+                stage=ctx.stage,
+                eef_prim_path=ctx.right_eef_prim_path,
+                target_pos_world=targets["grasp"][0],
+                target_quat_world=targets["grasp"][1],
+                robot_base_pos=robot_base_pos,
+                robot_base_quat=robot_base_quat,
+                n_waypoints=PRE_GRASP_IK_WAYPOINTS,
+            )
+            if traj_grasp is None:
+                raise RuntimeError("pre_grasp->grasp IK failed")
+            if not _execute_openarm_curobo_trajectory(
+                robot=ctx.robot,
+                world=world,
+                simulation_app=simulation_app,
+                curobo_state=ctx.curobo_state,
+                trajectory=traj_grasp,
+                gripper_target=GRIPPER_OPEN,
+                record_fn=record_step,
+                timeout_fn=timeout_fn,
+                stop_event=stop_event,
+            ):
+                raise RuntimeError("pre_grasp->grasp execution failed")
+
+            if not _hold_current_pose(
+                robot=ctx.robot,
+                world=world,
+                simulation_app=simulation_app,
+                gripper_target=GRIPPER_CLOSED,
+                hold_steps=max(1, int(round(10 * float(steps_per_segment) / float(STEPS_PER_SEGMENT)))),
+                record_fn=record_step,
+                timeout_fn=timeout_fn,
+                stop_event=stop_event,
+            ):
+                raise RuntimeError("gripper close failed")
+            if not attach_state["attached"] and _should_attach(ctx.stage, ctx.right_eef_prim_path, ctx.cube_prim_path):
+                if ctx.cube_prim_path:
+                    attach_state["attached"] = _create_attachment_joint(ctx.stage, ctx.right_eef_prim_path, ctx.cube_prim_path)
+                    _step_world(world, simulation_app, render=True, steps=4)
+
+            traj_lift = _plan_openarm_linear_ik_segment(
+                curobo_state=ctx.curobo_state,
+                current_full=_to_numpy(ctx.robot.get_joint_positions()),
+                stage=ctx.stage,
+                eef_prim_path=ctx.right_eef_prim_path,
+                target_pos_world=targets["lift"][0],
+                target_quat_world=targets["lift"][1],
+                robot_base_pos=robot_base_pos,
+                robot_base_quat=robot_base_quat,
+                n_waypoints=LIFT_IK_WAYPOINTS,
+            )
+            if traj_lift is None:
+                raise RuntimeError("lift IK failed")
+            if not _execute_openarm_curobo_trajectory(
+                robot=ctx.robot,
+                world=world,
+                simulation_app=simulation_app,
+                curobo_state=ctx.curobo_state,
+                trajectory=traj_lift,
+                gripper_target=GRIPPER_CLOSED,
+                record_fn=record_step,
+                timeout_fn=timeout_fn,
+                stop_event=stop_event,
+            ):
+                raise RuntimeError("lift execution failed")
+
+            traj_bowl = _plan_openarm_curobo_segment(
+                curobo_state=ctx.curobo_state,
+                current_full=_to_numpy(ctx.robot.get_joint_positions()),
+                target_pos_world=targets["bowl"][0],
+                target_quat_world=targets["bowl"][1],
+                robot_base_pos=robot_base_pos,
+                robot_base_quat=robot_base_quat,
+            )
+            if traj_bowl is None:
+                raise RuntimeError("lift->bowl planning failed")
+            if not _execute_openarm_curobo_trajectory(
+                robot=ctx.robot,
+                world=world,
+                simulation_app=simulation_app,
+                curobo_state=ctx.curobo_state,
+                trajectory=traj_bowl,
+                gripper_target=GRIPPER_CLOSED,
+                record_fn=record_step,
+                timeout_fn=timeout_fn,
+                stop_event=stop_event,
+            ):
+                raise RuntimeError("lift->bowl execution failed")
+
+            traj_place = _plan_openarm_linear_ik_segment(
+                curobo_state=ctx.curobo_state,
+                current_full=_to_numpy(ctx.robot.get_joint_positions()),
+                stage=ctx.stage,
+                eef_prim_path=ctx.right_eef_prim_path,
+                target_pos_world=targets["place"][0],
+                target_quat_world=targets["place"][1],
+                robot_base_pos=robot_base_pos,
+                robot_base_quat=robot_base_quat,
+                n_waypoints=PLACE_IK_WAYPOINTS,
+            )
+            if traj_place is None:
+                raise RuntimeError("bowl->place IK failed")
+            if not _execute_openarm_curobo_trajectory(
+                robot=ctx.robot,
+                world=world,
+                simulation_app=simulation_app,
+                curobo_state=ctx.curobo_state,
+                trajectory=traj_place,
+                gripper_target=GRIPPER_CLOSED,
+                record_fn=record_step,
+                timeout_fn=timeout_fn,
+                stop_event=stop_event,
+            ):
+                raise RuntimeError("bowl->place execution failed")
+
+            if not _hold_current_pose(
+                robot=ctx.robot,
+                world=world,
+                simulation_app=simulation_app,
+                gripper_target=GRIPPER_OPEN,
+                hold_steps=max(1, int(round(12 * float(steps_per_segment) / float(STEPS_PER_SEGMENT)))),
+                record_fn=record_step,
+                timeout_fn=timeout_fn,
+                stop_event=stop_event,
+            ):
+                raise RuntimeError("place release failed")
+            if attach_state["attached"]:
+                _remove_prim_if_exists(ctx.stage, ATTACHMENT_JOINT_PATH)
+                attach_state["attached"] = False
                 _step_world(world, simulation_app, render=True, steps=4)
 
-        if end_name == "place_open" and attached:
-            _remove_prim_if_exists(ctx.stage, ATTACHMENT_JOINT_PATH)
-            attached = False
-            _step_world(world, simulation_app, render=True, steps=4)
+            traj_home = _plan_openarm_curobo_segment(
+                curobo_state=ctx.curobo_state,
+                current_full=_to_numpy(ctx.robot.get_joint_positions()),
+                target_pos_world=ctx.pose_samples["home"].position_world,
+                target_quat_world=ctx.pose_samples["home"].orientation,
+                robot_base_pos=robot_base_pos,
+                robot_base_quat=robot_base_quat,
+            )
+            if traj_home is None:
+                raise RuntimeError("return home planning failed")
+            if not _execute_openarm_curobo_trajectory(
+                robot=ctx.robot,
+                world=world,
+                simulation_app=simulation_app,
+                curobo_state=ctx.curobo_state,
+                trajectory=traj_home,
+                gripper_target=GRIPPER_OPEN,
+                record_fn=record_step,
+                timeout_fn=timeout_fn,
+                stop_event=stop_event,
+                mark_last=True,
+            ):
+                raise RuntimeError("return home execution failed")
+            used_curobo = True
+        except Exception as exc:
+            LOG.warning("Episode %d cuRobo plan failed, switching to waypoint fallback: %s", episode_index + 1, exc)
 
-        LOG.info(
-            "Episode %d transition %s -> %s done (%d frames)",
-            episode_index + 1,
-            start_name,
-            end_name,
-            seg_steps,
-        )
+    if stop_event.is_set():
+        return frame_index, True, False
+    if timeout_fn():
+        LOG.warning("Episode %d timed out after %.2fs", episode_index, time.time() - episode_start)
+        return frame_index, False, False
+
+    if not used_curobo:
+        if not _run_waypoint_fallback(
+            cube_pos=cube_pos,
+            bowl_pos=bowl_pos,
+            ctx=ctx,
+            world=world,
+            simulation_app=simulation_app,
+            steps_per_segment=steps_per_segment,
+            stop_event=stop_event,
+            timeout_fn=timeout_fn,
+            record_fn=record_step,
+            attach_state=attach_state,
+        ):
+            return frame_index, bool(stop_event.is_set()), False
 
     _remove_prim_if_exists(ctx.stage, ATTACHMENT_JOINT_PATH)
     _step_world(world, simulation_app, render=True, steps=6)
