@@ -1327,8 +1327,13 @@ def scene_save():
 
 # ── SceneSmith → USD export (main-thread, uses asset_converter) ──
 
-def _handle_export_scene(scene_dir, output_name):
+def _handle_export_scene(scene_dir, output_name, room_filter=None):
     """Export SceneSmith scene to USD. Uses omni.kit.asset_converter.
+
+    Args:
+        scene_dir: SceneSmith output directory
+        output_name: name for output USD
+        room_filter: if set, only export this room (e.g. "living_room")
 
     Handles multi-room house_state: objects + room walls + doors/windows + ceiling lights.
     Runs on Flask thread — converter + pxr USD write are offline operations.
@@ -1368,8 +1373,10 @@ def _handle_export_scene(scene_dir, output_name):
                 pos = lr.get("position", [0, 0])
             placed_rooms[rid] = (float(pos[0]), float(pos[1]))
 
-        # Room geometries → walls
+        # Room geometries → walls (optionally filtered)
         for rname, rg in layout.get("room_geometries", {}).items():
+            if room_filter and rname != room_filter:
+                continue
             ox, oy = placed_rooms.get(rname, (0, 0))
             for wall in rg.get("walls", []):
                 t = wall.get("transform", {}).get("translation", [0, 0, 0])
@@ -1393,9 +1400,11 @@ def _handle_export_scene(scene_dir, output_name):
                     "is_floor": True,
                 })
 
-        # Objects from rooms
+        # Objects from rooms (optionally filtered)
         for room_name, room_data in scene_state.get("rooms", {}).items():
             if not isinstance(room_data, dict):
+                continue
+            if room_filter and room_name != room_filter:
                 continue
             room_objs = room_data.get("objects", {})
             if not isinstance(room_objs, dict):
@@ -2375,18 +2384,21 @@ def code_execute():
 def scene_export_scene():
     """Export a SceneSmith scene to physics-ready USD using omni.kit.asset_converter.
 
-    Runs GLTF→USD conversion on Flask thread (asset_converter is thread-safe).
-    Scene assembly uses pxr directly (no sim main loop needed).
+    Params:
+        scene_dir: SceneSmith output directory
+        name: output scene name
+        room: (optional) export only this room (e.g. "living_room"). Default: all rooms.
     """
     data = flask_request.get_json(silent=True) or {}
     scene_dir = data.get("scene_dir", "")
     output_name = data.get("name", "exported_scene")
+    room_filter = data.get("room")  # None = all rooms
     if not scene_dir:
         return jsonify({"error": "scene_dir required"}), 400
     if not os.path.isdir(scene_dir):
         return jsonify({"error": f"Directory not found: {scene_dir}"}), 404
     try:
-        result = _handle_export_scene(scene_dir, output_name)
+        result = _handle_export_scene(scene_dir, output_name, room_filter=room_filter)
         return jsonify(result)
     except Exception as e:
         import traceback
