@@ -1328,22 +1328,38 @@ def scene_save():
 # ── SceneSmith → USD import ─────────────────────────────────
 
 def _find_scenesmith_scene_state(output_dir):
-    """Search for final scene_state.json in SceneSmith output directory."""
+    """Search for scene state in SceneSmith output directory.
+
+    Priority: house_state.json (multi-room) > final scene_state.json (single room).
+    Returns (path, is_house_state) tuple.
+    """
     root = Path(output_dir)
-    # Priority 1: direct
+
+    # Priority 1: combined house_state (multi-room, has all rooms)
+    for hs in sorted(root.glob("scene_000/combined_house_after_ceiling/house_state.json")):
+        return str(hs), True
+    for hs in sorted(root.glob("scene_000/combined_house_after_*/house_state.json")):
+        return str(hs), True
+    for hs in sorted(root.glob("scene_000/combined_house/house_state.json")):
+        return str(hs), True
+
+    # Priority 2: direct scene_state.json
     p = root / "scene_state.json"
     if p.exists():
-        return str(p)
-    # Priority 2: scene_000/room_*/scene_states/final_scene/
+        return str(p), False
+
+    # Priority 3: per-room final scene_state
     for ss in sorted(root.glob("scene_000/room_*/scene_states/final_scene/scene_state.json")):
-        return str(ss)
-    # Priority 3: recursive (max depth 6)
+        return str(ss), False
+
+    # Priority 4: any scene_state.json
     for ss in sorted(root.rglob("scene_state.json")):
         if "final_scene" in str(ss):
-            return str(ss)
+            return str(ss), False
     for ss in sorted(root.rglob("scene_state.json")):
-        return str(ss)
-    return None
+        return str(ss), False
+
+    return None, False
 
 
 def _parse_sdf_mass(sdf_path):
@@ -1451,9 +1467,9 @@ def _stamp_physics_on_usd(usd_path, object_type, sdf_path=None):
     return True
 
 
-def _assemble_scene_usd(scene_path, converted_objects):
+def _assemble_scene_usd(scene_path, converted_objects, ceiling_lights=None):
     """Create combined scene USD from per-object USDs."""
-    from pxr import Gf, Usd, UsdGeom, UsdPhysics
+    from pxr import Gf, Usd, UsdGeom, UsdPhysics, UsdLux, UsdShade, Sdf
 
     stage = Usd.Stage.CreateNew(str(scene_path))
     UsdGeom.SetStageUpAxis(stage, UsdGeom.Tokens.z)
@@ -1462,15 +1478,41 @@ def _assemble_scene_usd(scene_path, converted_objects):
     root = UsdGeom.Xform.Define(stage, "/World")
     stage.SetDefaultPrim(root.GetPrim())
 
-    # Ground plane
+    # Ground plane (Z-up: points on XY plane at z=0, normals pointing +Z)
     gp_xf = UsdGeom.Xform.Define(stage, "/World/GroundPlane")
     UsdPhysics.CollisionAPI.Apply(gp_xf.GetPrim())
     gp_mesh = UsdGeom.Mesh.Define(stage, "/World/GroundPlane/Mesh")
-    gp_mesh.CreatePointsAttr([(-50, 0, -50), (50, 0, -50), (50, 0, 50), (-50, 0, 50)])
+    gp_mesh.CreatePointsAttr([(-50, -50, 0), (50, -50, 0), (50, 50, 0), (-50, 50, 0)])
     gp_mesh.CreateFaceVertexCountsAttr([4])
     gp_mesh.CreateFaceVertexIndicesAttr([0, 1, 2, 3])
-    gp_mesh.CreateNormalsAttr([(0, 1, 0)] * 4)
+    gp_mesh.CreateNormalsAttr([(0, 0, 1)] * 4)
+    gp_mesh.CreateDisplayColorAttr([(0.5, 0.5, 0.5)])
 
+    # Ambient dome light (always add for visibility)
+    dome = UsdLux.DomeLight.Define(stage, "/World/Lights/DomeLight")
+    dome.CreateIntensityAttr(800)
+    dome.CreateColorAttr(Gf.Vec3f(1.0, 0.98, 0.95))
+
+    # Key distant light from above
+    key = UsdLux.DistantLight.Define(stage, "/World/Lights/KeyLight")
+    key.CreateIntensityAttr(2500)
+    key.CreateAngleAttr(1.0)
+    key.CreateColorAttr(Gf.Vec3f(1.0, 0.95, 0.88))
+    key_xf = UsdGeom.Xformable(key.GetPrim())
+    key_xf.AddRotateXYZOp().Set(Gf.Vec3f(-45, 30, 0))
+
+    # Ceiling lights from SceneSmith (if any)
+    for i, cl in enumerate(ceiling_lights or []):
+        pos = cl.get("pos", [0, 0, 2.5])
+        cl_name = _safe_prim_name(cl.get("id", f"ceiling_light_{i}"))
+        light = UsdLux.SphereLight.Define(stage, f"/World/Lights/{cl_name}")
+        light.CreateIntensityAttr(20000)
+        light.CreateRadiusAttr(0.1)
+        light.CreateColorAttr(Gf.Vec3f(1.0, 0.95, 0.88))
+        cl_xf = UsdGeom.Xformable(light.GetPrim())
+        cl_xf.AddTranslateOp().Set(Gf.Vec3d(float(pos[0]), float(pos[1]), float(pos[2])))
+
+    # Objects
     for item in converted_objects:
         obj = item["obj"]
         usd_file = item["usd"]
@@ -1493,8 +1535,9 @@ def _assemble_scene_usd(scene_path, converted_objects):
         if q and len(q) == 4:
             xf.AddOrientOp().Set(Gf.Quatf(float(q[0]), float(q[1]), float(q[2]), float(q[3])))
 
+    n_lights = len(ceiling_lights or [])
     stage.GetRootLayer().Save()
-    print(f"[scenesmith-import] Assembled scene: {scene_path} ({len(converted_objects)} objects)")
+    print(f"[scenesmith-import] Assembled scene: {scene_path} ({len(converted_objects)} objects, {n_lights} ceiling lights)")
     return True
 
 
@@ -1508,19 +1551,58 @@ def _convert_scenesmith_to_usd(output_dir, scene_name, objects_meta=None):
 
     Returns: absolute path to generated .usda file
     """
-    state_path = _find_scenesmith_scene_state(output_dir)
+    state_path, is_house = _find_scenesmith_scene_state(output_dir)
     if not state_path:
         raise FileNotFoundError(f"No scene_state.json found in {output_dir}")
 
     with open(state_path) as f:
         scene_state = json.load(f)
 
-    objects = scene_state.get("objects", {})
-    if isinstance(objects, list):
-        objects = {o.get("object_id", f"obj_{i}"): o for i, o in enumerate(objects)}
+    # Collect all objects from house_state (multi-room) or scene_state (single room)
+    objects = {}
+    ceiling_lights = []  # Track ceiling lights for auto Light prim
+    room_dirs = {}  # room_name → directory path
 
-    # Room dir = parent of scene_states/
-    room_dir = str(Path(state_path).parent.parent.parent)
+    if is_house and "rooms" in scene_state:
+        scene_root = str(Path(state_path).parent.parent)  # scene_000/
+        for room_name, room_data in scene_state.get("rooms", {}).items():
+            if not isinstance(room_data, dict):
+                continue
+            room_objs = room_data.get("objects", {})
+            if isinstance(room_objs, list):
+                room_objs = {o.get("object_id", f"obj_{i}"): o for i, o in enumerate(room_objs)}
+            elif not isinstance(room_objs, dict):
+                continue
+            # Find room directory
+            room_dir_path = os.path.join(scene_root, f"room_{room_name}")
+            if not os.path.isdir(room_dir_path):
+                # Try without prefix
+                for d in Path(scene_root).iterdir():
+                    if d.is_dir() and room_name in d.name:
+                        room_dir_path = str(d)
+                        break
+            room_dirs[room_name] = room_dir_path
+
+            for oid, obj in room_objs.items():
+                obj["_room"] = room_name
+                obj["_room_dir"] = room_dir_path
+                objects[oid] = obj
+                # Track ceiling lights
+                desc = obj.get("description", "").lower()
+                if any(w in desc for w in ["light", "lamp", "pendant", "chandelier", "flush"]):
+                    pos = obj.get("transform", {}).get("translation", [0, 0, 2.5])
+                    ceiling_lights.append({"id": oid, "pos": pos, "desc": obj.get("description", "")})
+        print(f"[scenesmith-import] house_state: {len(objects)} objects across {len(room_dirs)} rooms, {len(ceiling_lights)} ceiling lights")
+    else:
+        objects = scene_state.get("objects", {})
+        if isinstance(objects, list):
+            objects = {o.get("object_id", f"obj_{i}"): o for i, o in enumerate(objects)}
+
+    # Room dir fallback for single-room scenes
+    if not room_dirs:
+        room_dir = str(Path(state_path).parent.parent.parent)
+    else:
+        room_dir = None  # Use per-object _room_dir
 
     # Merge backend metadata
     meta_map = {}
@@ -1543,7 +1625,9 @@ def _convert_scenesmith_to_usd(output_dir, scene_name, objects_meta=None):
         if not geom_rel:
             continue
 
-        gltf_path = os.path.join(room_dir, geom_rel)
+        # Resolve GLTF path: per-room dir or single room dir
+        obj_room_dir = obj.get("_room_dir", room_dir)
+        gltf_path = os.path.join(obj_room_dir, geom_rel) if obj_room_dir else geom_rel
         if not os.path.exists(gltf_path):
             print(f"[scenesmith-import] WARNING: GLTF missing: {gltf_path}")
             continue
@@ -1573,7 +1657,7 @@ def _convert_scenesmith_to_usd(output_dir, scene_name, objects_meta=None):
         raise ValueError(f"No objects converted from {output_dir}")
 
     scene_path = os.path.join(library, f"{safe_name}_{ts}.usda")
-    _assemble_scene_usd(scene_path, converted)
+    _assemble_scene_usd(scene_path, converted, ceiling_lights=ceiling_lights)
     return scene_path
 
 
