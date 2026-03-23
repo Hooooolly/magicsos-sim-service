@@ -1355,10 +1355,16 @@ def _handle_export_scene(scene_dir, output_name, simulation_app):
         scene_root = str(Path(state_path).parent.parent)
         layout = scene_state.get("layout", {})
 
-        # Room offsets from placed_rooms
-        for r in layout.get("placed_rooms", []):
-            rid = r.get("id", "")
-            pos = r.get("position", [0, 0])
+        # Room offsets: match layout.rooms[i].id with placed_rooms[i].position
+        # (placed_rooms may have empty id fields)
+        layout_rooms_list = layout.get("rooms", [])
+        placed_rooms_list = layout.get("placed_rooms", [])
+        for i, lr in enumerate(layout_rooms_list):
+            rid = lr.get("id", "")
+            if i < len(placed_rooms_list):
+                pos = placed_rooms_list[i].get("position", [0, 0])
+            else:
+                pos = lr.get("position", [0, 0])
             placed_rooms[rid] = (float(pos[0]), float(pos[1]))
 
         # Room geometries → walls
@@ -2374,7 +2380,7 @@ def scene_export_scene():
     if not os.path.isdir(scene_dir):
         return jsonify({"error": f"Directory not found: {scene_dir}"}), 404
     return _enqueue_cmd("export_scene", scene_dir=scene_dir, output_name=output_name,
-                        timeout_override=300)
+                        timeout_override=600)
 
 
 # ── Data collection ──────────────────────────────────────────
