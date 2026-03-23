@@ -1327,10 +1327,11 @@ def scene_save():
 
 # ── SceneSmith → USD export (main-thread, uses asset_converter) ──
 
-def _handle_export_scene(scene_dir, output_name, simulation_app):
-    """Export SceneSmith scene to USD on main thread. Uses omni.kit.asset_converter.
+def _handle_export_scene(scene_dir, output_name):
+    """Export SceneSmith scene to USD. Uses omni.kit.asset_converter.
 
     Handles multi-room house_state: objects + room walls + doors/windows + ceiling lights.
+    Runs on Flask thread — converter + pxr USD write are offline operations.
     Returns dict with usd_path on success.
     """
     import asyncio
@@ -1461,8 +1462,13 @@ def _handle_export_scene(scene_dir, output_name, simulation_app):
         ctx.export_preview_surface = True
         ctx.use_meter_as_world_unit = True
         task = ac.get_instance().create_converter_task(str(src), str(dst), ctx)
-        while not task.is_finished():
-            simulation_app.update()
+        # Wait for converter to finish (use asyncio loop, not sim app update)
+        try:
+            loop = asyncio.get_event_loop()
+        except RuntimeError:
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+        loop.run_until_complete(task.wait_until_finished())
         return dst if Path(dst).exists() else None
 
     for oid, obj in all_objects.items():
@@ -2369,8 +2375,8 @@ def code_execute():
 def scene_export_scene():
     """Export a SceneSmith scene to physics-ready USD using omni.kit.asset_converter.
 
-    Runs on main thread (asset_converter needs Kit app loop).
-    Supports multi-room house_state.json: objects + walls + doors + windows + lights.
+    Runs GLTF→USD conversion on Flask thread (asset_converter is thread-safe).
+    Scene assembly uses pxr directly (no sim main loop needed).
     """
     data = flask_request.get_json(silent=True) or {}
     scene_dir = data.get("scene_dir", "")
@@ -2379,8 +2385,13 @@ def scene_export_scene():
         return jsonify({"error": "scene_dir required"}), 400
     if not os.path.isdir(scene_dir):
         return jsonify({"error": f"Directory not found: {scene_dir}"}), 404
-    return _enqueue_cmd("export_scene", scene_dir=scene_dir, output_name=output_name,
-                        timeout_override=600)
+    try:
+        result = _handle_export_scene(scene_dir, output_name)
+        return jsonify(result)
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return jsonify({"error": str(e)}), 500
 
 
 # ── Data collection ──────────────────────────────────────────
@@ -2838,16 +2849,6 @@ def _process_commands():
                         print("[world] WARNING: failed to recreate world after code_execute mutation")
                 _save_autosave_stage("code_execute")
                 cmd["result"] = {"success": True, "output": stdout_capture.getvalue()}
-
-            elif cmd_type == "export_scene":
-                try:
-                    cmd["result"] = _handle_export_scene(
-                        cmd["scene_dir"], cmd["output_name"], simulation_app
-                    )
-                except Exception as _export_exc:
-                    import traceback
-                    traceback.print_exc()
-                    cmd["error"] = str(_export_exc)
 
             elif cmd_type == "collect_start":
                 if _state["collecting"] or _collect_request is not None:
