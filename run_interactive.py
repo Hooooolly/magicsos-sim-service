@@ -1781,10 +1781,14 @@ def _find_robot_articulation():
     from pxr import UsdPhysics
     stage = _get_stage()
     if not stage:
+        print("[_find_robot_articulation] no stage")
         return None
+    prim_count = 0
     for prim in stage.Traverse():
+        prim_count += 1
         if prim.HasAPI(UsdPhysics.ArticulationRootAPI):
             return prim
+    print(f"[_find_robot_articulation] traversed {prim_count} prims, no ArticulationRootAPI found")
     return None
 
 
@@ -1799,16 +1803,17 @@ def robot_init_inference():
     global _inf_init_pending, _inf_init_phase, _inf_init_result, _inf_init_error, _inf_init_step_count, _inf_dc
     data = flask_request.get_json(silent=True) or {}
     force = data.get("force", False)
+    if _inf_dc is not None and not _inf_init_pending and not force:
+        return jsonify({"status": "ready", **(_inf_init_result or {})})
+    if _inf_init_pending and _inf_init_phase < 4:
+        # Already initializing — don't restart even if force=True
+        return jsonify({"status": "initializing", "phase": _inf_init_phase})
     if force and _inf_dc is not None:
         # Force re-init: clear cached state so main loop rebuilds everything
         _inf_dc = None
         _inf_init_result = None
         _inf_cameras.clear()
         print("[init_inference] force re-init requested")
-    if _inf_dc is not None and not _inf_init_pending:
-        return jsonify({"status": "ready", **(_inf_init_result or {})})
-    if _inf_init_pending and _inf_init_phase < 4:
-        return jsonify({"status": "initializing", "phase": _inf_init_phase})
     if _inf_init_error and not force:
         return jsonify({"status": "error", "error": _inf_init_error}), 500
     _inf_init_pending = True
@@ -2658,6 +2663,7 @@ def _run_pending_collection():
     except Exception:
         object_position_noise = 0.0
     target_objects = req.get("target_objects")
+    scene_usd_path = None  # set early so finally can reference it
 
     try:
         # Collect can run after many scene-chat mutations. Recreate World to
@@ -2776,6 +2782,37 @@ def _run_pending_collection():
         print(f"[collect] ERROR: {exc}")
     finally:
         _state["collecting"] = False
+        # Restore scene + NVCF streaming after collection (world.reset breaks it)
+        try:
+            _recreate_world_for_open_stage("collect_end")
+            # Reload the auto-saved scene if available
+            _saved_scene = scene_usd_path if scene_usd_path and os.path.exists(scene_usd_path) else None
+            if not _saved_scene:
+                _saved_scene = _state.get("scene", "")
+            if _saved_scene and os.path.exists(_saved_scene):
+                ctx = omni.usd.get_context()
+                _ok = ctx.open_stage(_saved_scene)
+                if _ok:
+                    for _ in range(300):
+                        simulation_app.update()
+                        if ctx.get_stage_state() == omni.usd.StageState.OPENED:
+                            break
+                        time.sleep(0.05)
+                    _recreate_world_for_open_stage("collect_scene_restore")
+                    print(f"[collect] scene restored: {_saved_scene}")
+            # Restore NVCF streaming readiness
+            try:
+                import omni.services.livestream.nvcf.services.api as _nvcf_api
+                _nvcf_api.app_ready = True
+                _nvcf_api.rtx_ready = True
+                print("[collect] NVCF streaming restored")
+            except Exception:
+                pass
+            # Pump a few frames to re-establish rendering
+            for _ in range(10):
+                simulation_app.update()
+        except Exception as _restore_exc:
+            print(f"[collect] WARNING: post-collection restore failed: {_restore_exc}")
 
 
 def _run_pending_replay():
@@ -3711,6 +3748,7 @@ def _run_deferred_inference_init():
             if art_prim is None:
                 _inf_init_error = "No ArticulationRootAPI found in scene"
                 _inf_init_pending = False
+                print(f"[init_inference] ERROR: {_inf_init_error}")
                 return
             _inf_robot_prim = art_prim
             prim_path = art_prim.GetPath().pathString
