@@ -1325,7 +1325,261 @@ def scene_save():
     return _enqueue_cmd("scene_save", output_path=output_path, output_dir=output_dir)
 
 
-# ── SceneSmith → USD import ─────────────────────────────────
+# ── SceneSmith → USD export (main-thread, uses asset_converter) ──
+
+def _handle_export_scene(scene_dir, output_name, simulation_app):
+    """Export SceneSmith scene to USD on main thread. Uses omni.kit.asset_converter.
+
+    Handles multi-room house_state: objects + room walls + doors/windows + ceiling lights.
+    Returns dict with usd_path on success.
+    """
+    import asyncio
+    import omni.kit.asset_converter as ac
+    from pxr import Gf, Usd, UsdGeom, UsdPhysics, UsdLux, Vt
+
+    scene_dir = str(scene_dir)
+    state_path, is_house = _find_scenesmith_scene_state(scene_dir)
+    if not state_path:
+        raise FileNotFoundError(f"No scene state found in {scene_dir}")
+
+    with open(state_path) as f:
+        scene_state = json.load(f)
+
+    # ── Parse objects + room info ────────────────────────────
+    all_objects = {}     # oid → obj dict (with _room_dir, _room_offset)
+    ceiling_lights = []
+    room_walls = []      # list of wall dicts with global coords
+    placed_rooms = {}    # room_name → (ox, oy)
+
+    if is_house and "rooms" in scene_state:
+        scene_root = str(Path(state_path).parent.parent)
+        layout = scene_state.get("layout", {})
+
+        # Room offsets from placed_rooms
+        for r in layout.get("placed_rooms", []):
+            rid = r.get("id", "")
+            pos = r.get("position", [0, 0])
+            placed_rooms[rid] = (float(pos[0]), float(pos[1]))
+
+        # Room geometries → walls
+        for rname, rg in layout.get("room_geometries", {}).items():
+            ox, oy = placed_rooms.get(rname, (0, 0))
+            for wall in rg.get("walls", []):
+                t = wall.get("transform", {}).get("translation", [0, 0, 0])
+                bmin = wall.get("bbox_min", [-0.5, -0.02, -0.5])
+                bmax = wall.get("bbox_max", [0.5, 0.02, 0.5])
+                room_walls.append({
+                    "id": f"{rname}_{wall.get('object_id', 'wall')}",
+                    "pos": (float(t[0]) + ox, float(t[1]) + oy, float(t[2])),
+                    "bbox_min": bmin, "bbox_max": bmax,
+                })
+            # Floor
+            floor_data = rg.get("floor", {})
+            if floor_data:
+                w = float(rg.get("width", 5.0))
+                l = float(rg.get("length", 5.0))
+                room_walls.append({
+                    "id": f"{rname}_floor",
+                    "pos": (ox, oy, 0.0),
+                    "bbox_min": [-w/2, -l/2, -0.01],
+                    "bbox_max": [w/2, l/2, 0.0],
+                    "is_floor": True,
+                })
+
+        # Objects from rooms
+        for room_name, room_data in scene_state.get("rooms", {}).items():
+            if not isinstance(room_data, dict):
+                continue
+            room_objs = room_data.get("objects", {})
+            if not isinstance(room_objs, dict):
+                continue
+            ox, oy = placed_rooms.get(room_name, (0, 0))
+            room_dir = os.path.join(scene_root, f"room_{room_name}")
+            if not os.path.isdir(room_dir):
+                for d in Path(scene_root).iterdir():
+                    if d.is_dir() and room_name in d.name:
+                        room_dir = str(d)
+                        break
+            for oid, obj in room_objs.items():
+                obj["_room_dir"] = room_dir
+                obj["_room_offset"] = (ox, oy)
+                all_objects[oid] = obj
+                desc = obj.get("description", "").lower()
+                if any(w in desc for w in ["light", "lamp", "pendant", "chandelier", "flush"]):
+                    t = obj.get("transform", {}).get("translation", [0, 0, 2.5])
+                    ceiling_lights.append({
+                        "id": oid,
+                        "pos": (float(t[0]) + ox, float(t[1]) + oy, float(t[2])),
+                    })
+        print(f"[export_scene] house: {len(all_objects)} objects, {len(placed_rooms)} rooms, "
+              f"{len(room_walls)} walls, {len(ceiling_lights)} lights")
+    else:
+        # Single room
+        room_dir = str(Path(state_path).parent.parent.parent)
+        objects_raw = scene_state.get("objects", {})
+        if isinstance(objects_raw, list):
+            objects_raw = {o.get("object_id", f"obj_{i}"): o for i, o in enumerate(objects_raw)}
+        for oid, obj in objects_raw.items():
+            obj["_room_dir"] = room_dir
+            obj["_room_offset"] = (0, 0)
+            all_objects[oid] = obj
+        rg = scene_state.get("room_geometry", {})
+        if rg:
+            for wall in rg.get("walls", []):
+                t = wall.get("transform", {}).get("translation", [0, 0, 0])
+                room_walls.append({
+                    "id": wall.get("object_id", "wall"),
+                    "pos": tuple(float(v) for v in t),
+                    "bbox_min": wall.get("bbox_min", [-0.5, -0.02, -0.5]),
+                    "bbox_max": wall.get("bbox_max", [0.5, 0.02, 0.5]),
+                })
+        print(f"[export_scene] single room: {len(all_objects)} objects, {len(room_walls)} walls")
+
+    # ── Convert GLTF→USD per object using asset_converter ────
+    library = os.environ.get("SIM_SCENE_LIBRARY", "/data/embodied/scene/library")
+    os.makedirs(library, exist_ok=True)
+    ts = int(time.time())
+    safe_name = re.sub(r"[^a-zA-Z0-9_-]", "_", output_name)[:60]
+    cache_dir = os.path.join(library, f"{safe_name}_{ts}_assets")
+    os.makedirs(cache_dir, exist_ok=True)
+
+    converted = []  # list of (oid, usd_path, obj)
+    skipped = 0
+
+    def _convert_gltf(src, dst):
+        ctx = ac.AssetConverterContext()
+        ctx.ignore_materials = False
+        ctx.ignore_cameras = True
+        ctx.ignore_animations = True
+        ctx.ignore_light = True
+        ctx.export_preview_surface = True
+        ctx.use_meter_as_world_unit = True
+        task = ac.get_instance().create_converter_task(str(src), str(dst), ctx)
+        while not task.is_finished():
+            simulation_app.update()
+        return dst if Path(dst).exists() else None
+
+    for oid, obj in all_objects.items():
+        geom_rel = obj.get("geometry_path", "")
+        if not geom_rel:
+            skipped += 1
+            continue
+        room_dir = obj.get("_room_dir", "")
+        gltf_path = os.path.join(room_dir, geom_rel) if room_dir else geom_rel
+        if not os.path.exists(gltf_path):
+            skipped += 1
+            continue
+        usd_file = os.path.join(cache_dir, f"{_safe_prim_name(oid)}.usd")
+        if not os.path.exists(usd_file):
+            result = _convert_gltf(gltf_path, usd_file)
+            if not result:
+                print(f"[export_scene] SKIP {oid}: convert failed")
+                skipped += 1
+                continue
+        converted.append((oid, usd_file, obj))
+        if len(converted) % 10 == 0:
+            print(f"[export_scene] converted {len(converted)} objects...")
+
+    print(f"[export_scene] converted {len(converted)}, skipped {skipped}")
+
+    # ── Assemble scene USD ───────────────────────────────────
+    scene_path = os.path.join(library, f"{safe_name}_{ts}.usda")
+    stage = Usd.Stage.CreateNew(scene_path)
+    UsdGeom.SetStageUpAxis(stage, UsdGeom.Tokens.z)
+    UsdGeom.SetStageMetersPerUnit(stage, 1.0)
+    root = UsdGeom.Xform.Define(stage, "/World")
+    stage.SetDefaultPrim(root.GetPrim())
+
+    # Lights
+    dome = UsdLux.DomeLight.Define(stage, "/World/Lights/DomeLight")
+    dome.CreateIntensityAttr(800)
+    dome.CreateColorAttr(Gf.Vec3f(1.0, 0.98, 0.95))
+    key = UsdLux.DistantLight.Define(stage, "/World/Lights/KeyLight")
+    key.CreateIntensityAttr(2500)
+    key.CreateColorAttr(Gf.Vec3f(1.0, 0.95, 0.88))
+    kxf = UsdGeom.Xformable(key.GetPrim())
+    kxf.AddRotateXYZOp().Set(Gf.Vec3f(-45, 30, 0))
+
+    for i, cl in enumerate(ceiling_lights):
+        cname = _safe_prim_name(cl["id"])
+        light = UsdLux.SphereLight.Define(stage, f"/World/Lights/{cname}")
+        light.CreateIntensityAttr(20000)
+        light.CreateRadiusAttr(0.1)
+        light.CreateColorAttr(Gf.Vec3f(1.0, 0.95, 0.88))
+        lxf = UsdGeom.Xformable(light.GetPrim())
+        lxf.AddTranslateOp().Set(Gf.Vec3d(*cl["pos"]))
+
+    # Room walls + floors
+    for wdata in room_walls:
+        wid = _safe_prim_name(wdata["id"])
+        is_floor = wdata.get("is_floor", False)
+        bmin = wdata["bbox_min"]
+        bmax = wdata["bbox_max"]
+        sx = max(0.001, float(bmax[0] - bmin[0]))
+        sy = max(0.001, float(bmax[1] - bmin[1]))
+        sz = max(0.001, float(bmax[2] - bmin[2]))
+        cx = float((bmin[0] + bmax[0]) * 0.5 + wdata["pos"][0])
+        cy = float((bmin[1] + bmax[1]) * 0.5 + wdata["pos"][1])
+        cz = float((bmin[2] + bmax[2]) * 0.5 + wdata["pos"][2])
+        prim_path = f"/World/Structure/{wid}"
+        cube = UsdGeom.Cube.Define(stage, prim_path)
+        cube.GetSizeAttr().Set(1.0)
+        if is_floor:
+            cube.GetDisplayColorAttr().Set([(0.55, 0.45, 0.3)])  # wood-like
+        else:
+            cube.GetDisplayColorAttr().Set([(0.92, 0.92, 0.9)])  # off-white walls
+        wxf = UsdGeom.Xformable(cube.GetPrim())
+        wxf.AddTranslateOp().Set(Gf.Vec3d(cx, cy, cz))
+        wxf.AddScaleOp().Set(Gf.Vec3d(sx, sy, sz))
+        UsdPhysics.CollisionAPI.Apply(cube.GetPrim())
+
+    # Objects
+    for oid, usd_file, obj in converted:
+        safe = _safe_prim_name(oid)
+        prim_path = f"/World/Objects/{safe}"
+        wrapper = UsdGeom.Xform.Define(stage, prim_path)
+
+        # Transform with room offset
+        t = obj.get("transform", {}).get("translation", [0, 0, 0])
+        ox, oy = obj.get("_room_offset", (0, 0))
+        gx, gy, gz = float(t[0]) + ox, float(t[1]) + oy, float(t[2])
+
+        xf = UsdGeom.Xformable(wrapper.GetPrim())
+        xf.AddTranslateOp().Set(Gf.Vec3d(gx, gy, gz))
+        q = obj.get("transform", {}).get("rotation_wxyz")
+        if q and len(q) == 4:
+            xf.AddOrientOp().Set(Gf.Quatf(float(q[0]), float(q[1]), float(q[2]), float(q[3])))
+        sf = obj.get("scale_factor", 1.0)
+        if isinstance(sf, (int, float)) and float(sf) != 1.0:
+            xf.AddScaleOp().Set(Gf.Vec3d(float(sf), float(sf), float(sf)))
+
+        asset_prim = stage.DefinePrim(f"{prim_path}/asset", "Xform")
+        asset_prim.GetReferences().AddReference(os.path.abspath(usd_file))
+
+    # Apply collision on all meshes
+    col_count = 0
+    for prim in stage.Traverse():
+        if prim.IsA(UsdGeom.Mesh):
+            UsdPhysics.CollisionAPI.Apply(prim)
+            mesh_col = UsdPhysics.MeshCollisionAPI.Apply(prim)
+            mesh_col.CreateApproximationAttr("convexHull")
+            col_count += 1
+
+    stage.GetRootLayer().Save()
+    print(f"[export_scene] DONE: {scene_path} ({len(converted)} objects, "
+          f"{len(room_walls)} walls, {len(ceiling_lights)} lights, {col_count} collision meshes)")
+
+    return {
+        "success": True,
+        "usd_path": scene_path,
+        "objects": len(converted),
+        "walls": len(room_walls),
+        "lights": len(ceiling_lights),
+        "skipped": skipped,
+    }
+
+
+# ── SceneSmith → USD import (legacy trimesh path) ────────────
 
 def _find_scenesmith_scene_state(output_dir):
     """Search for scene state in SceneSmith output directory.
@@ -1336,12 +1590,17 @@ def _find_scenesmith_scene_state(output_dir):
     root = Path(output_dir)
 
     # Priority 1: combined house_state (multi-room, has all rooms)
-    for hs in sorted(root.glob("scene_000/combined_house_after_ceiling/house_state.json")):
-        return str(hs), True
-    for hs in sorted(root.glob("scene_000/combined_house_after_*/house_state.json")):
-        return str(hs), True
-    for hs in sorted(root.glob("scene_000/combined_house/house_state.json")):
-        return str(hs), True
+    # Try both with and without scene_000/ prefix (caller may pass either level)
+    for pattern in [
+        "combined_house_after_ceiling/house_state.json",
+        "scene_000/combined_house_after_ceiling/house_state.json",
+        "combined_house_after_*/house_state.json",
+        "scene_000/combined_house_after_*/house_state.json",
+        "combined_house/house_state.json",
+        "scene_000/combined_house/house_state.json",
+    ]:
+        for hs in sorted(root.glob(pattern)):
+            return str(hs), True
 
     # Priority 2: direct scene_state.json
     p = root / "scene_state.json"
@@ -2015,10 +2274,11 @@ def robot_state():
 
 def _enqueue_cmd(cmd_type, **kwargs):
     """Enqueue a command for main-thread execution, wait for result."""
+    timeout = kwargs.pop("timeout_override", None) or _CMD_TIMEOUT
     result_event = threading.Event()
     cmd = {"type": cmd_type, "result": None, "error": None, "event": result_event, **kwargs}
     _cmd_queue.put(cmd)
-    if not result_event.wait(timeout=_CMD_TIMEOUT):
+    if not result_event.wait(timeout=timeout):
         if _state.get("collecting"):
             return jsonify({"error": "Timeout waiting for main thread (busy collecting). Use /emergency_stop to interrupt immediately."}), 504
         return jsonify({"error": "Timeout waiting for main thread"}), 504
@@ -2095,6 +2355,26 @@ def code_execute():
     if not code:
         return jsonify({"error": "code required"}), 400
     return _enqueue_cmd("code_execute", code=code)
+
+
+# ── Scene export (SceneSmith → USD with asset_converter) ─────
+
+@bridge.route("/scene/export_scene", methods=["POST"])
+def scene_export_scene():
+    """Export a SceneSmith scene to physics-ready USD using omni.kit.asset_converter.
+
+    Runs on main thread (asset_converter needs Kit app loop).
+    Supports multi-room house_state.json: objects + walls + doors + windows + lights.
+    """
+    data = flask_request.get_json(silent=True) or {}
+    scene_dir = data.get("scene_dir", "")
+    output_name = data.get("name", "exported_scene")
+    if not scene_dir:
+        return jsonify({"error": "scene_dir required"}), 400
+    if not os.path.isdir(scene_dir):
+        return jsonify({"error": f"Directory not found: {scene_dir}"}), 404
+    return _enqueue_cmd("export_scene", scene_dir=scene_dir, output_name=output_name,
+                        timeout_override=300)
 
 
 # ── Data collection ──────────────────────────────────────────
@@ -2552,6 +2832,16 @@ def _process_commands():
                         print("[world] WARNING: failed to recreate world after code_execute mutation")
                 _save_autosave_stage("code_execute")
                 cmd["result"] = {"success": True, "output": stdout_capture.getvalue()}
+
+            elif cmd_type == "export_scene":
+                try:
+                    cmd["result"] = _handle_export_scene(
+                        cmd["scene_dir"], cmd["output_name"], simulation_app
+                    )
+                except Exception as _export_exc:
+                    import traceback
+                    traceback.print_exc()
+                    cmd["error"] = str(_export_exc)
 
             elif cmd_type == "collect_start":
                 if _state["collecting"] or _collect_request is not None:
