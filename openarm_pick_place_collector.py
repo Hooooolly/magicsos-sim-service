@@ -701,6 +701,18 @@ def _build_openarm_curobo_robot_cfg(config_path: Path, urdf_path: Optional[Path]
     kin_cfg["asset_root_path"] = str(config_path.parent)
     if urdf_path is not None:
         kin_cfg["urdf_path"] = str(urdf_path)
+    # Shrink collision spheres on right link7 (gripper) to allow near-table grasps.
+    # Default 50mm radius causes false collisions with table when grasping objects on it.
+    collision_spheres = dict(kin_cfg.get("collision_spheres") or {})
+    for link_key in ("openarm_right_link7", "openarm_right_link6"):
+        if link_key in collision_spheres:
+            new_spheres = []
+            for s in collision_spheres[link_key]:
+                ns = dict(s)
+                ns["radius"] = min(float(ns.get("radius", 0.05)), 0.025)
+                new_spheres.append(ns)
+            collision_spheres[link_key] = new_spheres
+    kin_cfg["collision_spheres"] = collision_spheres
     robot_cfg["kinematics"] = kin_cfg
     return robot_cfg
 
@@ -724,7 +736,11 @@ def _extract_curobo_world_config(
             dims = (mx - mn).astype(np.float32)
             center_world = 0.5 * (mn + mx)
             center_robot = (rot_inv @ (center_world - robot_pos[:3])).astype(np.float32)
-            center_robot[2] -= 0.02
+            # Shrink table Z by 6cm and shift down — collision spheres on finger
+            # links (r=50mm) overlap with table top when grasping objects on it.
+            # This keeps gross collision avoidance while allowing near-table grasps.
+            dims[2] = max(dims[2] - 0.06, 0.01)
+            center_robot[2] -= 0.05
             cuboids.append(
                 Cuboid(
                     name="table",
@@ -740,6 +756,8 @@ def _extract_curobo_world_config(
                     dims=[float(dims[0]), float(dims[1]), float(dims[2])],
                 )
             )
+            LOG.info("cuRobo table cuboid: center_robot=[%.3f,%.3f,%.3f] dims=[%.3f,%.3f,%.3f]",
+                     center_robot[0], center_robot[1], center_robot[2], dims[0], dims[1], dims[2])
 
     if not cuboids:
         cuboids.append(
@@ -906,6 +924,110 @@ def _configure_cube_physics(stage: Any, cube_prim_path: Optional[str]) -> None:
     )
     if cube_prim.HasAPI(UsdPhysics.MassAPI):
         UsdPhysics.MassAPI(cube_prim).CreateMassAttr(0.01)
+
+
+def _apply_openarm_finger_friction(stage: Any, robot_prim_path: str, cube_prim_path: Optional[str] = None) -> None:
+    """Apply high-friction physics material to OpenArm finger collision shapes + cube."""
+    from pxr import UsdShade, UsdPhysics
+    try:
+        openarm_root = _openarm_root_from_robot_path(robot_prim_path)
+        mat_path = f"{openarm_root}/GripFrictionMaterial"
+        mat_prim = stage.GetPrimAtPath(mat_path)
+        if not mat_prim or not mat_prim.IsValid():
+            UsdShade.Material.Define(stage, mat_path)
+            mat_prim = stage.GetPrimAtPath(mat_path)
+        if not mat_prim.HasAPI(UsdPhysics.MaterialAPI):
+            UsdPhysics.MaterialAPI.Apply(mat_prim)
+        phys_mat = UsdPhysics.MaterialAPI(mat_prim)
+        phys_mat.CreateStaticFrictionAttr().Set(3.0)
+        phys_mat.CreateDynamicFrictionAttr().Set(3.0)
+        phys_mat.CreateRestitutionAttr().Set(0.0)
+        mat_shade = UsdShade.Material(mat_prim)
+
+        # OpenArm right finger links (under /World/OpenArm/, not under articulation root)
+        # IMPORTANT: Only bind material to the top-level finger prim, NOT collision children.
+        # MaterialBindingAPI.Apply on collision prims invalidates PhysX tensor views.
+        finger_roots = [
+            f"{openarm_root}/openarm_right_right_finger",
+            f"{openarm_root}/openarm_right_left_finger",
+        ]
+        bound = 0
+        for fr in finger_roots:
+            fr_prim = stage.GetPrimAtPath(fr)
+            if not fr_prim or not fr_prim.IsValid():
+                continue
+            if not fr_prim.HasAPI(UsdShade.MaterialBindingAPI):
+                UsdShade.MaterialBindingAPI.Apply(fr_prim)
+            UsdShade.MaterialBindingAPI(fr_prim).Bind(
+                mat_shade, UsdShade.Tokens.weakerThanDescendants, "physics"
+            )
+            bound += 1
+
+        # Also apply friction to cube (top-level only)
+        if cube_prim_path:
+            obj_prim = stage.GetPrimAtPath(cube_prim_path)
+            if obj_prim and obj_prim.IsValid():
+                if not obj_prim.HasAPI(UsdShade.MaterialBindingAPI):
+                    UsdShade.MaterialBindingAPI.Apply(obj_prim)
+                UsdShade.MaterialBindingAPI(obj_prim).Bind(
+                    mat_shade, UsdShade.Tokens.weakerThanDescendants, "physics"
+                )
+                bound += 1
+        LOG.info("OpenArm finger+object friction: static=3.0 dynamic=3.0 bound to %d prims", bound)
+    except Exception as exc:
+        LOG.warning("_apply_openarm_finger_friction failed: %s", exc)
+
+
+def _physical_gripper_close(
+    robot: Any, world: Any, simulation_app: Any,
+    arm_target: np.ndarray, n_steps: int = 40,
+) -> tuple[float, bool]:
+    """Close gripper with PD control, detect contact, squeeze.
+
+    Returns (hold_gripper_target, contact_detected).
+    """
+    RESIST_THRESHOLD = 0.003  # per-finger gap residual → contact
+    RESIST_PATIENCE = 3
+    SQUEEZE_OFFSET = 0.004  # squeeze 4mm past contact
+    MIN_CLOSE_STEP = 8
+
+    stall_count = 0
+    hold_target = GRIPPER_CLOSED
+    ramp_steps = max(int(GRIPPER_OPEN / 0.002), 1)
+    contact = False
+
+    for step in range(n_steps):
+        gr_frac = min(1.0, float(step + 1) / float(ramp_steps))
+        gr_target = float(GRIPPER_OPEN * (1.0 - gr_frac))
+        if stall_count >= RESIST_PATIENCE:
+            gr_target = hold_target
+
+        # Build full 18-DOF target: left arm locked at HOME, right arm + gripper controlled
+        full = HOME_FULL.copy()
+        for i, idx in enumerate(RIGHT_ARM_INDICES):
+            full[idx] = arm_target[i] if i < len(arm_target) else full[idx]
+        for idx in RIGHT_FINGER_INDICES:
+            full[idx] = gr_target
+        # PD control (physics_control=True)
+        from omni.isaac.core.utils.types import ArticulationAction
+        robot.apply_action(ArticulationAction(joint_positions=full.astype(np.float32)))
+        world.step(render=True)
+
+        # Contact detection
+        cur = _to_numpy(robot.get_joint_positions())
+        cur_finger_avg = float(np.mean([cur[idx] for idx in RIGHT_FINGER_INDICES]))
+        if stall_count < RESIST_PATIENCE and step >= MIN_CLOSE_STEP:
+            residual = cur_finger_avg - gr_target
+            if residual > RESIST_THRESHOLD:
+                stall_count += 1
+                if stall_count == RESIST_PATIENCE:
+                    hold_target = max(cur_finger_avg - SQUEEZE_OFFSET, 0.0)
+                    contact = True
+                    LOG.info("gripper contact at step %d, finger=%.4f, hold=%.4f", step, cur_finger_avg, hold_target)
+            else:
+                stall_count = 0
+
+    return hold_target, contact
 
 
 def _configure_bowl_collision(stage: Any, bowl_prim_path: Optional[str]) -> None:
@@ -1128,7 +1250,8 @@ def _compose_full_target_from_curobo(
     curobo_state: dict[str, Any],
     finger_target: float,
 ) -> np.ndarray:
-    targets = _to_numpy(current_full, dtype=np.float32).copy()
+    # Start from HOME_FULL to keep left arm locked (not from current which may have drifted)
+    targets = HOME_FULL.copy()
     targets[curobo_state["curobo_to_sim_arm"]] = _to_numpy(curobo_arm_target, dtype=np.float32)[: len(curobo_state["curobo_to_sim_arm"])]
     targets[RIGHT_FINGER_INDICES] = float(finger_target)
     return targets
@@ -1466,7 +1589,10 @@ def _episode_success(stage: Any, cube_prim_path: Optional[str], bowl_prim_path: 
     bowl_pos, _ = _get_prim_world_pose(stage, bowl_prim_path)
     xy_dist = float(np.linalg.norm(cube_pos[:2] - bowl_pos[:2]))
     z_delta = float(cube_pos[2] - bowl_pos[2])
-    return xy_dist <= 0.14 and z_delta <= 0.18
+    ok = xy_dist <= 0.14 and z_delta <= 0.18
+    LOG.info("success check: cube=%s bowl=%s xy=%.3f z_delta=%.3f → %s",
+             cube_pos[:3].tolist(), bowl_pos[:3].tolist(), xy_dist, z_delta, ok)
+    return ok
 
 
 def _move_cube_for_episode(
@@ -1506,6 +1632,12 @@ def _setup_scene_context(
 
     stage = _find_stage(simulation_app)
     robot_prim_path = _select_robot_prim(stage)
+    openarm_root = _openarm_root_from_robot_path(robot_prim_path)
+    # Apply friction BEFORE world.reset() to avoid invalidating physics tensor views
+    cube_prim_path = _find_named_prim(stage, ("cube", "cuboid"))
+    _apply_openarm_finger_friction(stage, robot_prim_path, cube_prim_path)
+    _configure_cube_physics(stage, cube_prim_path)
+    _step_world(world, simulation_app, render=True, steps=2)
     # Match Franka collector pattern: create Articulation, add to world scene,
     # reset world (creates PhysicsSimulationViews), step, then initialize.
     import time as _time_mod
@@ -1533,6 +1665,13 @@ def _setup_scene_context(
         for _ in range(30):
             simulation_app.update()
 
+    # Ensure physics is running before initialize
+    if world is not None and hasattr(world, "play"):
+        try:
+            world.play()
+        except Exception:
+            pass
+    _step_world(world, simulation_app, render=True, steps=5)
     if hasattr(robot, "initialize"):
         try:
             robot.initialize()
@@ -1586,7 +1725,6 @@ def _setup_scene_context(
         robot_prim_path=robot_prim_path,
         table_prim_path=table_prim_path,
     )
-
     return CollectorContext(
         stage=stage,
         robot=robot,
@@ -1633,6 +1771,7 @@ def _run_episode_simple(
         rng=rng,
         object_position_noise=object_position_noise,
     )
+    # Friction is applied in _setup_scene_context BEFORE world.reset()
     _step_world(world, simulation_app, render=True, steps=6)
 
     current = _to_numpy(ctx.robot.get_joint_positions())
@@ -1651,7 +1790,8 @@ def _run_episode_simple(
 
     # Convert dataset-order waypoint to 18-DOF sim target (same as _run_episode)
     def wp_to_full(wp_data: np.ndarray) -> np.ndarray:
-        current_full = _to_numpy(ctx.robot.get_joint_positions())
+        # Start from HOME_FULL to guarantee left arm stays locked
+        target = HOME_FULL.copy()
         arm_7 = np.zeros(7, dtype=np.float32)
         for sim_j in range(7):
             data_j = DATA_TO_SIM[sim_j]
@@ -1659,15 +1799,11 @@ def _run_episode_simple(
             if sim_j in NEGATED_SIM_JOINTS:
                 val = -val
             arm_7[sim_j] = val
-        target = current_full.copy()
         for i, idx in enumerate(RIGHT_ARM_INDICES):
             target[idx] = arm_7[i]
         finger_val = float(wp_data[7])
         for idx in RIGHT_FINGER_INDICES:
             target[idx] = finger_val
-        left_indices = [0, 2, 4, 6, 8, 10, 12, 14, 15]
-        for idx in left_indices:
-            target[idx] = HOME_FULL[idx]
         return target
 
     # Set initial pose
@@ -1697,12 +1833,57 @@ def _run_episode_simple(
 
         LOG.info("Episode %d: %s (%d steps, cuRobo)", episode_index + 1, wp_name, n_steps)
 
+        # CLOSE phase: physical gripper close with contact detection
+        if wp_name == "CLOSE":
+            arm_7 = _to_numpy(ctx.robot.get_joint_positions())[RIGHT_ARM_INDICES]
+            hold_target, contact = _physical_gripper_close(
+                robot=ctx.robot, world=world, simulation_app=simulation_app,
+                arm_target=arm_7, n_steps=n_steps,
+            )
+            # Record frames during close
+            for _ in range(n_steps):
+                cur = _to_numpy(ctx.robot.get_joint_positions())
+                obs_state = _full_to_dataset_state(cur)
+                act_state = obs_state.copy()
+                writer.add_frame(
+                    episode_index=episode_index, frame_index=frame_index,
+                    observation_state=obs_state, action=act_state,
+                    timestamp=time.time(), next_done=False,
+                )
+                if ctx.right_wrist_annotator is not None:
+                    try:
+                        rgba = np.asarray(ctx.right_wrist_annotator.get_data())
+                        if rgba.ndim == 3 and rgba.shape[-1] >= 3:
+                            writer.add_video_frame("right_wrist_cam", rgba[:, :, :3].astype(np.uint8))
+                    except Exception:
+                        pass
+                if ctx.left_wrist_annotator is not None:
+                    try:
+                        rgba = np.asarray(ctx.left_wrist_annotator.get_data())
+                        if rgba.ndim == 3 and rgba.shape[-1] >= 3:
+                            writer.add_video_frame("left_wrist_cam", rgba[:, :, :3].astype(np.uint8))
+                    except Exception:
+                        pass
+                frame_index += 1
+                from omni.isaac.core.utils.types import ArticulationAction
+                full = cur.copy()
+                for idx in RIGHT_FINGER_INDICES:
+                    full[idx] = hold_target
+                ctx.robot.apply_action(ArticulationAction(joint_positions=full.astype(np.float32)))
+                world.step(render=True)
+            if contact:
+                LOG.info("Episode %d: physical grasp contact detected, hold=%.4f", episode_index + 1, hold_target)
+            else:
+                LOG.warning("Episode %d: no gripper contact detected", episode_index + 1)
+            continue
+
         # Try cuRobo joint-space trajectory (smooth, collision-free)
         traj = _plan_openarm_curobo_joint_segment(
             curobo_state=ctx.curobo_state,
             current_full=start_full,
             target_full=target_full,
         )
+        use_pd = wp_name not in ("HOME", "APPROACH", "HOME_END")  # PD for grasp-related phases
         if traj is not None:
             # Execute cuRobo trajectory with recording
             for t_idx in range(traj.shape[0]):
@@ -1715,7 +1896,11 @@ def _run_episode_simple(
                     curobo_state=ctx.curobo_state,
                     finger_target=gripper_target,
                 )
-                ctx.robot.set_joint_positions(step_full)
+                if use_pd:
+                    from omni.isaac.core.utils.types import ArticulationAction
+                    ctx.robot.apply_action(ArticulationAction(joint_positions=step_full))
+                else:
+                    ctx.robot.set_joint_positions(step_full)
                 world.step(render=True)
                 obs_state = _full_to_dataset_state(_to_numpy(ctx.robot.get_joint_positions()))
                 act_state = _full_to_dataset_state(step_full)
@@ -1755,7 +1940,11 @@ def _run_episode_simple(
                     break
                 alpha = float(step + 1) / float(n_steps)
                 interp = ((1.0 - alpha) * start_full + alpha * target_full).astype(np.float32)
-                ctx.robot.set_joint_positions(interp)
+                if use_pd:
+                    from omni.isaac.core.utils.types import ArticulationAction
+                    ctx.robot.apply_action(ArticulationAction(joint_positions=interp))
+                else:
+                    ctx.robot.set_joint_positions(interp)
                 world.step(render=True)
                 obs_state = _full_to_dataset_state(_to_numpy(ctx.robot.get_joint_positions()))
                 act_state = _full_to_dataset_state(interp)
@@ -1787,18 +1976,12 @@ def _run_episode_simple(
                         pass
                 frame_index += 1
 
-        # Attachment/detachment logic (same as _run_episode)
-        if wp_name == "CLOSE" and ctx.cube_prim_path:
-            _create_attachment_joint(ctx.stage, ctx.right_eef_prim_path, ctx.cube_prim_path)
-            _step_world(world, simulation_app, render=True, steps=2)
-            LOG.info("Episode %d: attached cube", episode_index + 1)
+        # OPEN phase: release gripper
         if wp_name == "OPEN":
-            _remove_prim_if_exists(ctx.stage, ATTACHMENT_JOINT_PATH)
-            _step_world(world, simulation_app, render=True, steps=2)
-            LOG.info("Episode %d: released cube", episode_index + 1)
+            LOG.info("Episode %d: gripper opening (physical release)", episode_index + 1)
 
-    LOG.info("Episode %d: done, %d frames (cuRobo)", episode_index + 1, frame_index)
-    _remove_prim_if_exists(ctx.stage, ATTACHMENT_JOINT_PATH)
+    LOG.info("Episode %d: done, %d frames (cuRobo+physics)", episode_index + 1, frame_index)
+    _remove_prim_if_exists(ctx.stage, ATTACHMENT_JOINT_PATH)  # cleanup just in case
     _step_world(world, simulation_app, render=True, steps=6)
 
     if stop_event.is_set():
