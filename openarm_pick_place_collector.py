@@ -1000,16 +1000,21 @@ def _configure_openarm_drives(stage: Any, robot_prim_path: str) -> None:
             if d and d.GetStiffnessAttr():
                 drive = d
                 break
+        # For finger joints (including mimic), CREATE a linear drive if none exists.
+        # Mimic joints (finger_joint2) don't get drives from URDF import, but
+        # without a drive the PD target has no effect and the joint drifts.
+        if drive is None and name in finger_joints:
+            drive = _UsdPhysics.DriveAPI.Apply(prim, "linear")
+            LOG.info("created linear drive for mimic finger %s", name)
         if drive is None:
             continue
         if name in finger_joints:
-            # Finger: strong PD to track close ramp — matches Franka gains.
-            # kp=2000 + maxF=80N lets PD track the ramp properly so residual > 0.004
-            # genuinely means the fingers hit something (contact detection).
+            # Finger: strong PD to hold position. Both joint1 (driven) and
+            # joint2 (mimic) need drives because PhysX mimic constraints are
+            # soft and joint2 drifts without its own PD.
             drive.GetStiffnessAttr().Set(2000.0)
             drive.GetDampingAttr().Set(100.0)
-            if drive.GetMaxForceAttr():
-                drive.GetMaxForceAttr().Set(80.0)
+            drive.CreateMaxForceAttr(80.0)
             LOG.info("finger drive %s: kp=2000 kd=100 maxF=80", name)
         elif any(name.startswith(pfx) for pfx in arm_joints_prefix):
             # Arm: boost damping to reduce oscillation
