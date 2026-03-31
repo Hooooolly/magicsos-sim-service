@@ -140,17 +140,15 @@ CUROBO_RIGHT_EE_LINK = "openarm_right_hand"
 GRASP_QUAT_WXYZ = np.array([0.0505, 0.7232, 0.1517, 0.6719], dtype=np.float32)
 # Pre-grasp: offset back along approach direction (not straight up)
 PRE_GRASP_OFFSET = np.array([-0.08, 0.0, 0.06], dtype=np.float32)  # back + up from cube
-# Empirical offset from GT debug: at grasp endpoint, fmid was [0.073, 0.005, -0.027] from cube.
-# Add this to GRASP_OFFSET so finger clamping zone (fmid) aligns with cube center.
-GRASP_OFFSET = np.array([0.073, 0.005, -0.007], dtype=np.float32)
-LIFT_OFFSET = np.array([0.0, 0.0, 0.06], dtype=np.float32)  # gentle 6cm lift (was 15cm — too fast, ejects cube)
+GRASP_OFFSET = np.array([0.0, 0.0, 0.02], dtype=np.float32)  # slightly above cube center
+LIFT_OFFSET = np.array([0.0, 0.0, 0.06], dtype=np.float32)  # gentle 6cm lift
 BOWL_APPROACH_OFFSET = np.array([0.0, 0.0, 0.15], dtype=np.float32)
 PLACE_LOWER_OFFSET = np.array([0.0, 0.0, 0.05], dtype=np.float32)
 LINEAR_CARTESIAN_WAYPOINTS = 20
 GRIPPER_CLOSE_STEPS = 40  # match Franka — 0.04/0.002≈20 ramp + 20 hold
 GRIPPER_OPEN_STEPS = 15
 PRE_GRASP_IK_WAYPOINTS = 14
-LIFT_IK_WAYPOINTS = 30  # more waypoints = slower lift = less cube ejection
+LIFT_IK_WAYPOINTS = 30  # slow lift to avoid ejecting cube
 PLACE_IK_WAYPOINTS = 12
 CUROBO_SETTLE_STEPS = 6
 
@@ -1107,11 +1105,8 @@ def _compute_openarm_tip_mid_offset(
     if not (np.all(np.isfinite(hand_pos[:3])) and np.all(np.isfinite(rf_pos[:3]))):
         return None
 
-    # Use finger base midpoint (NOT TCP). OpenArm finger prismatic joints
-    # are at the finger base — the gripper clamps at this location, not at TCP.
-    # GT debug showed: TCP→cube=2.3cm (good) but fmid→cube=7.8cm (bad).
-    # We need fmid at cube, so use fmid as the reference point.
-    finger_mid = (0.5 * (rf_pos[:3] + lf_pos[:3])).astype(np.float32)
+    # Finger midpoint (no fingertip extension — OpenArm fingers are short prismatic)
+    finger_mid = 0.5 * (rf_pos[:3] + lf_pos[:3])
     offset_world = (finger_mid - hand_pos[:3]).astype(np.float32)
     rot_hand = _quat_to_rot_wxyz(hand_quat)
     offset_hand = (rot_hand.T @ offset_world).astype(np.float32)
@@ -1189,7 +1184,7 @@ def _physical_gripper_close(
     """
     RESIST_THRESHOLD = 0.004   # per-finger: 4mm gap = blocked
     RESIST_PATIENCE = 3        # 3 consecutive resistant steps = confirmed contact
-    SQUEEZE_OFFSET = 0.000     # no squeeze — just hold at contact width, rely on friction
+    SQUEEZE_OFFSET = 0.001     # 1mm inward — minimal squeeze to avoid ejecting cube
     MIN_CLOSE_STEP = 15        # skip early steps (PD still ramping)
     close_ramp_steps = max(int(GRIPPER_OPEN / 0.002), 1)  # ~20 steps
 
@@ -2004,11 +1999,9 @@ def _run_episode_simple(
     # EEF targets — tip_mid_correction is only 14mm (hand→finger_mid is very short on OpenArm)
     # so the main positioning error is PD tracking, not EEF→fingertip offset.
     # Keep correction for now but log it for debugging.
-    # GRASP_OFFSET includes empirical fmid→cube correction from GT debug.
-    # tip_mid_correction (14mm) is negligible compared to the 73mm empirical offset.
-    pre_grasp_pos = (cube_pos + PRE_GRASP_OFFSET).astype(np.float32)
-    grasp_pos = (cube_pos + GRASP_OFFSET).astype(np.float32)
-    lift_pos = (grasp_pos + LIFT_OFFSET).astype(np.float32)
+    pre_grasp_pos = (cube_pos + PRE_GRASP_OFFSET - tip_mid_correction).astype(np.float32)
+    grasp_pos = (cube_pos + GRASP_OFFSET - tip_mid_correction).astype(np.float32)
+    lift_pos = (cube_pos + GRASP_OFFSET + LIFT_OFFSET - tip_mid_correction).astype(np.float32)
     LOG.info("Targets: pre_grasp=%s grasp=%s cube=%s correction=%s",
              pre_grasp_pos.tolist(), grasp_pos.tolist(), cube_pos[:3].tolist(), tip_mid_correction.tolist())
 
@@ -2024,28 +2017,15 @@ def _run_episode_simple(
     def timeout_fn():
         return episode_timeout_sec > 0 and (time.time() - episode_start) > episode_timeout_sec
 
-    def _log_gt(label):
-        """Print all GT positions for debugging finger→cube alignment."""
-        hand = _get_prim_world_pose(ctx.stage, f"{ctx.openarm_root}/openarm_right_hand")[0][:3]
-        tcp = _get_prim_world_pose(ctx.stage, f"{ctx.openarm_root}/openarm_right_hand_tcp")[0][:3]
-        rf = _get_prim_world_pose(ctx.stage, f"{ctx.openarm_root}/openarm_right_right_finger")[0][:3]
-        lf = _get_prim_world_pose(ctx.stage, f"{ctx.openarm_root}/openarm_right_left_finger")[0][:3]
-        fmid = 0.5 * (rf + lf)
-        cb = _get_prim_world_pose(ctx.stage, ctx.cube_prim_path)[0][:3] if ctx.cube_prim_path else np.zeros(3)
-        cur = _to_numpy(ctx.robot.get_joint_positions())
-        finger_w = float(sum(cur[idx] for idx in RIGHT_FINGER_INDICES))
-        LOG.info("GT[%s] hand=[%.3f,%.3f,%.3f] tcp=[%.3f,%.3f,%.3f] Rf=[%.3f,%.3f,%.3f] Lf=[%.3f,%.3f,%.3f] fmid=[%.3f,%.3f,%.3f] cube=[%.3f,%.3f,%.3f] tcp→cube=%.3f fmid→cube=%.3f fw=%.4f",
-                 label,
-                 hand[0],hand[1],hand[2], tcp[0],tcp[1],tcp[2],
-                 rf[0],rf[1],rf[2], lf[0],lf[1],lf[2],
-                 fmid[0],fmid[1],fmid[2], cb[0],cb[1],cb[2],
-                 float(np.linalg.norm(tcp - cb)), float(np.linalg.norm(fmid - cb)), finger_w)
-
     def record_and_execute(traj, gripper_target, phase_name, is_final_phase=False):
-        """Execute cuRobo trajectory with direct PD control and record frames."""
+        """Execute cuRobo trajectory with direct PD control and record frames.
+
+        cuRobo trajectories are already smooth (interpolation_dt=0.03), so
+        rate-limiting is unnecessary and causes ~10cm tracking error.
+        Use direct apply_action with kp=2000 kd=200 for precise positioning.
+        """
         nonlocal frame_index, stopped
         from omni.isaac.core.utils.types import ArticulationAction
-        LOG.info("Executing %s: %d trajectory steps", phase_name, traj.shape[0])
         for t_idx in range(traj.shape[0]):
             if timeout_fn() or (stop_event is not None and stop_event.is_set()):
                 stopped = True
@@ -2058,9 +2038,6 @@ def _run_episode_simple(
             )
             ctx.robot.apply_action(ArticulationAction(joint_positions=step_full))
             world.step(render=True)
-            # Log GT every 30 frames (~1 second)
-            if t_idx % 30 == 0 or t_idx == traj.shape[0] - 1:
-                _log_gt(f"{phase_name}:{t_idx}/{traj.shape[0]}")
             # Record frame using actual positions
             obs_state = _full_to_dataset_state(_to_numpy(ctx.robot.get_joint_positions()))
             act_state = _full_to_dataset_state(step_full)
@@ -2132,7 +2109,11 @@ def _run_episode_simple(
             arm_cmd, gr_cmd = _step_toward_openarm_joint_targets(ctx.robot, cur[RIGHT_ARM_INDICES], GRIPPER_OPEN)
             _set_openarm_joint_targets(ctx.robot, arm_cmd, gr_cmd, physics_control=True)
             world.step(render=True)
-        _log_gt("after_settle")
+        # Log cube position after grasp approach
+        _cube_after_grasp = _get_prim_world_pose(ctx.stage, ctx.cube_prim_path)[0] if ctx.cube_prim_path else np.zeros(3)
+        LOG.info("AFTER GRASP APPROACH: cube=%s (moved %.4f from start)",
+                 _cube_after_grasp[:3].tolist(),
+                 float(np.linalg.norm(_cube_after_grasp[:3] - cube_pos[:3])))
 
         # 3. CLOSE gripper — log cube vs EEF position for debug
         # Get finger GT positions and their midpoint
@@ -2173,16 +2154,24 @@ def _run_episode_simple(
         else:
             LOG.warning("Episode %d: no gripper contact", episode_index + 1)
 
-        # Pre-lift settle: hold grip tight for 20 steps to stabilize before moving
-        from omni.isaac.core.utils.types import ArticulationAction
+        # Pre-lift settle: hold grip 20 steps
+        from omni.isaac.core.utils.types import ArticulationAction as _LiftAA
         for _ in range(20):
             cur = _to_numpy(ctx.robot.get_joint_positions())
             hold_full = HOME_FULL.copy()
             hold_full[RIGHT_ARM_INDICES] = cur[RIGHT_ARM_INDICES]
             for idx in RIGHT_FINGER_INDICES:
                 hold_full[idx] = hold_target
-            ctx.robot.apply_action(ArticulationAction(joint_positions=hold_full.astype(np.float32)))
+            ctx.robot.apply_action(_LiftAA(joint_positions=hold_full.astype(np.float32)))
             world.step(render=True)
+
+        # Log GT before lift
+        _hand = _get_prim_world_pose(ctx.stage, f"{ctx.openarm_root}/openarm_right_hand")[0][:3]
+        _fmid = 0.5 * (_get_prim_world_pose(ctx.stage, f"{ctx.openarm_root}/openarm_right_right_finger")[0][:3] + _get_prim_world_pose(ctx.stage, f"{ctx.openarm_root}/openarm_right_left_finger")[0][:3])
+        _cb = _get_prim_world_pose(ctx.stage, ctx.cube_prim_path)[0][:3] if ctx.cube_prim_path else np.zeros(3)
+        LOG.info("PRE-LIFT GT: hand=[%.3f,%.3f,%.3f] fmid=[%.3f,%.3f,%.3f] cube=[%.3f,%.3f,%.3f] fmid→cube=%.3f fw=%.4f",
+                 _hand[0],_hand[1],_hand[2], _fmid[0],_fmid[1],_fmid[2], _cb[0],_cb[1],_cb[2],
+                 float(np.linalg.norm(_fmid-_cb)), float(sum(_to_numpy(ctx.robot.get_joint_positions())[idx] for idx in RIGHT_FINGER_INDICES)))
 
         # 4. LIFT (linear IK — slow, many waypoints)
         LOG.info("Episode %d: LIFT", episode_index + 1)
