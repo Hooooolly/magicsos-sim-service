@@ -1201,7 +1201,8 @@ def _physical_gripper_close(
     MIN_DETECT_STEP = 25         # skip early transient dynamics
     MIN_CONTACT_WIDTH = 0.008    # per-finger >8mm = something between fingers
     # Cube is 30mm wide → each finger contacts at ~9mm. Below 8mm = near-closed (no object).
-    SQUEEZE_OFFSET = 0.002       # 2mm inward from stall point
+    SQUEEZE_OFFSET = 0.015       # 15mm inward from stall point (tight grip)
+    # 2mm was too loose — cube didn't lift. 15mm ensures firm grip.
 
     contact = False
     hold_gr_target = float(GRIPPER_CLOSED)
