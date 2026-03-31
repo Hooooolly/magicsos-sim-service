@@ -140,7 +140,9 @@ CUROBO_RIGHT_EE_LINK = "openarm_right_hand"
 GRASP_QUAT_WXYZ = np.array([0.0505, 0.7232, 0.1517, 0.6719], dtype=np.float32)
 # Pre-grasp: offset back along approach direction (not straight up)
 PRE_GRASP_OFFSET = np.array([-0.08, 0.0, 0.06], dtype=np.float32)  # back + up from cube
-GRASP_OFFSET = np.array([0.02, 0.0, 0.02], dtype=np.float32)  # +2cm X to compensate PD tracking lag
+# Empirical offset from GT debug: at grasp endpoint, fmid was [0.073, 0.005, -0.027] from cube.
+# Add this to GRASP_OFFSET so finger clamping zone (fmid) aligns with cube center.
+GRASP_OFFSET = np.array([0.073, 0.005, -0.007], dtype=np.float32)
 LIFT_OFFSET = np.array([0.0, 0.0, 0.06], dtype=np.float32)  # gentle 6cm lift (was 15cm — too fast, ejects cube)
 BOWL_APPROACH_OFFSET = np.array([0.0, 0.0, 0.15], dtype=np.float32)
 PLACE_LOWER_OFFSET = np.array([0.0, 0.0, 0.05], dtype=np.float32)
@@ -1105,17 +1107,11 @@ def _compute_openarm_tip_mid_offset(
     if not (np.all(np.isfinite(hand_pos[:3])) and np.all(np.isfinite(rf_pos[:3]))):
         return None
 
-    # Use TCP (hand_tcp) position as the fingertip midpoint reference.
-    # TCP is defined in URDF as a fixed joint 8cm from hand along hand Z.
-    # This is more reliable than extending finger base along finger local axes
-    # (finger Z doesn't point toward fingertip on OpenArm).
-    tcp_path = f"{openarm_root}/openarm_right_hand_tcp"
-    tcp_pos, _ = _get_prim_world_pose(stage, tcp_path)
-    if np.all(np.isfinite(tcp_pos[:3])):
-        finger_mid = tcp_pos[:3].astype(np.float32)
-    else:
-        # Fallback to finger base midpoint
-        finger_mid = (0.5 * (rf_pos[:3] + lf_pos[:3])).astype(np.float32)
+    # Use finger base midpoint (NOT TCP). OpenArm finger prismatic joints
+    # are at the finger base — the gripper clamps at this location, not at TCP.
+    # GT debug showed: TCP→cube=2.3cm (good) but fmid→cube=7.8cm (bad).
+    # We need fmid at cube, so use fmid as the reference point.
+    finger_mid = (0.5 * (rf_pos[:3] + lf_pos[:3])).astype(np.float32)
     offset_world = (finger_mid - hand_pos[:3]).astype(np.float32)
     rot_hand = _quat_to_rot_wxyz(hand_quat)
     offset_hand = (rot_hand.T @ offset_world).astype(np.float32)
@@ -2008,9 +2004,11 @@ def _run_episode_simple(
     # EEF targets — tip_mid_correction is only 14mm (hand→finger_mid is very short on OpenArm)
     # so the main positioning error is PD tracking, not EEF→fingertip offset.
     # Keep correction for now but log it for debugging.
-    pre_grasp_pos = (cube_pos + PRE_GRASP_OFFSET - tip_mid_correction).astype(np.float32)
-    grasp_pos = (cube_pos + GRASP_OFFSET - tip_mid_correction).astype(np.float32)
-    lift_pos = (cube_pos + GRASP_OFFSET + LIFT_OFFSET - tip_mid_correction).astype(np.float32)
+    # GRASP_OFFSET includes empirical fmid→cube correction from GT debug.
+    # tip_mid_correction (14mm) is negligible compared to the 73mm empirical offset.
+    pre_grasp_pos = (cube_pos + PRE_GRASP_OFFSET).astype(np.float32)
+    grasp_pos = (cube_pos + GRASP_OFFSET).astype(np.float32)
+    lift_pos = (grasp_pos + LIFT_OFFSET).astype(np.float32)
     LOG.info("Targets: pre_grasp=%s grasp=%s cube=%s correction=%s",
              pre_grasp_pos.tolist(), grasp_pos.tolist(), cube_pos[:3].tolist(), tip_mid_correction.tolist())
 
