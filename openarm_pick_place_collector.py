@@ -1182,7 +1182,7 @@ def _physical_gripper_close(
 
     Returns (hold_gripper_target, contact_detected).
     """
-    RESIST_THRESHOLD = 0.004   # per-finger: 4mm gap = blocked
+    RESIST_THRESHOLD = 0.010   # per-finger: 10mm gap = blocked (raised from 4mm — kp=2000 PD lag < 4mm causes false positives)
     RESIST_PATIENCE = 3        # 3 consecutive resistant steps = confirmed contact
     SQUEEZE_OFFSET = 0.001     # 1mm inward — minimal squeeze to avoid ejecting cube
     MIN_CLOSE_STEP = 15        # skip early steps (PD still ramping)
