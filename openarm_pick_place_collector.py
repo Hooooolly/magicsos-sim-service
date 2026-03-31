@@ -1105,8 +1105,14 @@ def _compute_openarm_tip_mid_offset(
     if not (np.all(np.isfinite(hand_pos[:3])) and np.all(np.isfinite(rf_pos[:3]))):
         return None
 
-    # Finger midpoint (no fingertip extension — OpenArm fingers are short prismatic)
-    finger_mid = 0.5 * (rf_pos[:3] + lf_pos[:3])
+    # Extend finger base to fingertip along each finger's local Z axis.
+    # OpenArm finger link center-of-mass is at z≈0.022 from base; fingertip ≈ 0.04m.
+    FINGERTIP_EXTENSION = 0.035  # meters along finger local Z
+    rf_quat = _get_prim_world_pose(stage, rf_path)[1]
+    lf_quat = _get_prim_world_pose(stage, lf_path)[1]
+    rf_tip = rf_pos[:3] + _quat_to_rot_wxyz(rf_quat)[:, 2] * FINGERTIP_EXTENSION
+    lf_tip = lf_pos[:3] + _quat_to_rot_wxyz(lf_quat)[:, 2] * FINGERTIP_EXTENSION
+    finger_mid = 0.5 * (rf_tip + lf_tip)
     offset_world = (finger_mid - hand_pos[:3]).astype(np.float32)
     rot_hand = _quat_to_rot_wxyz(hand_quat)
     offset_hand = (rot_hand.T @ offset_world).astype(np.float32)
