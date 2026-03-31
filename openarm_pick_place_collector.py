@@ -139,10 +139,8 @@ CUROBO_RIGHT_EE_LINK = "openarm_right_hand"
 # ee_link quat when gripper is at cube: wxyz = (0.0505, 0.7232, 0.1517, 0.6719)
 GRASP_QUAT_WXYZ = np.array([0.0505, 0.7232, 0.1517, 0.6719], dtype=np.float32)
 # Pre-grasp: offset back along approach direction (not straight up)
-PRE_GRASP_OFFSET = np.array([-0.08 + 0.028, 0.0 - 0.036, 0.06], dtype=np.float32)  # back + up + finger_mid calibration
-# Calibrated offset: measured finger_mid→cube = [0.028, -0.036, -0.015] at grasp pose.
-# Add this to GRASP_OFFSET so finger midpoint lands on cube center.
-GRASP_OFFSET = np.array([0.028, -0.036, 0.005], dtype=np.float32)
+PRE_GRASP_OFFSET = np.array([-0.08, 0.0, 0.06], dtype=np.float32)  # back + up from cube
+GRASP_OFFSET = np.array([0.0, 0.0, 0.02], dtype=np.float32)  # slightly above cube center
 LIFT_OFFSET = np.array([0.0, 0.0, 0.15], dtype=np.float32)
 BOWL_APPROACH_OFFSET = np.array([0.0, 0.0, 0.15], dtype=np.float32)
 PLACE_LOWER_OFFSET = np.array([0.0, 0.0, 0.05], dtype=np.float32)
