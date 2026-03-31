@@ -1996,10 +1996,17 @@ def _run_episode_simple(
         tip_mid_correction = (rot_grasp @ tip_mid_offset_hand).astype(np.float32)
         LOG.info("tip_mid correction (world): %s", tip_mid_correction.tolist())
 
-    # EEF targets: cube_pos + offset - tip_mid_correction → finger_mid lands on cube
+    # EEF targets — tip_mid_correction is only 14mm (hand→finger_mid is very short on OpenArm)
+    # so the main positioning error is PD tracking, not EEF→fingertip offset.
+    # Keep correction for now but log it for debugging.
     pre_grasp_pos = (cube_pos + PRE_GRASP_OFFSET - tip_mid_correction).astype(np.float32)
     grasp_pos = (cube_pos + GRASP_OFFSET - tip_mid_correction).astype(np.float32)
     lift_pos = (cube_pos + GRASP_OFFSET + LIFT_OFFSET - tip_mid_correction).astype(np.float32)
+    LOG.info("Targets: pre_grasp=%s grasp=%s cube=%s correction=%s",
+             pre_grasp_pos.tolist(), grasp_pos.tolist(), cube_pos[:3].tolist(), tip_mid_correction.tolist())
+
+    # Add settle steps after each trajectory to let PD converge to target
+    SETTLE_STEPS = 30  # extra frames at target to close PD tracking gap
     bowl_approach_pos = (bowl_pos + BOWL_APPROACH_OFFSET).astype(np.float32)
     place_pos = (bowl_pos + PLACE_LOWER_OFFSET).astype(np.float32)
 
@@ -2091,6 +2098,13 @@ def _run_episode_simple(
             raise RuntimeError("PRE_GRASP→GRASP planning failed")
         if not record_and_execute(traj, GRIPPER_OPEN, "grasp"):
             raise RuntimeError("PRE_GRASP→GRASP stopped")
+        # Settle: hold at grasp target to let PD converge
+        LOG.info("Episode %d: settling at grasp pose (%d steps)", episode_index + 1, SETTLE_STEPS)
+        for _ in range(SETTLE_STEPS):
+            cur = _to_numpy(ctx.robot.get_joint_positions())
+            arm_cmd, gr_cmd = _step_toward_openarm_joint_targets(ctx.robot, cur[RIGHT_ARM_INDICES], GRIPPER_OPEN)
+            _set_openarm_joint_targets(ctx.robot, arm_cmd, gr_cmd, physics_control=True)
+            world.step(render=True)
         # Log cube position after grasp approach
         _cube_after_grasp = _get_prim_world_pose(ctx.stage, ctx.cube_prim_path)[0] if ctx.cube_prim_path else np.zeros(3)
         LOG.info("AFTER GRASP APPROACH: cube=%s (moved %.4f from start)",
