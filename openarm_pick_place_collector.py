@@ -1105,14 +1105,17 @@ def _compute_openarm_tip_mid_offset(
     if not (np.all(np.isfinite(hand_pos[:3])) and np.all(np.isfinite(rf_pos[:3]))):
         return None
 
-    # Extend finger base to fingertip along each finger's local Z axis.
-    # OpenArm finger link center-of-mass is at z≈0.022 from base; fingertip ≈ 0.04m.
-    FINGERTIP_EXTENSION = 0.035  # meters along finger local Z
-    rf_quat = _get_prim_world_pose(stage, rf_path)[1]
-    lf_quat = _get_prim_world_pose(stage, lf_path)[1]
-    rf_tip = rf_pos[:3] + _quat_to_rot_wxyz(rf_quat)[:, 2] * FINGERTIP_EXTENSION
-    lf_tip = lf_pos[:3] + _quat_to_rot_wxyz(lf_quat)[:, 2] * FINGERTIP_EXTENSION
-    finger_mid = 0.5 * (rf_tip + lf_tip)
+    # Use TCP (hand_tcp) position as the fingertip midpoint reference.
+    # TCP is defined in URDF as a fixed joint 8cm from hand along hand Z.
+    # This is more reliable than extending finger base along finger local axes
+    # (finger Z doesn't point toward fingertip on OpenArm).
+    tcp_path = f"{openarm_root}/openarm_right_hand_tcp"
+    tcp_pos, _ = _get_prim_world_pose(stage, tcp_path)
+    if np.all(np.isfinite(tcp_pos[:3])):
+        finger_mid = tcp_pos[:3].astype(np.float32)
+    else:
+        # Fallback to finger base midpoint
+        finger_mid = (0.5 * (rf_pos[:3] + lf_pos[:3])).astype(np.float32)
     offset_world = (finger_mid - hand_pos[:3]).astype(np.float32)
     rot_hand = _quat_to_rot_wxyz(hand_quat)
     offset_hand = (rot_hand.T @ offset_world).astype(np.float32)
