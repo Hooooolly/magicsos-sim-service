@@ -138,8 +138,10 @@ CUROBO_RIGHT_EE_LINK = "openarm_right_hand"
 # Grasp orientation from replay data frame 260 (side-approach, not top-down)
 # ee_link quat when gripper is at cube: wxyz = (0.0505, 0.7232, 0.1517, 0.6719)
 GRASP_QUAT_WXYZ = np.array([0.0505, 0.7232, 0.1517, 0.6719], dtype=np.float32)
-# Pre-grasp: offset back along approach direction (not straight up)
-PRE_GRASP_OFFSET = np.array([-0.08, 0.0, 0.06], dtype=np.float32)  # back + up from cube
+# Pre-grasp: approach from directly above (avoid sweeping through cube)
+# The old offset [-0.08, 0, 0.06] caused HOME→PRE_GRASP trajectory to
+# sweep horizontally through the cube (cube not in cuRobo collision world).
+PRE_GRASP_OFFSET = np.array([0.0, 0.0, 0.12], dtype=np.float32)  # 12cm above cube
 GRASP_OFFSET = np.array([0.0, 0.0, 0.02], dtype=np.float32)  # slightly above cube center
 LIFT_OFFSET = np.array([0.0, 0.0, 0.06], dtype=np.float32)  # gentle 6cm lift
 BOWL_APPROACH_OFFSET = np.array([0.0, 0.0, 0.15], dtype=np.float32)
@@ -1197,7 +1199,8 @@ def _physical_gripper_close(
     VELOCITY_THRESHOLD = 0.0003  # per-finger: <0.3mm/step = stalled
     STALL_PATIENCE = 5           # 5 consecutive stalled steps = confirmed
     MIN_DETECT_STEP = 25         # skip early transient dynamics
-    MIN_CONTACT_WIDTH = 0.005    # per-finger >5mm = something between fingers
+    MIN_CONTACT_WIDTH = 0.008    # per-finger >8mm = something between fingers
+    # Cube is 30mm wide → each finger contacts at ~9mm. Below 8mm = near-closed (no object).
     SQUEEZE_OFFSET = 0.002       # 2mm inward from stall point
 
     contact = False
