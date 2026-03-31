@@ -2018,8 +2018,14 @@ def _run_episode_simple(
         return episode_timeout_sec > 0 and (time.time() - episode_start) > episode_timeout_sec
 
     def record_and_execute(traj, gripper_target, phase_name, is_final_phase=False):
-        """Execute cuRobo trajectory with rate-limited PD control and record frames."""
+        """Execute cuRobo trajectory with direct PD control and record frames.
+
+        cuRobo trajectories are already smooth (interpolation_dt=0.03), so
+        rate-limiting is unnecessary and causes ~10cm tracking error.
+        Use direct apply_action with kp=2000 kd=200 for precise positioning.
+        """
         nonlocal frame_index, stopped
+        from omni.isaac.core.utils.types import ArticulationAction
         for t_idx in range(traj.shape[0]):
             if timeout_fn() or (stop_event is not None and stop_event.is_set()):
                 stopped = True
@@ -2030,9 +2036,7 @@ def _run_episode_simple(
                 curobo_state=ctx.curobo_state,
                 finger_target=gripper_target,
             )
-            right_arm = step_full[RIGHT_ARM_INDICES]
-            arm_cmd, gr_cmd = _step_toward_openarm_joint_targets(ctx.robot, right_arm, gripper_target)
-            _set_openarm_joint_targets(ctx.robot, arm_cmd, gr_cmd, physics_control=True)
+            ctx.robot.apply_action(ArticulationAction(joint_positions=step_full))
             world.step(render=True)
             # Record frame using actual positions
             obs_state = _full_to_dataset_state(_to_numpy(ctx.robot.get_joint_positions()))
