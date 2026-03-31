@@ -1015,10 +1015,10 @@ def _configure_openarm_drives(stage: Any, robot_prim_path: str) -> None:
             # Arm: boost damping to reduce oscillation
             old_kp = drive.GetStiffnessAttr().Get() if drive.GetStiffnessAttr() else 0
             old_kd = drive.GetDampingAttr().Get() if drive.GetDampingAttr() else 0
-            # Official tuning: kp moderate, kd = kp/10 for near-critical damping
-            # kp=400 smooth but can't reach target; kp=1000 reaches but oscillates
-            new_kp = 800.0
-            new_kd = 80.0
+            # High kp for precise positioning + rate-limited PD prevents oscillation
+            # kp=800 had ~10cm steady-state error; kp=2000 should close to ~3cm
+            new_kp = 2000.0
+            new_kd = 200.0
             drive.GetStiffnessAttr().Set(new_kp)
             drive.GetDampingAttr().Set(new_kd)
             if drive.GetMaxForceAttr():
