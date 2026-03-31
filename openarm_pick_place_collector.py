@@ -140,7 +140,7 @@ CUROBO_RIGHT_EE_LINK = "openarm_right_hand"
 GRASP_QUAT_WXYZ = np.array([0.0505, 0.7232, 0.1517, 0.6719], dtype=np.float32)
 # Pre-grasp: offset back along approach direction (not straight up)
 PRE_GRASP_OFFSET = np.array([-0.08, 0.0, 0.06], dtype=np.float32)  # back + up from cube
-GRASP_OFFSET = np.array([0.0, 0.0, 0.02], dtype=np.float32)  # slightly above cube center
+GRASP_OFFSET = np.array([0.02, 0.0, 0.02], dtype=np.float32)  # +2cm X to compensate PD tracking lag
 LIFT_OFFSET = np.array([0.0, 0.0, 0.06], dtype=np.float32)  # gentle 6cm lift (was 15cm — too fast, ejects cube)
 BOWL_APPROACH_OFFSET = np.array([0.0, 0.0, 0.15], dtype=np.float32)
 PLACE_LOWER_OFFSET = np.array([0.0, 0.0, 0.05], dtype=np.float32)
