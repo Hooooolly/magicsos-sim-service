@@ -1898,7 +1898,27 @@ def _setup_scene_context(
         except Exception as _init_exc:
             LOG.warning("robot.initialize() failed: %s", _init_exc)
     _step_world(world, simulation_app, render=True, steps=5)
-    LOG.info("robot DOFs: %d names: %s", robot.num_dof, list(robot.dof_names)[:5])
+    LOG.info("robot DOFs: %d names: %s", robot.num_dof, list(robot.dof_names))
+
+    # Re-apply drives AFTER initialize — Articulation.initialize() may reset PD gains.
+    # Also set gains via Articulation API (more reliable than USD DriveAPI post-reset).
+    _configure_openarm_drives(stage, robot_prim_path)
+    try:
+        n_dof = robot.num_dof
+        kps = np.full(n_dof, 2000.0, dtype=np.float32)
+        kds = np.full(n_dof, 200.0, dtype=np.float32)
+        # Fingers: kp=2000, kd=100 (lower damping for faster close)
+        for idx in RIGHT_FINGER_INDICES:
+            kds[idx] = 100.0
+        robot.set_gains(kps=kps, kds=kds)
+        LOG.info("set_gains via Articulation API: kps=[2000]*%d, finger_kd=100", n_dof)
+    except Exception as _gains_exc:
+        LOG.warning("set_gains failed (will rely on USD drives): %s", _gains_exc)
+
+    # Diagnostic: read actual joint positions to verify finger tracking
+    _diag_pos = _to_numpy(robot.get_joint_positions())
+    LOG.info("post-init joints[16:18] (fingers): %.4f %.4f (expect ~0.04 for GRIPPER_OPEN)",
+             float(_diag_pos[16]), float(_diag_pos[17]))
 
     openarm_root = _openarm_root_from_robot_path(robot_prim_path)
     camera_cfg = _load_right_wrist_camera_cfg()
@@ -2121,12 +2141,20 @@ def _run_episode_simple(
             raise RuntimeError("PRE_GRASP→GRASP planning failed")
         if not record_and_execute(traj, GRIPPER_OPEN, "grasp"):
             raise RuntimeError("PRE_GRASP→GRASP stopped")
-        # Settle: hold at grasp target to let PD converge
+        # Settle: hold at LAST trajectory target (not current) via direct apply_action
+        # Bug fix: using cur[RIGHT_ARM_INDICES] as target held at imprecise position
+        # instead of converging to desired grasp pose (caused ~30mm positioning error).
+        grasp_arm_target = traj[-1] if traj is not None and traj.shape[0] > 0 else _to_numpy(ctx.robot.get_joint_positions())[RIGHT_ARM_INDICES]
         LOG.info("Episode %d: settling at grasp pose (%d steps)", episode_index + 1, SETTLE_STEPS)
+        from omni.isaac.core.utils.types import ArticulationAction as _SettleAA
         for _ in range(SETTLE_STEPS):
-            cur = _to_numpy(ctx.robot.get_joint_positions())
-            arm_cmd, gr_cmd = _step_toward_openarm_joint_targets(ctx.robot, cur[RIGHT_ARM_INDICES], GRIPPER_OPEN)
-            _set_openarm_joint_targets(ctx.robot, arm_cmd, gr_cmd, physics_control=True)
+            settle_full = _compose_full_target_from_curobo(
+                current_full=_to_numpy(ctx.robot.get_joint_positions()),
+                curobo_arm_target=grasp_arm_target,
+                curobo_state=ctx.curobo_state,
+                finger_target=GRIPPER_OPEN,
+            )
+            ctx.robot.apply_action(_SettleAA(joint_positions=settle_full))
             world.step(render=True)
         # Log cube position after grasp approach
         _cube_after_grasp = _get_prim_world_pose(ctx.stage, ctx.cube_prim_path)[0] if ctx.cube_prim_path else np.zeros(3)
