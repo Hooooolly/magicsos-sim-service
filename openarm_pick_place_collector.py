@@ -145,7 +145,7 @@ LIFT_OFFSET = np.array([0.0, 0.0, 0.06], dtype=np.float32)  # gentle 6cm lift
 BOWL_APPROACH_OFFSET = np.array([0.0, 0.0, 0.15], dtype=np.float32)
 PLACE_LOWER_OFFSET = np.array([0.0, 0.0, 0.05], dtype=np.float32)
 LINEAR_CARTESIAN_WAYPOINTS = 20
-GRIPPER_CLOSE_STEPS = 40  # match Franka — 0.04/0.002≈20 ramp + 20 hold
+GRIPPER_CLOSE_STEPS = 50  # 20 ramp + 10 settle + 20 detection window
 GRIPPER_OPEN_STEPS = 15
 PRE_GRASP_IK_WAYPOINTS = 14
 LIFT_IK_WAYPOINTS = 30  # slow lift to avoid ejecting cube
@@ -1185,7 +1185,7 @@ def _physical_gripper_close(
     RESIST_THRESHOLD = 0.010   # per-finger: 10mm gap = blocked (raised from 4mm — kp=2000 PD lag < 4mm causes false positives)
     RESIST_PATIENCE = 3        # 3 consecutive resistant steps = confirmed contact
     SQUEEZE_OFFSET = 0.001     # 1mm inward — minimal squeeze to avoid ejecting cube
-    MIN_CLOSE_STEP = 15        # skip early steps (PD still ramping)
+    MIN_CLOSE_STEP = 30        # ramp ends at step ~20 (0.04/0.002), wait 10 more for PD to converge
     close_ramp_steps = max(int(GRIPPER_OPEN / 0.002), 1)  # ~20 steps
 
     stall_count = 0
