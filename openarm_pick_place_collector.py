@@ -1184,7 +1184,7 @@ def _physical_gripper_close(
     """
     RESIST_THRESHOLD = 0.004   # per-finger: 4mm gap = blocked
     RESIST_PATIENCE = 3        # 3 consecutive resistant steps = confirmed contact
-    SQUEEZE_OFFSET = 0.002     # 2mm inward — less squeeze = less ejection risk
+    SQUEEZE_OFFSET = 0.000     # no squeeze — just hold at contact width, rely on friction
     MIN_CLOSE_STEP = 15        # skip early steps (PD still ramping)
     close_ramp_steps = max(int(GRIPPER_OPEN / 0.002), 1)  # ~20 steps
 
