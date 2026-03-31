@@ -141,14 +141,14 @@ GRASP_QUAT_WXYZ = np.array([0.0505, 0.7232, 0.1517, 0.6719], dtype=np.float32)
 # Pre-grasp: offset back along approach direction (not straight up)
 PRE_GRASP_OFFSET = np.array([-0.08, 0.0, 0.06], dtype=np.float32)  # back + up from cube
 GRASP_OFFSET = np.array([0.0, 0.0, 0.02], dtype=np.float32)  # slightly above cube center
-LIFT_OFFSET = np.array([0.0, 0.0, 0.15], dtype=np.float32)
+LIFT_OFFSET = np.array([0.0, 0.0, 0.06], dtype=np.float32)  # gentle 6cm lift (was 15cm — too fast, ejects cube)
 BOWL_APPROACH_OFFSET = np.array([0.0, 0.0, 0.15], dtype=np.float32)
 PLACE_LOWER_OFFSET = np.array([0.0, 0.0, 0.05], dtype=np.float32)
 LINEAR_CARTESIAN_WAYPOINTS = 20
 GRIPPER_CLOSE_STEPS = 40  # match Franka — 0.04/0.002≈20 ramp + 20 hold
 GRIPPER_OPEN_STEPS = 15
 PRE_GRASP_IK_WAYPOINTS = 14
-LIFT_IK_WAYPOINTS = 12
+LIFT_IK_WAYPOINTS = 30  # more waypoints = slower lift = less cube ejection
 PLACE_IK_WAYPOINTS = 12
 CUROBO_SETTLE_STEPS = 6
 
@@ -2154,7 +2154,18 @@ def _run_episode_simple(
         else:
             LOG.warning("Episode %d: no gripper contact", episode_index + 1)
 
-        # 4. LIFT (linear IK or MotionGen)
+        # Pre-lift settle: hold grip tight for 20 steps to stabilize before moving
+        from omni.isaac.core.utils.types import ArticulationAction
+        for _ in range(20):
+            cur = _to_numpy(ctx.robot.get_joint_positions())
+            hold_full = HOME_FULL.copy()
+            hold_full[RIGHT_ARM_INDICES] = cur[RIGHT_ARM_INDICES]
+            for idx in RIGHT_FINGER_INDICES:
+                hold_full[idx] = hold_target
+            ctx.robot.apply_action(ArticulationAction(joint_positions=hold_full.astype(np.float32)))
+            world.step(render=True)
+
+        # 4. LIFT (linear IK — slow, many waypoints)
         LOG.info("Episode %d: LIFT", episode_index + 1)
         traj = _plan_openarm_linear_ik_segment(
             curobo_state=ctx.curobo_state,
