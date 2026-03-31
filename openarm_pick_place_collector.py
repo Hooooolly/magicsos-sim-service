@@ -1082,6 +1082,42 @@ def _rate_limited_apply(robot: Any, target_full: np.ndarray) -> np.ndarray:
     return smoothed
 
 
+def _compute_openarm_tip_mid_offset(
+    stage: Any,
+    openarm_root: str,
+) -> Optional[np.ndarray]:
+    """Measure fingertip-midpoint offset in hand frame (Franka-style).
+
+    Returns offset_hand such that:
+        tip_mid_world = hand_pos + rot(hand_quat) @ offset_hand
+
+    To place tip_mid at cube center:
+        eef_target = cube_pos - rot(grasp_quat) @ offset_hand
+    """
+    hand_path = f"{openarm_root}/openarm_right_hand"
+    rf_path = f"{openarm_root}/openarm_right_right_finger"
+    lf_path = f"{openarm_root}/openarm_right_left_finger"
+
+    hand_pos, hand_quat = _get_prim_world_pose(stage, hand_path)
+    rf_pos, _ = _get_prim_world_pose(stage, rf_path)
+    lf_pos, _ = _get_prim_world_pose(stage, lf_path)
+
+    if not (np.all(np.isfinite(hand_pos[:3])) and np.all(np.isfinite(rf_pos[:3]))):
+        return None
+
+    # Finger midpoint (no fingertip extension — OpenArm fingers are short prismatic)
+    finger_mid = 0.5 * (rf_pos[:3] + lf_pos[:3])
+    offset_world = (finger_mid - hand_pos[:3]).astype(np.float32)
+    rot_hand = _quat_to_rot_wxyz(hand_quat)
+    offset_hand = (rot_hand.T @ offset_world).astype(np.float32)
+
+    if float(np.linalg.norm(offset_hand)) < 1e-6:
+        return None
+    LOG.info("tip_mid offset in hand frame: %s (norm=%.4f)",
+             offset_hand.tolist(), float(np.linalg.norm(offset_hand)))
+    return offset_hand
+
+
 def _step_toward_openarm_joint_targets(
     robot: Any,
     right_arm_target: np.ndarray,
@@ -1949,9 +1985,21 @@ def _run_episode_simple(
     bowl_pos = _get_prim_world_pose(ctx.stage, ctx.bowl_prim_path)[0] if ctx.bowl_prim_path else ctx.bowl_base_pos.copy()
     robot_base_pos, robot_base_quat = _get_prim_world_pose(ctx.stage, ctx.robot_prim_path)
     grasp_quat = GRASP_QUAT_WXYZ.copy()
-    pre_grasp_pos = (cube_pos + PRE_GRASP_OFFSET).astype(np.float32)
-    grasp_pos = (cube_pos + GRASP_OFFSET).astype(np.float32)
-    lift_pos = (grasp_pos + LIFT_OFFSET).astype(np.float32)
+
+    # Compute hand→finger_mid offset to align fingertip midpoint with cube center.
+    # cuRobo targets the EEF (hand wrist), so we subtract the rotated offset
+    # so that finger_mid (not hand) lands on cube_pos.
+    tip_mid_offset_hand = _compute_openarm_tip_mid_offset(ctx.stage, ctx.openarm_root)
+    tip_mid_correction = np.zeros(3, dtype=np.float32)
+    if tip_mid_offset_hand is not None:
+        rot_grasp = _quat_to_rot_wxyz(grasp_quat)
+        tip_mid_correction = (rot_grasp @ tip_mid_offset_hand).astype(np.float32)
+        LOG.info("tip_mid correction (world): %s", tip_mid_correction.tolist())
+
+    # EEF targets: cube_pos + offset - tip_mid_correction → finger_mid lands on cube
+    pre_grasp_pos = (cube_pos + PRE_GRASP_OFFSET - tip_mid_correction).astype(np.float32)
+    grasp_pos = (cube_pos + GRASP_OFFSET - tip_mid_correction).astype(np.float32)
+    lift_pos = (cube_pos + GRASP_OFFSET + LIFT_OFFSET - tip_mid_correction).astype(np.float32)
     bowl_approach_pos = (bowl_pos + BOWL_APPROACH_OFFSET).astype(np.float32)
     place_pos = (bowl_pos + PLACE_LOWER_OFFSET).astype(np.float32)
 
