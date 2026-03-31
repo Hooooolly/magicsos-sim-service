@@ -2026,15 +2026,28 @@ def _run_episode_simple(
     def timeout_fn():
         return episode_timeout_sec > 0 and (time.time() - episode_start) > episode_timeout_sec
 
-    def record_and_execute(traj, gripper_target, phase_name, is_final_phase=False):
-        """Execute cuRobo trajectory with direct PD control and record frames.
+    def _log_gt(label):
+        """Print all GT positions for debugging finger→cube alignment."""
+        hand = _get_prim_world_pose(ctx.stage, f"{ctx.openarm_root}/openarm_right_hand")[0][:3]
+        tcp = _get_prim_world_pose(ctx.stage, f"{ctx.openarm_root}/openarm_right_hand_tcp")[0][:3]
+        rf = _get_prim_world_pose(ctx.stage, f"{ctx.openarm_root}/openarm_right_right_finger")[0][:3]
+        lf = _get_prim_world_pose(ctx.stage, f"{ctx.openarm_root}/openarm_right_left_finger")[0][:3]
+        fmid = 0.5 * (rf + lf)
+        cb = _get_prim_world_pose(ctx.stage, ctx.cube_prim_path)[0][:3] if ctx.cube_prim_path else np.zeros(3)
+        cur = _to_numpy(ctx.robot.get_joint_positions())
+        finger_w = float(sum(cur[idx] for idx in RIGHT_FINGER_INDICES))
+        LOG.info("GT[%s] hand=[%.3f,%.3f,%.3f] tcp=[%.3f,%.3f,%.3f] Rf=[%.3f,%.3f,%.3f] Lf=[%.3f,%.3f,%.3f] fmid=[%.3f,%.3f,%.3f] cube=[%.3f,%.3f,%.3f] tcp→cube=%.3f fmid→cube=%.3f fw=%.4f",
+                 label,
+                 hand[0],hand[1],hand[2], tcp[0],tcp[1],tcp[2],
+                 rf[0],rf[1],rf[2], lf[0],lf[1],lf[2],
+                 fmid[0],fmid[1],fmid[2], cb[0],cb[1],cb[2],
+                 float(np.linalg.norm(tcp - cb)), float(np.linalg.norm(fmid - cb)), finger_w)
 
-        cuRobo trajectories are already smooth (interpolation_dt=0.03), so
-        rate-limiting is unnecessary and causes ~10cm tracking error.
-        Use direct apply_action with kp=2000 kd=200 for precise positioning.
-        """
+    def record_and_execute(traj, gripper_target, phase_name, is_final_phase=False):
+        """Execute cuRobo trajectory with direct PD control and record frames."""
         nonlocal frame_index, stopped
         from omni.isaac.core.utils.types import ArticulationAction
+        LOG.info("Executing %s: %d trajectory steps", phase_name, traj.shape[0])
         for t_idx in range(traj.shape[0]):
             if timeout_fn() or (stop_event is not None and stop_event.is_set()):
                 stopped = True
@@ -2047,6 +2060,9 @@ def _run_episode_simple(
             )
             ctx.robot.apply_action(ArticulationAction(joint_positions=step_full))
             world.step(render=True)
+            # Log GT every 30 frames (~1 second)
+            if t_idx % 30 == 0 or t_idx == traj.shape[0] - 1:
+                _log_gt(f"{phase_name}:{t_idx}/{traj.shape[0]}")
             # Record frame using actual positions
             obs_state = _full_to_dataset_state(_to_numpy(ctx.robot.get_joint_positions()))
             act_state = _full_to_dataset_state(step_full)
@@ -2118,11 +2134,7 @@ def _run_episode_simple(
             arm_cmd, gr_cmd = _step_toward_openarm_joint_targets(ctx.robot, cur[RIGHT_ARM_INDICES], GRIPPER_OPEN)
             _set_openarm_joint_targets(ctx.robot, arm_cmd, gr_cmd, physics_control=True)
             world.step(render=True)
-        # Log cube position after grasp approach
-        _cube_after_grasp = _get_prim_world_pose(ctx.stage, ctx.cube_prim_path)[0] if ctx.cube_prim_path else np.zeros(3)
-        LOG.info("AFTER GRASP APPROACH: cube=%s (moved %.4f from start)",
-                 _cube_after_grasp[:3].tolist(),
-                 float(np.linalg.norm(_cube_after_grasp[:3] - cube_pos[:3])))
+        _log_gt("after_settle")
 
         # 3. CLOSE gripper — log cube vs EEF position for debug
         # Get finger GT positions and their midpoint
