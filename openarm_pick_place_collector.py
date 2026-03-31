@@ -1878,9 +1878,14 @@ def _setup_scene_context(
                 world.reset()
             else:
                 raise
+        # Set PD targets to HOME DURING warmup steps, not after.
+        # world.reset() defaults drive targets to 0 — without this, fingers
+        # close to 0 and arm drifts under gravity during the 30 warmup steps.
+        from omni.isaac.core.utils.types import ArticulationAction as _WarmupAA
         for _ in range(30):
+            robot.apply_action(_WarmupAA(joint_positions=HOME_FULL.copy()))
             world.step(render=True)
-        LOG.info("world.reset() + 30 steps done")
+        LOG.info("world.reset() + 30 steps done (with HOME PD targets)")
     else:
         for _ in range(30):
             simulation_app.update()
@@ -1891,29 +1896,23 @@ def _setup_scene_context(
             world.play()
         except Exception:
             pass
-    _step_world(world, simulation_app, render=True, steps=5)
+    # Keep applying HOME targets during init steps (PD targets must persist)
+    from omni.isaac.core.utils.types import ArticulationAction as _InitAA
+    for _ in range(5):
+        robot.apply_action(_InitAA(joint_positions=HOME_FULL.copy()))
+        world.step(render=True)
     if hasattr(robot, "initialize"):
         try:
             robot.initialize()
         except Exception as _init_exc:
             LOG.warning("robot.initialize() failed: %s", _init_exc)
-    _step_world(world, simulation_app, render=True, steps=5)
+    for _ in range(5):
+        robot.apply_action(_InitAA(joint_positions=HOME_FULL.copy()))
+        world.step(render=True)
     LOG.info("robot DOFs: %d names: %s", robot.num_dof, list(robot.dof_names))
 
-    # Re-apply drives AFTER initialize — Articulation.initialize() may reset PD gains.
-    # Also set gains via Articulation API (more reliable than USD DriveAPI post-reset).
+    # Re-apply drives AFTER initialize
     _configure_openarm_drives(stage, robot_prim_path)
-    try:
-        n_dof = robot.num_dof
-        kps = np.full(n_dof, 2000.0, dtype=np.float32)
-        kds = np.full(n_dof, 200.0, dtype=np.float32)
-        # Fingers: kp=2000, kd=100 (lower damping for faster close)
-        for idx in RIGHT_FINGER_INDICES:
-            kds[idx] = 100.0
-        robot.set_gains(kps=kps, kds=kds)
-        LOG.info("set_gains via Articulation API: kps=[2000]*%d, finger_kd=100", n_dof)
-    except Exception as _gains_exc:
-        LOG.warning("set_gains failed (will rely on USD drives): %s", _gains_exc)
 
     # Diagnostic: read actual joint positions to verify finger tracking
     _diag_pos = _to_numpy(robot.get_joint_positions())
@@ -2091,10 +2090,14 @@ def _run_episode_simple(
             frame_index += 1
         return True
 
-    # Set homing pose
+    # Set homing pose: teleport first (instant position), then apply_action
+    # to set PD targets (so fingers don't close back to 0 on next step).
     home_targets = _compose_home_full_target(current, finger_target=GRIPPER_OPEN)
     _apply_joint_targets(ctx.robot, home_targets, physics_control=False)
-    _step_world(world, simulation_app, render=True, steps=10)
+    from omni.isaac.core.utils.types import ArticulationAction as _HomeAA
+    for _ in range(10):
+        ctx.robot.apply_action(_HomeAA(joint_positions=home_targets.copy()))
+        world.step(render=True)
     LOG.info("Episode %d: Cartesian cuRobo (cube=%s bowl=%s)", episode_index + 1,
              cube_pos[:3].tolist(), bowl_pos[:3].tolist())
 
