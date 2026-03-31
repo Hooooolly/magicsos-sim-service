@@ -2003,6 +2003,13 @@ def _run_episode_simple(
     _remove_prim_if_exists(ctx.stage, ATTACHMENT_JOINT_PATH)
     _world_reset(world, simulation_app)
 
+    # After world.reset(), PD targets revert to 0. Re-apply HOME targets
+    # so fingers stay open and arm holds position during warmup steps.
+    from omni.isaac.core.utils.types import ArticulationAction as _EpResetAA
+    for _ in range(8):
+        ctx.robot.apply_action(_EpResetAA(joint_positions=HOME_FULL.copy()))
+        world.step(render=True)
+
     _move_cube_for_episode(
         stage=ctx.stage,
         cube_prim_path=ctx.cube_prim_path,
@@ -2010,9 +2017,13 @@ def _run_episode_simple(
         rng=rng,
         object_position_noise=object_position_noise,
     )
-    _step_world(world, simulation_app, render=True, steps=6)
+    for _ in range(6):
+        ctx.robot.apply_action(_EpResetAA(joint_positions=HOME_FULL.copy()))
+        world.step(render=True)
 
     current = _to_numpy(ctx.robot.get_joint_positions())
+    LOG.info("episode reset finger pos: [%.4f, %.4f] (expect ~0.04)",
+             float(current[16]), float(current[17]))
     if current.size < 18:
         raise RuntimeError(f"Expected OpenArm articulation with 18 DOF, got {current.size}.")
     if ctx.curobo_state is None:
@@ -2076,6 +2087,13 @@ def _run_episode_simple(
             )
             ctx.robot.apply_action(ArticulationAction(joint_positions=step_full))
             world.step(render=True)
+            # Log finger tracking at start, middle, and end of trajectory
+            if t_idx in (0, traj.shape[0] // 2, traj.shape[0] - 1):
+                _act = _to_numpy(ctx.robot.get_joint_positions())
+                LOG.info("%s t=%d/%d finger_tgt=%.4f finger_act=[%.4f,%.4f] cmd=[%.4f,%.4f]",
+                         phase_name, t_idx, traj.shape[0], gripper_target,
+                         float(_act[16]), float(_act[17]),
+                         float(step_full[16]), float(step_full[17]))
             # Record frame using actual positions
             obs_state = _full_to_dataset_state(_to_numpy(ctx.robot.get_joint_positions()))
             act_state = _full_to_dataset_state(step_full)
