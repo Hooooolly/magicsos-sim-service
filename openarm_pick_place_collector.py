@@ -1171,56 +1171,75 @@ def _set_openarm_joint_targets(
 
 def _physical_gripper_close(
     robot: Any, world: Any, simulation_app: Any,
-    arm_target: np.ndarray, n_steps: int = 40,
+    arm_target: np.ndarray, n_steps: int = 60,
 ) -> tuple[float, bool]:
-    """Close gripper with Franka-style contact detection.
+    """Close gripper with velocity-based contact detection.
 
-    Ramps gripper from OPEN to CLOSED over ~20 steps via rate-limited PD.
-    Monitors residual (actual finger width - commanded target): when fingers
-    stall on an object, residual exceeds RESIST_THRESHOLD for RESIST_PATIENCE
-    consecutive steps.  On confirmed contact, holds at squeeze position.
+    Uses direct apply_action (no rate limiter) for faster PD convergence.
+    The old residual-based approach failed because OpenArm's PD finger drives
+    converge much slower than Franka's, causing false positives (residual from
+    PD lag, not actual contact).
+
+    Velocity-based detection: when finger position stops changing (stalled on
+    object) while still open, that's genuine contact. Free-closing fingers keep
+    moving; blocked fingers don't.
 
     Returns (hold_gripper_target, contact_detected).
     """
-    RESIST_THRESHOLD = 0.010   # per-finger: 10mm gap = blocked (raised from 4mm — kp=2000 PD lag < 4mm causes false positives)
-    RESIST_PATIENCE = 3        # 3 consecutive resistant steps = confirmed contact
-    SQUEEZE_OFFSET = 0.001     # 1mm inward — minimal squeeze to avoid ejecting cube
-    MIN_CLOSE_STEP = 30        # ramp ends at step ~20 (0.04/0.002), wait 10 more for PD to converge
-    close_ramp_steps = max(int(GRIPPER_OPEN / 0.002), 1)  # ~20 steps
+    from omni.isaac.core.utils.types import ArticulationAction
 
-    stall_count = 0
-    hold_gr_target = float(GRIPPER_CLOSED)
+    RAMP_STEPS = 20              # ramp OPEN→CLOSED over 20 steps (0.002/step)
+    VELOCITY_THRESHOLD = 0.0003  # per-finger: <0.3mm/step = stalled
+    STALL_PATIENCE = 5           # 5 consecutive stalled steps = confirmed
+    MIN_DETECT_STEP = 25         # skip early transient dynamics
+    MIN_CONTACT_WIDTH = 0.005    # per-finger >5mm = something between fingers
+    SQUEEZE_OFFSET = 0.002       # 2mm inward from stall point
+
     contact = False
+    hold_gr_target = float(GRIPPER_CLOSED)
+    stall_count = 0
+    prev_finger_avg = None
 
     for step in range(n_steps):
-        # Ramp gripper target from OPEN to CLOSED
-        gr_frac = min(1.0, float(step + 1) / float(close_ramp_steps))
-        gr_target = float(GRIPPER_OPEN * (1.0 - gr_frac))
-        # If contact confirmed, hold at squeeze position
-        if stall_count >= RESIST_PATIENCE:
+        # Ramp gripper target: OPEN→CLOSED over RAMP_STEPS, then hold
+        if contact:
             gr_target = hold_gr_target
+        else:
+            gr_frac = min(1.0, float(step + 1) / float(RAMP_STEPS))
+            gr_target = float(GRIPPER_OPEN * (1.0 - gr_frac))
 
-        # Rate-limited PD control (not teleport)
-        arm_cmd, gr_cmd = _step_toward_openarm_joint_targets(robot, arm_target, gr_target)
-        _set_openarm_joint_targets(robot, arm_cmd, gr_cmd, physics_control=True)
+        # Direct apply_action — no rate limiter
+        # (rate limiter caused double-limiting on top of ramp, PD couldn't converge)
+        full = HOME_FULL.copy()
+        full[RIGHT_ARM_INDICES] = np.asarray(arm_target, dtype=np.float32)[:7]
+        full[RIGHT_FINGER_INDICES] = gr_target
+        robot.apply_action(ArticulationAction(joint_positions=full.astype(np.float32)))
         world.step(render=True)
 
-        # Contact detection: total gripper width vs commanded target
+        # Read actual finger positions
         cur = _to_numpy(robot.get_joint_positions())
-        cur_gw = float(sum(cur[idx] for idx in RIGHT_FINGER_INDICES))
-        per_finger_avg = cur_gw / len(RIGHT_FINGER_INDICES)
+        per_finger_avg = float(np.mean([cur[idx] for idx in RIGHT_FINGER_INDICES]))
 
-        if stall_count < RESIST_PATIENCE and cur_gw > 0 and step >= MIN_CLOSE_STEP:
-            residual = per_finger_avg - gr_target
-            if residual > RESIST_THRESHOLD:
+        # Velocity-based contact detection
+        if not contact and step >= MIN_DETECT_STEP and prev_finger_avg is not None:
+            velocity = abs(per_finger_avg - prev_finger_avg)
+            if velocity < VELOCITY_THRESHOLD and per_finger_avg > MIN_CONTACT_WIDTH:
                 stall_count += 1
-                if stall_count == RESIST_PATIENCE:
+                if stall_count >= STALL_PATIENCE:
                     hold_gr_target = max(per_finger_avg - SQUEEZE_OFFSET, 0.0)
                     contact = True
-                    LOG.info("contact at step %d, total_w=%.4f, hold=%.4f",
-                             step, cur_gw, hold_gr_target)
+                    LOG.info("contact at step %d, v=%.5f, finger=%.4f, hold=%.4f",
+                             step, velocity, per_finger_avg, hold_gr_target)
             else:
                 stall_count = 0
+
+        # Debug log every 20 steps
+        if step % 20 == 0 or step == n_steps - 1:
+            v_str = f"{abs(per_finger_avg - prev_finger_avg):.5f}" if prev_finger_avg is not None else "N/A"
+            LOG.info("close step=%d tgt=%.4f act=%.4f v=%s stall=%d contact=%s",
+                     step, gr_target, per_finger_avg, v_str, stall_count, contact)
+
+        prev_finger_avg = per_finger_avg
 
     cur = _to_numpy(robot.get_joint_positions())
     actual_finger = float(np.mean([cur[idx] for idx in RIGHT_FINGER_INDICES]))
@@ -2133,16 +2152,19 @@ def _run_episode_simple(
             robot=ctx.robot, world=world, simulation_app=simulation_app,
             arm_target=arm_7, n_steps=GRIPPER_CLOSE_STEPS,
         )
-        # Record close-hold frames with rate-limited PD
+        # Record close-hold frames with direct apply_action (consistent with close)
+        from omni.isaac.core.utils.types import ArticulationAction as _HoldAA
         for _ in range(GRIPPER_CLOSE_STEPS):
-            cur = _to_numpy(ctx.robot.get_joint_positions())
-            arm_cmd, gr_cmd = _step_toward_openarm_joint_targets(ctx.robot, arm_7, hold_target)
-            _set_openarm_joint_targets(ctx.robot, arm_cmd, gr_cmd, physics_control=True)
+            hold_full = HOME_FULL.copy()
+            hold_full[RIGHT_ARM_INDICES] = arm_7
+            for idx in RIGHT_FINGER_INDICES:
+                hold_full[idx] = hold_target
+            ctx.robot.apply_action(_HoldAA(joint_positions=hold_full.astype(np.float32)))
             world.step(render=True)
             actual = _to_numpy(ctx.robot.get_joint_positions())
             writer.add_frame(episode_index=episode_index, frame_index=frame_index,
                              observation_state=_full_to_dataset_state(actual),
-                             action=_full_to_dataset_state(arm_cmd),
+                             action=_full_to_dataset_state(hold_full),
                              timestamp=time.time(), next_done=False)
             if ctx.right_wrist_annotator is not None:
                 writer.add_video_frame("right_wrist_cam", _capture_rgb(ctx.right_wrist_annotator))
