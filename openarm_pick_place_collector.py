@@ -145,7 +145,9 @@ CUROBO_RIGHT_EE_LINK = "openarm_right_hand"
 # ~2cm from cube and achieves 70% lift rate. Not ideal visually (palm-level
 # contact) but the physics grip works through friction.
 GRASP_QUAT_WXYZ = np.array([0.0505, 0.7232, 0.1517, 0.6719], dtype=np.float32)
-PRE_GRASP_OFFSET = np.array([0.0, 0.0, 0.12], dtype=np.float32)  # 12cm above cube
+# Side approach: 8cm behind + 12cm above. High enough to clear cube during
+# HOME→PRE_GRASP, then linear descent to GRASP from side-above angle.
+PRE_GRASP_OFFSET = np.array([-0.08, 0.0, 0.12], dtype=np.float32)
 GRASP_OFFSET = np.array([0.0, 0.0, 0.02], dtype=np.float32)  # 2cm above cube center
 LIFT_OFFSET = np.array([0.0, 0.0, 0.06], dtype=np.float32)  # gentle 6cm lift
 BOWL_APPROACH_OFFSET = np.array([0.0, 0.0, 0.15], dtype=np.float32)
