@@ -137,14 +137,14 @@ DEFAULT_CUROBO_TO_SIM_ARM = np.array([0, 2, 4, 6, 8, 10, 12, 1, 3, 5, 7, 9, 11, 
 RIGHT_ARM_CUROBO_SLICE = slice(7, 14)
 LEFT_ARM_CUROBO_SLICE = slice(0, 7)
 CUROBO_RIGHT_EE_LINK = "openarm_right_hand"
-# Grasp orientation from replay data frame 260 (side-approach, not top-down)
-# ee_link quat when gripper is at cube: wxyz = (0.0505, 0.7232, 0.1517, 0.6719)
-GRASP_QUAT_WXYZ = np.array([0.0505, 0.7232, 0.1517, 0.6719], dtype=np.float32)
-# Pre-grasp: approach from directly above (avoid sweeping through cube)
-# The old offset [-0.08, 0, 0.06] caused HOME→PRE_GRASP trajectory to
-# sweep horizontally through the cube (cube not in cuRobo collision world).
+# Top-down grasp: Rx(180) makes hand Z point down, fingers toward table.
+# Old quat (0.0505, 0.7232, 0.1517, 0.6719) was side-approach — hand tilted
+# 80° so palm hit cube instead of fingers. Top-down avoids this.
+GRASP_QUAT_WXYZ = np.array([0.0, 1.0, 0.0, 0.0], dtype=np.float32)  # Rx(180) = pure top-down
 PRE_GRASP_OFFSET = np.array([0.0, 0.0, 0.12], dtype=np.float32)  # 12cm above cube
-GRASP_OFFSET = np.array([0.0, 0.0, 0.02], dtype=np.float32)  # slightly above cube center
+# GRASP_OFFSET = 0: tip_mid_correction places fingers at cube center height.
+# Hand ends up ~14mm above cube (hand→finger_mid offset in Z).
+GRASP_OFFSET = np.array([0.0, 0.0, 0.0], dtype=np.float32)
 LIFT_OFFSET = np.array([0.0, 0.0, 0.06], dtype=np.float32)  # gentle 6cm lift
 BOWL_APPROACH_OFFSET = np.array([0.0, 0.0, 0.15], dtype=np.float32)
 PLACE_LOWER_OFFSET = np.array([0.0, 0.0, 0.05], dtype=np.float32)
