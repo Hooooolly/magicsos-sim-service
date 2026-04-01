@@ -98,11 +98,9 @@ DEFAULT_RIGHT_CAMERA_CFG = {
     "mount_link": "openarm_right_link7",
     "prim_name": "wrist_cam",
     "resolution": [640, 480],
-    "focal_length": 10.0,  # wider FOV (was 15.0)
-    # Camera pose relative to mount link — applied during setup so it
-    # persists across scene reloads. Without this, USD default is used.
-    "translate": [0.0, 0.0, 0.04],          # 4cm forward along link Z (toward fingers)
-    "orient_euler_xyz_deg": [0.0, 180.0, 0.0],  # flip to look outward/downward at workspace
+    "focal_length": 10.0,  # wider FOV to see gripper (was 15.0)
+    # Don't set translate/orient — USD scene already has correct camera pose.
+    # Only focal_length is changed for wider angle.
 }
 
 # Waypoints extracted from successful replay data (ep0 of openarm_pick_sim_cam)
@@ -433,20 +431,9 @@ def _apply_wrist_camera_pose(stage: Any, camera_prim_path: str, cam_cfg: dict[st
         LOG.warning("cannot apply camera pose: prim %s not found", camera_prim_path)
         return
 
-    translate = cam_cfg.get("translate")
-    orient = cam_cfg.get("orient_euler_xyz_deg")
-    LOG.info("_apply_wrist_camera_pose: path=%s translate=%s orient=%s focal=%s keys=%s",
-             camera_prim_path, translate, orient, cam_cfg.get("focal_length"), list(cam_cfg.keys()))
-
-    if translate or orient:
-        xf = UsdGeom.Xformable(cam_prim)
-        xf.ClearXformOpOrder()
-        if translate:
-            xf.AddTranslateOp().Set(Gf.Vec3d(*translate))
-        if orient:
-            xf.AddRotateXYZOp().Set(Gf.Vec3f(*orient))
-        LOG.info("camera pose: translate=%s orient=%s on %s", translate, orient, camera_prim_path)
-
+    # Only apply focal_length — the USD scene already has the correct camera
+    # pose. Applying translate/orient from camera_meta.yaml breaks the view
+    # (upside down right cam, black left cam).
     focal = cam_cfg.get("focal_length")
     if focal:
         usd_cam = UsdGeom.Camera(cam_prim)
@@ -458,12 +445,8 @@ def _apply_wrist_camera_pose(stage: Any, camera_prim_path: str, cam_cfg: dict[st
 def _setup_right_wrist_camera(stage: Any, camera_prim_path: str, cam_cfg: dict[str, Any]) -> tuple[Any, Any]:
     import omni.replicator.core as rep
 
-    # Apply camera pose from config before creating render product
-    try:
-        _apply_wrist_camera_pose(stage, camera_prim_path, cam_cfg)
-    except Exception as _cam_exc:
-        LOG.warning("_apply_wrist_camera_pose failed: %s", _cam_exc)
-        import traceback; traceback.print_exc()
+    # Camera pose (translate, orient, focal) is baked into the scene USDA.
+    # No runtime override — see docs/openarm-camera-setup.md.
 
     resolution_raw = cam_cfg.get("resolution", list(CAMERA_RENDER_RESOLUTION))
     try:
@@ -1991,15 +1974,9 @@ def _setup_scene_context(
     _configure_bowl_collision(stage, bowl_prim_path)
 
     render_product, annotator = _setup_right_wrist_camera(stage, right_camera_path, camera_cfg)
-    # Apply camera pose at top level (the call inside _setup_right_wrist_camera
-    # was silently failing for unknown reasons)
-    LOG.info("DIRECT camera pose apply for right cam: %s cfg_keys=%s", right_camera_path, list(camera_cfg.keys()))
-    try:
-        _apply_wrist_camera_pose(stage, right_camera_path, camera_cfg)
-    except Exception as _exc:
-        LOG.warning("DIRECT camera pose failed: %s", _exc)
 
     # Setup left wrist camera (overview cam)
+    # Camera pose is baked into scene USDA (camfix) — no runtime override needed.
     left_rp, left_annot, left_cam_path = None, None, None
     try:
         import omni.replicator.core as rep
@@ -2010,9 +1987,6 @@ def _setup_scene_context(
                 left_cam_path = cand
                 break
         if left_cam_path:
-            # Apply same camera pose to left cam (overview)
-            left_cam_cfg = {"focal_length": 10.0, "translate": [0.0, 0.0, 0.04], "orient_euler_xyz_deg": [0.0, 180.0, 0.0]}
-            _apply_wrist_camera_pose(stage, left_cam_path, left_cam_cfg)
             res = camera_cfg.get("resolution", [640, 480])
             left_rp = rep.create.render_product(left_cam_path, (int(res[0]), int(res[1])))
             left_annot = rep.AnnotatorRegistry.get_annotator("rgb")
