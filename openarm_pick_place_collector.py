@@ -98,7 +98,11 @@ DEFAULT_RIGHT_CAMERA_CFG = {
     "mount_link": "openarm_right_link7",
     "prim_name": "wrist_cam",
     "resolution": [640, 480],
-    "focal_length": 15.0,
+    "focal_length": 10.0,  # wider FOV (was 15.0)
+    # Camera pose relative to mount link — applied during setup so it
+    # persists across scene reloads. Without this, USD default is used.
+    "translate": [0.0, 0.0, 0.04],          # 4cm forward along link Z (toward fingers)
+    "orient_euler_xyz_deg": [0.0, 180.0, 0.0],  # flip to look outward/downward at workspace
 }
 
 # Waypoints extracted from successful replay data (ep0 of openarm_pick_sim_cam)
@@ -416,8 +420,44 @@ def _resolve_right_wrist_camera(stage: Any, openarm_root: str, cam_cfg: dict[str
     raise RuntimeError("Unable to resolve right wrist camera prim for OpenArm.")
 
 
+def _apply_wrist_camera_pose(stage: Any, camera_prim_path: str, cam_cfg: dict[str, Any]) -> None:
+    """Apply camera local pose from config (translate + orient + focal_length).
+
+    Without this, the camera uses the USD default orientation which may not
+    look at the workspace. Config is persisted in robot_config.yaml / DEFAULT_RIGHT_CAMERA_CFG.
+    """
+    from pxr import UsdGeom, Gf
+
+    cam_prim = stage.GetPrimAtPath(camera_prim_path)
+    if not cam_prim or not cam_prim.IsValid():
+        LOG.warning("cannot apply camera pose: prim %s not found", camera_prim_path)
+        return
+
+    translate = cam_cfg.get("translate")
+    orient = cam_cfg.get("orient_euler_xyz_deg")
+
+    if translate or orient:
+        xf = UsdGeom.Xformable(cam_prim)
+        xf.ClearXformOpOrder()
+        if translate:
+            xf.AddTranslateOp().Set(Gf.Vec3d(*translate))
+        if orient:
+            xf.AddRotateXYZOp().Set(Gf.Vec3f(*orient))
+        LOG.info("camera pose: translate=%s orient=%s on %s", translate, orient, camera_prim_path)
+
+    focal = cam_cfg.get("focal_length")
+    if focal:
+        usd_cam = UsdGeom.Camera(cam_prim)
+        if usd_cam:
+            usd_cam.GetFocalLengthAttr().Set(float(focal))
+            LOG.info("camera focal_length=%.1f on %s", float(focal), camera_prim_path)
+
+
 def _setup_right_wrist_camera(stage: Any, camera_prim_path: str, cam_cfg: dict[str, Any]) -> tuple[Any, Any]:
     import omni.replicator.core as rep
+
+    # Apply camera pose from config before creating render product
+    _apply_wrist_camera_pose(stage, camera_prim_path, cam_cfg)
 
     resolution_raw = cam_cfg.get("resolution", list(CAMERA_RENDER_RESOLUTION))
     try:
@@ -1957,6 +1997,9 @@ def _setup_scene_context(
                 left_cam_path = cand
                 break
         if left_cam_path:
+            # Apply same camera pose to left cam (overview)
+            left_cam_cfg = {"focal_length": 10.0, "translate": [0.0, 0.0, 0.04], "orient_euler_xyz_deg": [0.0, 180.0, 0.0]}
+            _apply_wrist_camera_pose(stage, left_cam_path, left_cam_cfg)
             res = camera_cfg.get("resolution", [640, 480])
             left_rp = rep.create.render_product(left_cam_path, (int(res[0]), int(res[1])))
             left_annot = rep.AnnotatorRegistry.get_annotator("rgb")

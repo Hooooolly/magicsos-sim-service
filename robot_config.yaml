@@ -23,9 +23,13 @@ cameras:
     mount_link: openarm_left_link7
     prim_name: wrist_cam
     resolution: [640, 480]
-    focal_length: 15.0
+    focal_length: 10.0                       # wider FOV for overview
+    translate: [0.0, 0.0, 0.04]             # 4cm forward along link Z
+    orient_euler_xyz_deg: [0.0, 180.0, 0.0] # flip to look outward at workspace
   right_wrist_cam:
     mount_link: openarm_right_link7
     prim_name: wrist_cam
     resolution: [640, 480]
-    focal_length: 15.0
+    focal_length: 10.0                       # wider FOV to see gripper + cube
+    translate: [0.0, 0.0, 0.04]             # 4cm forward along link Z
+    orient_euler_xyz_deg: [0.0, 180.0, 0.0] # flip to look outward at workspace
