@@ -435,6 +435,8 @@ def _apply_wrist_camera_pose(stage: Any, camera_prim_path: str, cam_cfg: dict[st
 
     translate = cam_cfg.get("translate")
     orient = cam_cfg.get("orient_euler_xyz_deg")
+    LOG.info("_apply_wrist_camera_pose: path=%s translate=%s orient=%s focal=%s keys=%s",
+             camera_prim_path, translate, orient, cam_cfg.get("focal_length"), list(cam_cfg.keys()))
 
     if translate or orient:
         xf = UsdGeom.Xformable(cam_prim)
