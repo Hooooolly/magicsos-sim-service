@@ -1758,15 +1758,10 @@ def _assemble_scene_usd(scene_path, converted_objects, ceiling_lights=None):
     root = UsdGeom.Xform.Define(stage, "/World")
     stage.SetDefaultPrim(root.GetPrim())
 
-    # Ground plane (Z-up: points on XY plane at z=0, normals pointing +Z)
-    gp_xf = UsdGeom.Xform.Define(stage, "/World/GroundPlane")
-    UsdPhysics.CollisionAPI.Apply(gp_xf.GetPrim())
-    gp_mesh = UsdGeom.Mesh.Define(stage, "/World/GroundPlane/Mesh")
-    gp_mesh.CreatePointsAttr([(-50, -50, 0), (50, -50, 0), (50, 50, 0), (-50, 50, 0)])
-    gp_mesh.CreateFaceVertexCountsAttr([4])
-    gp_mesh.CreateFaceVertexIndicesAttr([0, 1, 2, 3])
-    gp_mesh.CreateNormalsAttr([(0, 0, 1)] * 4)
-    gp_mesh.CreateDisplayColorAttr([(0.5, 0.5, 0.5)])
+    # Default ground plane + environment (required for Isaac Sim render pipeline + lighting)
+    DEFAULT_ENV_USD = "https://omniverse-content-production.s3-us-west-2.amazonaws.com/Assets/Isaac/4.5/Isaac/Environments/Grid/default_environment.usd"
+    gp_prim = stage.DefinePrim("/World/defaultGroundPlane", "Xform")
+    gp_prim.GetReferences().AddReference(DEFAULT_ENV_USD)
 
     # Ambient dome light (always add for visibility)
     dome = UsdLux.DomeLight.Define(stage, "/World/Lights/DomeLight")
