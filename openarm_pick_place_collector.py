@@ -1208,18 +1208,11 @@ def _set_openarm_joint_targets(
 def _physical_gripper_close(
     robot: Any, world: Any, simulation_app: Any,
     arm_target: np.ndarray, n_steps: int = 60,
+    record_fn: Optional[Callable[[np.ndarray, np.ndarray], None]] = None,
 ) -> tuple[float, bool]:
     """Close gripper with velocity-based contact detection.
 
-    Uses direct apply_action (no rate limiter) for faster PD convergence.
-    The old residual-based approach failed because OpenArm's PD finger drives
-    converge much slower than Franka's, causing false positives (residual from
-    PD lag, not actual contact).
-
-    Velocity-based detection: when finger position stops changing (stalled on
-    object) while still open, that's genuine contact. Free-closing fingers keep
-    moving; blocked fingers don't.
-
+    record_fn(actual_joints, target_joints) is called each step to record frames.
     Returns (hold_gripper_target, contact_detected).
     """
     from omni.isaac.core.utils.types import ArticulationAction
@@ -1255,6 +1248,10 @@ def _physical_gripper_close(
         full[RIGHT_FINGER_INDICES] = gr_target
         robot.apply_action(ArticulationAction(joint_positions=full.astype(np.float32)))
         world.step(render=True)
+
+        # Record frame if callback provided
+        if record_fn is not None:
+            record_fn(_to_numpy(robot.get_joint_positions()), full)
 
         # Read actual finger positions
         cur = _to_numpy(robot.get_joint_positions())
@@ -2249,9 +2246,22 @@ def _run_episode_simple(
                  rf_pos[:3].tolist(), lf_pos[:3].tolist())
         LOG.info("Episode %d: CLOSE gripper", episode_index + 1)
         arm_7 = _to_numpy(ctx.robot.get_joint_positions())[RIGHT_ARM_INDICES]
+        def _close_record_fn(actual_joints, target_joints):
+            nonlocal frame_index
+            writer.add_frame(episode_index=episode_index, frame_index=frame_index,
+                             observation_state=_full_to_dataset_state(actual_joints),
+                             action=_full_to_dataset_state(target_joints),
+                             timestamp=time.time(), next_done=False)
+            if ctx.right_wrist_annotator is not None:
+                writer.add_video_frame("right_wrist_cam", _capture_rgb(ctx.right_wrist_annotator))
+            if ctx.left_wrist_annotator is not None:
+                writer.add_video_frame("left_wrist_cam", _capture_rgb(ctx.left_wrist_annotator))
+            frame_index += 1
+
         hold_target, contact = _physical_gripper_close(
             robot=ctx.robot, world=world, simulation_app=simulation_app,
             arm_target=arm_7, n_steps=GRIPPER_CLOSE_STEPS,
+            record_fn=_close_record_fn,
         )
         # Record close-hold frames with direct apply_action (consistent with close)
         from omni.isaac.core.utils.types import ArticulationAction as _HoldAA
