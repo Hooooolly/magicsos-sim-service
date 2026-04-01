@@ -140,11 +140,11 @@ CUROBO_RIGHT_EE_LINK = "openarm_right_hand"
 # Top-down grasp: Rx(180) makes hand Z point down, fingers toward table.
 # Old quat (0.0505, 0.7232, 0.1517, 0.6719) was side-approach — hand tilted
 # 80° so palm hit cube instead of fingers. Top-down avoids this.
-GRASP_QUAT_WXYZ = np.array([0.0, 1.0, 0.0, 0.0], dtype=np.float32)  # Rx(180) = pure top-down
+GRASP_QUAT_WXYZ = np.array([0.1736, 0.9848, 0.0, 0.0], dtype=np.float32)  # Rx(160) = mostly down, 20° forward tilt
 PRE_GRASP_OFFSET = np.array([0.0, 0.0, 0.12], dtype=np.float32)  # 12cm above cube
-# GRASP_OFFSET = 0: tip_mid_correction places fingers at cube center height.
-# Hand ends up ~14mm above cube (hand→finger_mid offset in Z).
-GRASP_OFFSET = np.array([0.0, 0.0, 0.0], dtype=np.float32)
+# Small offset — with Rx(160), hand tilts 20° forward, fingers slightly behind.
+# tip_mid_correction handles vertical offset. 5mm extra Z for clearance.
+GRASP_OFFSET = np.array([0.0, 0.0, 0.005], dtype=np.float32)
 LIFT_OFFSET = np.array([0.0, 0.0, 0.06], dtype=np.float32)  # gentle 6cm lift
 BOWL_APPROACH_OFFSET = np.array([0.0, 0.0, 0.15], dtype=np.float32)
 PLACE_LOWER_OFFSET = np.array([0.0, 0.0, 0.05], dtype=np.float32)
