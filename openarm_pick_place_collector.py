@@ -2218,6 +2218,17 @@ def _run_episode_simple(
             )
             ctx.robot.apply_action(_SettleAA(joint_positions=settle_full))
             world.step(render=True)
+            # Record settle frames to avoid jump cuts in video
+            actual = _to_numpy(ctx.robot.get_joint_positions())
+            writer.add_frame(episode_index=episode_index, frame_index=frame_index,
+                             observation_state=_full_to_dataset_state(actual),
+                             action=_full_to_dataset_state(settle_full),
+                             timestamp=time.time(), next_done=False)
+            if ctx.right_wrist_annotator is not None:
+                writer.add_video_frame("right_wrist_cam", _capture_rgb(ctx.right_wrist_annotator))
+            if ctx.left_wrist_annotator is not None:
+                writer.add_video_frame("left_wrist_cam", _capture_rgb(ctx.left_wrist_annotator))
+            frame_index += 1
         # Log cube position after grasp approach
         _cube_after_grasp = _get_prim_world_pose(ctx.stage, ctx.cube_prim_path)[0] if ctx.cube_prim_path else np.zeros(3)
         LOG.info("AFTER GRASP APPROACH: cube=%s (moved %.4f from start)",
@@ -2266,7 +2277,7 @@ def _run_episode_simple(
         else:
             LOG.warning("Episode %d: no gripper contact", episode_index + 1)
 
-        # Pre-lift settle: hold grip 20 steps
+        # Pre-lift settle: hold grip 20 steps (record to avoid jump cut)
         from omni.isaac.core.utils.types import ArticulationAction as _LiftAA
         for _ in range(20):
             cur = _to_numpy(ctx.robot.get_joint_positions())
@@ -2276,6 +2287,16 @@ def _run_episode_simple(
                 hold_full[idx] = hold_target
             ctx.robot.apply_action(_LiftAA(joint_positions=hold_full.astype(np.float32)))
             world.step(render=True)
+            actual = _to_numpy(ctx.robot.get_joint_positions())
+            writer.add_frame(episode_index=episode_index, frame_index=frame_index,
+                             observation_state=_full_to_dataset_state(actual),
+                             action=_full_to_dataset_state(hold_full),
+                             timestamp=time.time(), next_done=False)
+            if ctx.right_wrist_annotator is not None:
+                writer.add_video_frame("right_wrist_cam", _capture_rgb(ctx.right_wrist_annotator))
+            if ctx.left_wrist_annotator is not None:
+                writer.add_video_frame("left_wrist_cam", _capture_rgb(ctx.left_wrist_annotator))
+            frame_index += 1
 
         # Log GT before lift
         _hand = _get_prim_world_pose(ctx.stage, f"{ctx.openarm_root}/openarm_right_hand")[0][:3]
