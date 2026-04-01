@@ -459,7 +459,11 @@ def _setup_right_wrist_camera(stage: Any, camera_prim_path: str, cam_cfg: dict[s
     import omni.replicator.core as rep
 
     # Apply camera pose from config before creating render product
-    _apply_wrist_camera_pose(stage, camera_prim_path, cam_cfg)
+    try:
+        _apply_wrist_camera_pose(stage, camera_prim_path, cam_cfg)
+    except Exception as _cam_exc:
+        LOG.warning("_apply_wrist_camera_pose failed: %s", _cam_exc)
+        import traceback; traceback.print_exc()
 
     resolution_raw = cam_cfg.get("resolution", list(CAMERA_RENDER_RESOLUTION))
     try:
