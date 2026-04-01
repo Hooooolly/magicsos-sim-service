@@ -1204,8 +1204,10 @@ def _physical_gripper_close(
     SQUEEZE_OFFSET = 0.015       # 15mm inward from stall point (tight grip)
     # 2mm was too loose — cube didn't lift. 15mm ensures firm grip.
 
+    MIN_HOLD = 0.005  # minimum grip target — prevents PhysX explosion from fully-closed grip
+
     contact = False
-    hold_gr_target = float(GRIPPER_CLOSED)
+    hold_gr_target = MIN_HOLD  # default: tight but not fully closed
     stall_count = 0
     prev_finger_avg = None
 
@@ -1235,7 +1237,7 @@ def _physical_gripper_close(
             if velocity < VELOCITY_THRESHOLD and per_finger_avg > MIN_CONTACT_WIDTH:
                 stall_count += 1
                 if stall_count >= STALL_PATIENCE:
-                    hold_gr_target = max(per_finger_avg - SQUEEZE_OFFSET, 0.0)
+                    hold_gr_target = max(per_finger_avg - SQUEEZE_OFFSET, MIN_HOLD)
                     contact = True
                     LOG.info("contact at step %d, v=%.5f, finger=%.4f, hold=%.4f",
                              step, velocity, per_finger_avg, hold_gr_target)
