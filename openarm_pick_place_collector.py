@@ -2255,9 +2255,10 @@ def _run_episode_simple(
 
         # 4. LIFT (linear IK — slow, many waypoints)
         LOG.info("Episode %d: LIFT", episode_index + 1)
+        _lift_current = _to_numpy(ctx.robot.get_joint_positions())
         traj = _plan_openarm_linear_ik_segment(
             curobo_state=ctx.curobo_state,
-            current_full=_to_numpy(ctx.robot.get_joint_positions()),
+            current_full=_lift_current,
             stage=ctx.stage, eef_prim_path=ctx.right_eef_prim_path,
             target_pos_world=lift_pos, target_quat_world=grasp_quat,
             robot_base_pos=robot_base_pos, robot_base_quat=robot_base_quat,
@@ -2266,12 +2267,18 @@ def _run_episode_simple(
         if traj is None:
             traj = _plan_openarm_curobo_segment(
                 curobo_state=ctx.curobo_state,
-                current_full=_to_numpy(ctx.robot.get_joint_positions()),
+                current_full=_lift_current,
                 target_pos_world=lift_pos, target_quat_world=grasp_quat,
                 robot_base_pos=robot_base_pos, robot_base_quat=robot_base_quat,
             )
         if traj is None:
             raise RuntimeError("LIFT planning failed")
+        # Prepend current arm state to trajectory to avoid configuration jump.
+        # IK waypoint 1 may differ from current arm config, causing a jolt that
+        # opens finger_joint1. Adding 5 "hold" steps gives PD time to stabilize.
+        _cur_curobo = _full_to_curobo_arm_target(_lift_current, ctx.curobo_state)
+        _hold_steps = np.tile(_cur_curobo.reshape(1, -1), (5, 1))
+        traj = np.vstack([_hold_steps, traj])
         if not record_and_execute(traj, hold_target, "lift"):
             raise RuntimeError("LIFT stopped")
         _cube_after_lift = _get_prim_world_pose(ctx.stage, ctx.cube_prim_path)[0] if ctx.cube_prim_path else np.zeros(3)
@@ -2292,12 +2299,16 @@ def _run_episode_simple(
             bowl_wp_full[RIGHT_ARM_INDICES[sim_j]] = val
         for idx in RIGHT_FINGER_INDICES:
             bowl_wp_full[idx] = hold_target
+        _bowl_current = _to_numpy(ctx.robot.get_joint_positions())
         traj = _plan_openarm_curobo_joint_segment(
             curobo_state=ctx.curobo_state,
-            current_full=_to_numpy(ctx.robot.get_joint_positions()),
+            current_full=_bowl_current,
             target_full=bowl_wp_full,
         )
         if traj is not None:
+            # Prepend current state for smooth transition
+            _cur_c = _full_to_curobo_arm_target(_bowl_current, ctx.curobo_state)
+            traj = np.vstack([np.tile(_cur_c.reshape(1, -1), (5, 1)), traj])
             if not record_and_execute(traj, hold_target, "bowl"):
                 raise RuntimeError("MOVE→BOWL stopped")
         else:
