@@ -1991,6 +1991,13 @@ def _setup_scene_context(
     _configure_bowl_collision(stage, bowl_prim_path)
 
     render_product, annotator = _setup_right_wrist_camera(stage, right_camera_path, camera_cfg)
+    # Apply camera pose at top level (the call inside _setup_right_wrist_camera
+    # was silently failing for unknown reasons)
+    LOG.info("DIRECT camera pose apply for right cam: %s cfg_keys=%s", right_camera_path, list(camera_cfg.keys()))
+    try:
+        _apply_wrist_camera_pose(stage, right_camera_path, camera_cfg)
+    except Exception as _exc:
+        LOG.warning("DIRECT camera pose failed: %s", _exc)
 
     # Setup left wrist camera (overview cam)
     left_rp, left_annot, left_cam_path = None, None, None
