@@ -24,6 +24,7 @@ import time
 import threading
 import re
 import uuid
+import zipfile
 from pathlib import Path
 from urllib.parse import urlencode
 
@@ -1692,6 +1693,33 @@ def _make_scene_download_archive(scene_dir: str) -> Path:
     return Path(archive_path)
 
 
+def _resolve_downloadable_usd_assets_dir(usd_path: Path) -> Path | None:
+    assets_dir = usd_path.with_name(f"{usd_path.stem}_assets")
+    if assets_dir.exists() and assets_dir.is_dir():
+        return assets_dir
+    return None
+
+
+def _make_usd_download_archive(usd_path: str) -> Path:
+    root = _resolve_downloadable_usd_path(usd_path)
+    assets_dir = _resolve_downloadable_usd_assets_dir(root)
+    if assets_dir is None:
+        return root
+
+    _cleanup_download_cache()
+    DOWNLOAD_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+
+    base_name = _safe_token(root.stem) or "scene"
+    archive_path = DOWNLOAD_CACHE_DIR / f"{base_name}_{int(time.time())}_{os.getpid()}_usd_bundle.zip"
+    with zipfile.ZipFile(archive_path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        archive.write(root, arcname=root.name)
+        for child in sorted(assets_dir.rglob("*")):
+            if child.is_file():
+                rel_path = child.relative_to(assets_dir).as_posix()
+                archive.write(child, arcname=f"{assets_dir.name}/{rel_path}")
+    return archive_path
+
+
 def _resolve_downloadable_usd_path(usd_path: str) -> Path:
     path = Path(usd_path).expanduser().resolve()
     if not path.is_file():
@@ -2503,16 +2531,17 @@ def scene_download_output():
 
 @bridge.route("/scene/download_usd", methods=["GET"])
 def scene_download_usd():
-    """Download an exported USD file."""
+    """Download an exported USD file, bundling sibling assets when present."""
     usd_path = (flask_request.args.get("usd_path") or "").strip()
     if not usd_path:
         return jsonify({"error": "usd_path required"}), 400
+    bundle_requested = str(flask_request.args.get("bundle") or "1").strip().lower() not in {"0", "false", "no"}
     try:
-        path = _resolve_downloadable_usd_path(usd_path)
+        path = _make_usd_download_archive(usd_path) if bundle_requested else _resolve_downloadable_usd_path(usd_path)
         return send_file(
             str(path),
             as_attachment=True,
-            mimetype="application/octet-stream",
+            mimetype="application/zip" if path.suffix.lower() == ".zip" else "application/octet-stream",
         )
     except FileNotFoundError as exc:
         return jsonify({"error": str(exc)}), 404
