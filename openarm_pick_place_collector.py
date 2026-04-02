@@ -152,7 +152,7 @@ GRASP_OFFSET = np.array([0.0, 0.0, 0.02], dtype=np.float32)  # 2cm above cube ce
 LIFT_OFFSET = np.array([0.0, 0.0, 0.06], dtype=np.float32)  # gentle 6cm lift
 BOWL_APPROACH_OFFSET = np.array([0.0, 0.0, 0.15], dtype=np.float32)
 PLACE_LOWER_OFFSET = np.array([0.0, 0.0, 0.05], dtype=np.float32)
-LINEAR_CARTESIAN_WAYPOINTS = 20
+LINEAR_CARTESIAN_WAYPOINTS = 40  # slow approach to avoid bouncing cube on contact
 GRIPPER_CLOSE_STEPS = 50  # 20 ramp + 10 settle + 20 detection window
 GRIPPER_OPEN_STEPS = 15
 PRE_GRASP_IK_WAYPOINTS = 14
@@ -959,8 +959,17 @@ def _configure_cube_physics(stage: Any, cube_prim_path: Optional[str]) -> None:
         UsdShade.Tokens.weakerThanDescendants,
         "physics",
     )
-    if cube_prim.HasAPI(UsdPhysics.MassAPI):
-        UsdPhysics.MassAPI(cube_prim).CreateMassAttr(0.05)  # 50g — with 80N finger force, 50g cube is fine
+    # Set mass: 50g was too light — cube bounces wildly on finger contact.
+    # 200g resists contact forces better, still light enough for 80N grip.
+    from pxr import PhysxSchema
+    if not cube_prim.HasAPI(UsdPhysics.MassAPI):
+        UsdPhysics.MassAPI.Apply(cube_prim)
+    UsdPhysics.MassAPI(cube_prim).CreateMassAttr(0.2)  # 200g
+    # Contact damping to absorb impact energy
+    if not cube_prim.HasAPI(PhysxSchema.PhysxRigidBodyAPI):
+        PhysxSchema.PhysxRigidBodyAPI.Apply(cube_prim)
+    PhysxSchema.PhysxRigidBodyAPI(cube_prim).CreateLinearDampingAttr(5.0)
+    PhysxSchema.PhysxRigidBodyAPI(cube_prim).CreateAngularDampingAttr(5.0)
 
 
 def _apply_openarm_finger_friction(stage: Any, robot_prim_path: str, cube_prim_path: Optional[str] = None) -> None:
