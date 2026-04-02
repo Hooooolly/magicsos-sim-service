@@ -18,12 +18,14 @@ import argparse
 import json
 import logging
 import os
+import shutil
 import sys
 import time
 import threading
 import re
 import uuid
 from pathlib import Path
+from urllib.parse import urlencode
 
 # ── Env defaults ──────────────────────────────────────────────
 os.environ.setdefault("ACCEPT_EULA", "Y")
@@ -441,11 +443,15 @@ threading.Thread(
 print(f"[interactive] Health server on :{HEALTH_PORT}")
 
 # ── Bridge API (port 5800) ───────────────────────────────────
-from flask import Flask, request as flask_request, jsonify
+from flask import Flask, request as flask_request, jsonify, send_file
 import traceback
 
 bridge = Flask(__name__)
 bridge.config["JSONIFY_PRETTYPRINT_REGULAR"] = False
+USD_SUFFIXES = {".usd", ".usda", ".usdc"}
+DOWNLOAD_CACHE_DIR = Path(
+    os.environ.get("SIM_DOWNLOAD_CACHE_DIR", "/tmp/sim-service-downloads")
+)
 
 
 def _get_stage():
@@ -1642,6 +1648,59 @@ def _find_scenesmith_scene_state(output_dir):
     return None, False
 
 
+def _build_bridge_url(path: str, **params) -> str:
+    query = urlencode(
+        {k: v for k, v in params.items() if v is not None and str(v).strip() != ""}
+    )
+    return f"{path}?{query}" if query else path
+
+
+def _cleanup_download_cache(max_age_sec: int = 6 * 60 * 60) -> None:
+    try:
+        DOWNLOAD_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        return
+    cutoff = time.time() - max_age_sec
+    for child in DOWNLOAD_CACHE_DIR.glob("*"):
+        try:
+            if child.is_file() and child.stat().st_mtime < cutoff:
+                child.unlink()
+        except Exception:
+            continue
+
+
+def _make_scene_download_archive(scene_dir: str) -> Path:
+    root = Path(scene_dir).expanduser().resolve()
+    if not root.is_dir():
+        raise FileNotFoundError(f"Directory not found: {root}")
+    state_path, _ = _find_scenesmith_scene_state(str(root))
+    if not state_path:
+        raise ValueError(f"Not a valid SceneSmith output directory: {root}")
+
+    _cleanup_download_cache()
+    DOWNLOAD_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+
+    parts = [_safe_token(part) for part in root.parts[-3:] if str(part).strip()]
+    base_name = "_".join(parts) or "scenesmith_output"
+    archive_base = DOWNLOAD_CACHE_DIR / f"{base_name}_{int(time.time())}_{os.getpid()}"
+    archive_path = shutil.make_archive(
+        str(archive_base),
+        "zip",
+        root_dir=str(root.parent),
+        base_dir=root.name,
+    )
+    return Path(archive_path)
+
+
+def _resolve_downloadable_usd_path(usd_path: str) -> Path:
+    path = Path(usd_path).expanduser().resolve()
+    if not path.is_file():
+        raise FileNotFoundError(f"USD file not found: {path}")
+    if path.suffix.lower() not in USD_SUFFIXES:
+        raise ValueError(f"Not a USD file: {path}")
+    return path
+
+
 def _parse_sdf_mass(sdf_path):
     """Extract mass from SDF XML file."""
     try:
@@ -1952,7 +2011,18 @@ def scene_import_scenesmith():
     try:
         usd_path = _convert_scenesmith_to_usd(output_dir, name, objects_meta)
         print(f"[scenesmith-import] DONE: {usd_path}")
-        return jsonify({"success": True, "usd_path": usd_path})
+        return jsonify(
+            {
+                "success": True,
+                "usd_path": usd_path,
+                "usd_download_url": _build_bridge_url(
+                    "/scene/download_usd", usd_path=usd_path
+                ),
+                "scenesmith_output_download_url": _build_bridge_url(
+                    "/scene/download_output", scene_dir=output_dir
+                ),
+            }
+        )
     except Exception as ex:
         import traceback
         traceback.print_exc()
@@ -2394,11 +2464,63 @@ def scene_export_scene():
         return jsonify({"error": f"Directory not found: {scene_dir}"}), 404
     try:
         result = _handle_export_scene(scene_dir, output_name, room_filter=room_filter)
+        usd_path = result.get("usd_path")
+        if usd_path:
+            result["usd_download_url"] = _build_bridge_url(
+                "/scene/download_usd", usd_path=usd_path
+            )
+        result["scenesmith_output_download_url"] = _build_bridge_url(
+            "/scene/download_output", scene_dir=scene_dir
+        )
         return jsonify(result)
     except Exception as e:
         import traceback
         traceback.print_exc()
         return jsonify({"error": str(e)}), 500
+
+
+@bridge.route("/scene/download_output", methods=["GET"])
+def scene_download_output():
+    """Download the original SceneSmith output directory as a zip archive."""
+    scene_dir = (flask_request.args.get("scene_dir") or "").strip()
+    if not scene_dir:
+        return jsonify({"error": "scene_dir required"}), 400
+    try:
+        archive_path = _make_scene_download_archive(scene_dir)
+        return send_file(
+            str(archive_path),
+            as_attachment=True,
+            mimetype="application/zip",
+        )
+    except FileNotFoundError as exc:
+        return jsonify({"error": str(exc)}), 404
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+    except Exception as exc:
+        traceback.print_exc()
+        return jsonify({"error": str(exc)}), 500
+
+
+@bridge.route("/scene/download_usd", methods=["GET"])
+def scene_download_usd():
+    """Download an exported USD file."""
+    usd_path = (flask_request.args.get("usd_path") or "").strip()
+    if not usd_path:
+        return jsonify({"error": "usd_path required"}), 400
+    try:
+        path = _resolve_downloadable_usd_path(usd_path)
+        return send_file(
+            str(path),
+            as_attachment=True,
+            mimetype="application/octet-stream",
+        )
+    except FileNotFoundError as exc:
+        return jsonify({"error": str(exc)}), 404
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+    except Exception as exc:
+        traceback.print_exc()
+        return jsonify({"error": str(exc)}), 500
 
 
 # ── Data collection ──────────────────────────────────────────
