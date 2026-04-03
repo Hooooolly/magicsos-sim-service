@@ -1793,7 +1793,225 @@ def _resolve_downloadable_usd_assets_dir(usd_path: Path) -> Path | None:
     return None
 
 
-def _make_usd_download_archive(usd_path: str) -> Path:
+def _resolve_scenesmith_room_dir(scene_root: Path, room_name: str) -> Path | None:
+    direct = scene_root / f"room_{room_name}"
+    if direct.is_dir():
+        return direct
+    for child in sorted(scene_root.iterdir()):
+        if child.is_dir() and room_name in child.name:
+            return child
+    return None
+
+
+def _normalize_scene_state_objects(raw_objects) -> dict[str, dict]:
+    if isinstance(raw_objects, list):
+        return {
+            str(item.get("object_id") or item.get("id") or f"obj_{idx}"): item
+            for idx, item in enumerate(raw_objects)
+            if isinstance(item, dict)
+        }
+    if isinstance(raw_objects, dict):
+        return {
+            str(key): value
+            for key, value in raw_objects.items()
+            if isinstance(value, dict)
+        }
+    return {}
+
+
+def _resolve_texture_for_gltf_path(gltf_path: Path) -> Path | None:
+    if not gltf_path.exists():
+        return None
+
+    preferred = gltf_path.with_name("Image_0.png")
+    if preferred.is_file():
+        return preferred
+
+    for child in sorted(gltf_path.parent.iterdir()):
+        if child.is_file() and child.suffix.lower() in {".png", ".jpg", ".jpeg", ".webp"}:
+            return child
+    return None
+
+
+def _collect_scenesmith_texture_sources(scene_dir: str) -> dict[str, Path]:
+    state_path, is_house = _find_scenesmith_scene_state(scene_dir)
+    if not state_path:
+        return {}
+
+    try:
+        scene_state = json.loads(Path(state_path).read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+    texture_sources: dict[str, Path] = {}
+    state_file = Path(state_path)
+
+    if is_house and isinstance(scene_state.get("rooms"), dict):
+        scene_root = state_file.parent.parent
+        for room_name, room_data in scene_state.get("rooms", {}).items():
+            if not isinstance(room_data, dict):
+                continue
+            room_dir = _resolve_scenesmith_room_dir(scene_root, str(room_name))
+            if room_dir is None:
+                continue
+            for object_id, obj in _normalize_scene_state_objects(room_data.get("objects", {})).items():
+                geom_rel = str(obj.get("geometry_path") or "").strip()
+                if not geom_rel:
+                    continue
+                texture_path = _resolve_texture_for_gltf_path(room_dir / geom_rel)
+                if texture_path is not None:
+                    texture_sources[object_id] = texture_path
+        return texture_sources
+
+    objects = _normalize_scene_state_objects(scene_state.get("objects", {}))
+    room_dir = state_file.parent.parent.parent
+    for object_id, obj in objects.items():
+        geom_rel = str(obj.get("geometry_path") or "").strip()
+        if not geom_rel:
+            continue
+        texture_path = _resolve_texture_for_gltf_path(room_dir / geom_rel)
+        if texture_path is not None:
+            texture_sources[object_id] = texture_path
+    return texture_sources
+
+
+def _read_portable_usd_source_text(source_usd: Path) -> str:
+    text = source_usd.read_text(encoding="utf-8")
+    if 'references = @' not in text:
+        return text
+
+    from pxr import Usd
+
+    stage = Usd.Stage.Open(str(source_usd))
+    if stage is None:
+        return text
+
+    tmp_path = DOWNLOAD_CACHE_DIR / f"{source_usd.stem}_{int(time.time())}_{os.getpid()}_flatten_tmp.usda"
+    stage.Export(str(tmp_path))
+    try:
+        return tmp_path.read_text(encoding="utf-8")
+    finally:
+        tmp_path.unlink(missing_ok=True)
+
+
+def _rewrite_flattened_portable_usd_text(text: str, texture_targets: dict[str, str]) -> str:
+    lines = text.splitlines(keepends=True)
+    out_lines: list[str] = []
+    brace_depth = 0
+    objects_decl_pending = False
+    objects_depth = None
+    in_objects = False
+    current_object = None
+    current_object_depth = None
+    object_decl_pending = None
+
+    for line in lines:
+        stripped = line.strip()
+        updated = line.replace("@gltf/pbr.mdl@", "@./gltf/pbr.mdl@")
+
+        if not in_objects and stripped.startswith('def "Objects"'):
+            objects_decl_pending = True
+        elif in_objects and current_object is None and objects_depth is not None and brace_depth == objects_depth:
+            match = re.match(r'^def Xform "([^"]+)"(?:\s*\(|\s*)$', stripped)
+            if match:
+                object_decl_pending = match.group(1)
+
+        if current_object and "asset inputs:texture" in updated:
+            target = texture_targets.get(current_object)
+            if target:
+                updated = re.sub(r"@[^@]+@", f"@{target}@", updated, count=1)
+
+        out_lines.append(updated)
+
+        brace_depth += updated.count("{") - updated.count("}")
+
+        if objects_decl_pending and "{" in updated:
+            in_objects = True
+            objects_depth = brace_depth
+            objects_decl_pending = False
+
+        if object_decl_pending and "{" in updated:
+            current_object = object_decl_pending
+            current_object_depth = brace_depth
+            object_decl_pending = None
+
+        if current_object_depth is not None and brace_depth < current_object_depth:
+            current_object = None
+            current_object_depth = None
+
+        if objects_depth is not None and brace_depth < objects_depth:
+            in_objects = False
+            objects_depth = None
+            current_object = None
+            current_object_depth = None
+            object_decl_pending = None
+
+    return "".join(out_lines)
+
+
+def _resolve_portable_pbr_mdl_path() -> Path | None:
+    candidates = [
+        Path("/isaac-sim/kit/mdl/core/mdl/gltf/pbr.mdl"),
+        Path("/isaacsim/kit/mdl/core/mdl/gltf/pbr.mdl"),
+    ]
+    for candidate in candidates:
+        if candidate.is_file():
+            return candidate
+    return None
+
+
+def _make_portable_flattened_usd_archive(usd_path: str, scene_dir: str) -> Path | None:
+    root = _resolve_downloadable_usd_path(usd_path)
+    if root.suffix.lower() != ".usda":
+        return None
+
+    texture_sources = _collect_scenesmith_texture_sources(scene_dir)
+    mdl_path = _resolve_portable_pbr_mdl_path()
+    if not texture_sources or mdl_path is None:
+        return None
+
+    _cleanup_download_cache()
+    DOWNLOAD_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+
+    base_name = _safe_token(root.stem) or "scene"
+    stamp = f"{int(time.time())}_{os.getpid()}"
+    archive_path = DOWNLOAD_CACHE_DIR / f"{base_name}_{stamp}_usd_bundle.zip"
+    portable_root = DOWNLOAD_CACHE_DIR / f"{base_name}_{stamp}_portable{root.suffix}"
+    bundle_dir = DOWNLOAD_CACHE_DIR / f"{base_name}_{stamp}_bundle"
+    textures_dir = bundle_dir / "textures"
+    gltf_dir = bundle_dir / "gltf"
+    textures_dir.mkdir(parents=True, exist_ok=True)
+    gltf_dir.mkdir(parents=True, exist_ok=True)
+
+    texture_targets: dict[str, str] = {}
+    for object_id, source_path in texture_sources.items():
+        target_dir = textures_dir / _safe_token(object_id)
+        target_dir.mkdir(parents=True, exist_ok=True)
+        target_path = target_dir / source_path.name
+        shutil.copy2(source_path, target_path)
+        texture_targets[object_id] = f"./textures/{target_dir.name}/{target_path.name}"
+
+    portable_text = _read_portable_usd_source_text(root)
+    portable_text = _rewrite_flattened_portable_usd_text(portable_text, texture_targets)
+    portable_root.write_text(portable_text, encoding="utf-8")
+    shutil.copy2(mdl_path, gltf_dir / "pbr.mdl")
+
+    with zipfile.ZipFile(archive_path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        archive.write(portable_root, arcname=root.name)
+        archive.write(gltf_dir / "pbr.mdl", arcname="gltf/pbr.mdl")
+        for child in sorted(textures_dir.rglob("*")):
+            if child.is_file():
+                rel_path = child.relative_to(bundle_dir).as_posix()
+                archive.write(child, arcname=rel_path)
+    return archive_path
+
+
+def _make_usd_download_archive(usd_path: str, scene_dir: str | None = None) -> Path:
+    if scene_dir:
+        portable_archive = _make_portable_flattened_usd_archive(usd_path, scene_dir)
+        if portable_archive is not None:
+            return portable_archive
+
     root = _resolve_downloadable_usd_path(usd_path)
     assets_dir = _resolve_downloadable_usd_assets_dir(root)
     if assets_dir is None:
@@ -2143,7 +2361,7 @@ def scene_import_scenesmith():
                 "success": True,
                 "usd_path": usd_path,
                 "usd_download_url": _build_bridge_url(
-                    "/scene/download_usd", usd_path=usd_path
+                    "/scene/download_usd", usd_path=usd_path, scene_dir=output_dir
                 ),
                 "scenesmith_output_download_url": _build_bridge_url(
                     "/scene/download_output", scene_dir=output_dir
@@ -2594,7 +2812,7 @@ def scene_export_scene():
         usd_path = result.get("usd_path")
         if usd_path:
             result["usd_download_url"] = _build_bridge_url(
-                "/scene/download_usd", usd_path=usd_path
+                "/scene/download_usd", usd_path=usd_path, scene_dir=scene_dir
             )
         result["scenesmith_output_download_url"] = _build_bridge_url(
             "/scene/download_output", scene_dir=scene_dir
@@ -2632,11 +2850,16 @@ def scene_download_output():
 def scene_download_usd():
     """Download an exported USD file, bundling sibling assets when present."""
     usd_path = (flask_request.args.get("usd_path") or "").strip()
+    scene_dir = (flask_request.args.get("scene_dir") or "").strip()
     if not usd_path:
         return jsonify({"error": "usd_path required"}), 400
     bundle_requested = str(flask_request.args.get("bundle") or "1").strip().lower() not in {"0", "false", "no"}
     try:
-        path = _make_usd_download_archive(usd_path) if bundle_requested else _resolve_downloadable_usd_path(usd_path)
+        path = (
+            _make_usd_download_archive(usd_path, scene_dir=scene_dir or None)
+            if bundle_requested
+            else _resolve_downloadable_usd_path(usd_path)
+        )
         return send_file(
             str(path),
             as_attachment=True,
