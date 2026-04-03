@@ -3119,69 +3119,61 @@ def _process_commands():
 
             elif cmd_type == "scene_load":
                 usd_path = cmd["usd_path"]
-                ctx = omni.usd.get_context()
                 print(f"[interactive] Loading scene: {usd_path}")
 
-                # Guard against invalid paths. Some Isaac builds may shutdown app
-                # after open_stage() failures on missing files.
                 if not os.path.exists(usd_path):
                     cmd["error"] = f"Scene file not found: {usd_path}"
                 else:
-                    # open_stage returns bool (True=success), NOT a tuple
-                    ok = ctx.open_stage(usd_path)
-                    if not ok:
-                        cmd["error"] = f"Failed to open stage: {usd_path}"
-                    else:
-                        for _ in range(300):
+                    # Use add_reference instead of open_stage to preserve WebRTC stream.
+                    # open_stage replaces the entire USD stage, which kills the NVCF
+                    # streaming render target. Adding a reference keeps the existing
+                    # stage (cameras, Render prim, ground plane) intact.
+                    try:
+                        stage = _get_stage()
+                        from pxr import Sdf
+
+                        # 1. Clear previous scene content under /World
+                        world_prim = stage.GetPrimAtPath("/World")
+                        if world_prim and world_prim.IsValid():
+                            children_to_remove = []
+                            for child in world_prim.GetChildren():
+                                name = child.GetName()
+                                # Keep ground plane and physics-related prims
+                                if name in ("defaultGroundPlane", "GroundPlane"):
+                                    continue
+                                children_to_remove.append(child.GetPath().pathString)
+                            for path in children_to_remove:
+                                stage.RemovePrim(path)
+                            print(f"[scene_load] Cleared {len(children_to_remove)} prims from /World")
+
+                        # Also remove any previous /World/Scene reference
+                        scene_prim_path = "/World/Scene"
+                        old = stage.GetPrimAtPath(scene_prim_path)
+                        if old and old.IsValid():
+                            stage.RemovePrim(scene_prim_path)
+
+                        # 2. Add new scene as a reference (composing /World from USD)
+                        scene_prim = stage.DefinePrim(scene_prim_path, "Xform")
+                        scene_prim.GetReferences().AddReference(
+                            usd_path, Sdf.Path("/World")
+                        )
+
+                        # 3. Verify content loaded
+                        prim_count = sum(1 for _ in stage.Traverse())
+                        print(f"[scene_load] Added reference: {prim_count} total prims")
+
+                        # 4. Let renderer catch up
+                        for _ in range(30):
                             simulation_app.update()
-                            if ctx.get_stage_state() == omni.usd.StageState.OPENED:
-                                break
-                            time.sleep(0.05)
-                        if not _recreate_world_for_open_stage("scene_load"):
-                            cmd["error"] = "Failed to recreate world after scene load"
-                        else:
-                            # Re-bind viewport camera to new stage's camera prim
-                            # (open_stage invalidates the old render target binding)
-                            try:
-                                from omni.kit.viewport.utility import get_active_viewport
-                                vp_api = get_active_viewport()
-                                if vp_api is not None:
-                                    # Find camera in new stage
-                                    new_stage = omni.usd.get_context().get_stage()
-                                    cam_path = "/OmniverseKit_Persp"
-                                    cam_prim = new_stage.GetPrimAtPath(cam_path) if new_stage else None
-                                    if cam_prim is None or not cam_prim.IsValid():
-                                        # Create a default perspective camera
-                                        cam_prim = new_stage.DefinePrim(cam_path, "Camera")
-                                        xf = UsdGeom.Xformable(cam_prim)
-                                        xf.AddTranslateOp().Set(Gf.Vec3d(3, -3, 4))
-                                        xf.AddRotateXYZOp().Set(Gf.Vec3f(55, 0, 35))
-                                        UsdGeom.Camera(cam_prim).GetFocalLengthAttr().Set(18.0)
-                                        print(f"[scene_load] Created default camera at {cam_path}")
-                                    vp_api.set_active_camera(cam_path)
-                                    print(f"[scene_load] Viewport camera bound to {cam_path}")
 
-                                    # Re-enable NVCF streaming (open_stage can reset extensions)
-                                    try:
-                                        _ext_mgr = omni.kit.app.get_app().get_extension_manager()
-                                        _ext_mgr.set_extension_enabled_immediate("omni.services.livestream.nvcf", True)
-                                        print("[scene_load] NVCF streaming re-enabled")
-                                    except Exception as _nvcf_exc:
-                                        print(f"[scene_load] WARNING: NVCF re-enable: {_nvcf_exc}")
+                        _state["scene"] = usd_path
+                        _state["robots"] = {}
+                        cmd["result"] = {"success": True, "scene": usd_path}
+                        print(f"[interactive] Scene loaded: {usd_path}")
 
-                                    # Force render frames to re-initialize RTX pipeline + streaming
-                                    for _ in range(120):
-                                        simulation_app.update()
-                                    print("[scene_load] Render pipeline refreshed (120 frames)")
-                            except Exception as vp_exc:
-                                print(f"[scene_load] WARNING: viewport rebind failed: {vp_exc}")
-
-                            _state["scene"] = usd_path
-                            _state["robots"] = {}
-                            _state["physics"] = False
-                            _save_autosave_stage("scene_load")
-                            print(f"[interactive] Scene loaded: {usd_path}")
-                            cmd["result"] = {"success": True, "scene": usd_path}
+                    except Exception as load_exc:
+                        cmd["error"] = f"Scene load failed: {load_exc}"
+                        print(f"[scene_load] ERROR: {load_exc}")
 
             elif cmd_type == "scene_save":
                 stage = _get_stage()
