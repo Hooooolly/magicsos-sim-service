@@ -1594,6 +1594,7 @@ def _handle_export_scene(scene_dir, output_name, room_filter=None):
             col_count += 1
 
     stage.GetRootLayer().Save()
+    _flatten_scene_usd_in_place(scene_path, cache_dir)
     _make_tree_world_readable(cache_dir)
     _make_tree_world_readable(scene_path)
     print(f"[export_scene] DONE: {scene_path} ({len(converted)} objects, "
@@ -1701,13 +1702,7 @@ def _write_portable_usd_root_copy(source_usd: Path, target_usd: Path, assets_dir
         return
 
     text = source_usd.read_text(encoding="utf-8")
-    for child in sorted(assets_dir.rglob("*")):
-        if not child.is_file():
-            continue
-        abs_path = os.path.abspath(str(child))
-        rel_path = f"./{assets_dir.name}/{child.relative_to(assets_dir).as_posix()}"
-        text = text.replace(abs_path, rel_path)
-
+    text = _rewrite_portable_usd_text(text, assets_dir)
     target_usd.write_text(text, encoding="utf-8")
 
 
@@ -1732,6 +1727,47 @@ def _make_tree_world_readable(root: str | Path) -> None:
 def _relative_usd_reference(scene_path: str | Path, asset_path: str | Path) -> str:
     rel = os.path.relpath(str(asset_path), start=str(Path(scene_path).parent))
     return Path(rel).as_posix()
+
+
+def _rewrite_portable_usd_text(text: str, assets_dir: Path) -> str:
+    """Rewrite asset references so a USD file stays portable next to its assets dir."""
+    for child in sorted(assets_dir.rglob("*")):
+        if not child.is_file():
+            continue
+
+        rel_from_assets = child.relative_to(assets_dir).as_posix()
+        bundle_rel = f"./{assets_dir.name}/{rel_from_assets}"
+        local_rel = f"./{rel_from_assets}"
+        abs_path = os.path.abspath(str(child))
+
+        text = text.replace(abs_path, bundle_rel)
+        text = text.replace(f"@{local_rel}@", f"@{bundle_rel}@")
+
+    return text
+
+
+def _flatten_scene_usd_in_place(scene_path: str | Path, assets_dir: str | Path | None) -> None:
+    """Flatten a composed USD scene while preserving portable texture paths."""
+    scene_path = Path(scene_path)
+    if scene_path.suffix.lower() != ".usda":
+        return
+
+    assets_path = Path(assets_dir) if assets_dir else None
+    if assets_path is None or not assets_path.exists():
+        return
+
+    from pxr import Usd
+
+    stage = Usd.Stage.Open(str(scene_path))
+    if stage is None:
+        return
+
+    tmp_path = scene_path.with_name(f"{scene_path.stem}_flatten_tmp{scene_path.suffix}")
+    stage.Export(str(tmp_path))
+    text = tmp_path.read_text(encoding="utf-8")
+    text = _rewrite_portable_usd_text(text, assets_path)
+    scene_path.write_text(text, encoding="utf-8")
+    tmp_path.unlink(missing_ok=True)
 
 
 def _resolve_downloadable_usd_assets_dir(usd_path: Path) -> Path | None:
@@ -1943,6 +1979,7 @@ def _assemble_scene_usd(scene_path, converted_objects, ceiling_lights=None):
     n_lights = len(ceiling_lights or [])
     stage.GetRootLayer().Save()
     assets_dir = Path(str(scene_path)).with_name(f"{Path(str(scene_path)).stem}_assets")
+    _flatten_scene_usd_in_place(scene_path, assets_dir)
     _make_tree_world_readable(assets_dir)
     _make_tree_world_readable(scene_path)
     print(f"[scenesmith-import] Assembled scene: {scene_path} ({len(converted_objects)} objects, {n_lights} ceiling lights)")
