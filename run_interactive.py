@@ -3161,10 +3161,18 @@ def _process_commands():
                                     vp_api.set_active_camera(cam_path)
                                     print(f"[scene_load] Viewport camera bound to {cam_path}")
 
-                                    # Force several render frames to re-initialize RTX pipeline
-                                    for _ in range(60):
+                                    # Re-enable NVCF streaming (open_stage can reset extensions)
+                                    try:
+                                        _ext_mgr = omni.kit.app.get_app().get_extension_manager()
+                                        _ext_mgr.set_extension_enabled_immediate("omni.services.livestream.nvcf", True)
+                                        print("[scene_load] NVCF streaming re-enabled")
+                                    except Exception as _nvcf_exc:
+                                        print(f"[scene_load] WARNING: NVCF re-enable: {_nvcf_exc}")
+
+                                    # Force render frames to re-initialize RTX pipeline + streaming
+                                    for _ in range(120):
                                         simulation_app.update()
-                                    print("[scene_load] Render pipeline refreshed (60 frames)")
+                                    print("[scene_load] Render pipeline refreshed (120 frames)")
                             except Exception as vp_exc:
                                 print(f"[scene_load] WARNING: viewport rebind failed: {vp_exc}")
 
