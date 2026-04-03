@@ -148,7 +148,11 @@ GRASP_QUAT_WXYZ = np.array([0.0505, 0.7232, 0.1517, 0.6719], dtype=np.float32)
 # Side approach: 8cm behind + 12cm above. High enough to clear cube during
 # HOME→PRE_GRASP, then linear descent to GRASP from side-above angle.
 PRE_GRASP_OFFSET = np.array([-0.08, 0.0, 0.12], dtype=np.float32)
-GRASP_OFFSET = np.array([0.0, 0.0, 0.02], dtype=np.float32)  # 2cm above cube center
+# GRASP_OFFSET=0: with side-approach QUAT, tip_mid_correction is mostly in X
+# (14mm horizontal). Z correction is only -1.3mm. So OFFSET=0 places
+# finger_mid at cube center height. Old value [0,0,0.02] put fingers
+# 2cm ABOVE cube → palm contacted cube instead of fingertips.
+GRASP_OFFSET = np.array([0.0, 0.0, 0.0], dtype=np.float32)
 LIFT_OFFSET = np.array([0.0, 0.0, 0.06], dtype=np.float32)  # gentle 6cm lift
 BOWL_APPROACH_OFFSET = np.array([0.0, 0.0, 0.15], dtype=np.float32)
 PLACE_LOWER_OFFSET = np.array([0.0, 0.0, 0.05], dtype=np.float32)
@@ -2353,7 +2357,7 @@ def _run_episode_simple(
         # IK waypoint 1 may differ from current arm config, causing a jolt that
         # opens finger_joint1. Adding 5 "hold" steps gives PD time to stabilize.
         _cur_curobo = _full_to_curobo_arm_target(_lift_current, ctx.curobo_state)
-        _hold_steps = np.tile(_cur_curobo.reshape(1, -1), (5, 1))
+        _hold_steps = np.tile(_cur_curobo.reshape(1, -1), (15, 1))  # 15 hold steps (was 5)
         traj = np.vstack([_hold_steps, traj])
         if not record_and_execute(traj, hold_target, "lift"):
             raise RuntimeError("LIFT stopped")
