@@ -1497,7 +1497,10 @@ def _handle_export_scene(scene_dir, output_name, room_filter=None):
         if not os.path.exists(gltf_path):
             skipped += 1
             continue
-        usd_file = os.path.join(cache_dir, f"{_safe_prim_name(oid)}.usd")
+        safe_oid = _safe_prim_name(oid)
+        obj_cache_dir = os.path.join(cache_dir, safe_oid)
+        os.makedirs(obj_cache_dir, exist_ok=True)
+        usd_file = os.path.join(obj_cache_dir, f"{safe_oid}.usd")
         if not os.path.exists(usd_file):
             result = _convert_gltf(gltf_path, usd_file)
             if not result:
