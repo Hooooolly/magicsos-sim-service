@@ -1580,9 +1580,14 @@ def _handle_export_scene(scene_dir, output_name, room_filter=None):
         q = obj.get("transform", {}).get("rotation_wxyz")
         if q and len(q) == 4:
             xf.AddOrientOp().Set(Gf.Quatf(float(q[0]), float(q[1]), float(q[2]), float(q[3])))
+        # omni.kit.asset_converter writes glTF transforms at centimeter scale even
+        # when the scene assembly here is authored in meters. Apply the unit
+        # correction at the wrapper so object placement stays in SceneSmith meters.
         sf = obj.get("scale_factor", 1.0)
-        if isinstance(sf, (int, float)) and float(sf) != 1.0:
-            xf.AddScaleOp().Set(Gf.Vec3d(float(sf), float(sf), float(sf)))
+        asset_scale = 0.01
+        if isinstance(sf, (int, float)):
+            asset_scale *= float(sf)
+        xf.AddScaleOp().Set(Gf.Vec3d(asset_scale, asset_scale, asset_scale))
 
         asset_prim = stage.DefinePrim(f"{prim_path}/asset", "Xform")
         asset_prim.GetReferences().AddReference(_relative_usd_reference(scene_path, usd_file))
