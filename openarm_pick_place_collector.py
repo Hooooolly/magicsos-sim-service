@@ -148,11 +148,11 @@ GRASP_QUAT_WXYZ = np.array([0.0505, 0.7232, 0.1517, 0.6719], dtype=np.float32)
 # Side approach: 8cm behind + 12cm above. High enough to clear cube during
 # HOME→PRE_GRASP, then linear descent to GRASP from side-above angle.
 PRE_GRASP_OFFSET = np.array([-0.08, 0.0, 0.12], dtype=np.float32)
-# GRASP_OFFSET=0: with side-approach QUAT, tip_mid_correction is mostly in X
-# (14mm horizontal). Z correction is only -1.3mm. So OFFSET=0 places
-# finger_mid at cube center height. Old value [0,0,0.02] put fingers
-# 2cm ABOVE cube → palm contacted cube instead of fingertips.
-GRASP_OFFSET = np.array([0.0, 0.0, 0.0], dtype=np.float32)
+# tip_mid_correction only accounts for hand→finger_base (14mm in +X).
+# But the fingertip extends ~15mm beyond the base. Without backing off,
+# the cube ends up at the finger ROOT, not the TIP.
+# -0.015 in X pulls the hand back so fingertips (not base) reach the cube.
+GRASP_OFFSET = np.array([-0.015, 0.0, 0.0], dtype=np.float32)
 LIFT_OFFSET = np.array([0.0, 0.0, 0.06], dtype=np.float32)  # gentle 6cm lift
 BOWL_APPROACH_OFFSET = np.array([0.0, 0.0, 0.15], dtype=np.float32)
 PLACE_LOWER_OFFSET = np.array([0.0, 0.0, 0.05], dtype=np.float32)
