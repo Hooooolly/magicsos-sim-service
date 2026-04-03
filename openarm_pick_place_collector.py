@@ -148,11 +148,11 @@ GRASP_QUAT_WXYZ = np.array([0.0505, 0.7232, 0.1517, 0.6719], dtype=np.float32)
 # Side approach: 8cm behind + 12cm above. High enough to clear cube during
 # HOME→PRE_GRASP, then linear descent to GRASP from side-above angle.
 PRE_GRASP_OFFSET = np.array([-0.08, 0.0, 0.12], dtype=np.float32)
-# tip_mid_correction accounts for hand→finger_base (14mm in +X).
-# -8mm in X pulls the hand back slightly so fingertips reach cube,
-# not finger root. Total hand offset = 14+8=22mm behind cube.
-# (-15mm caused IK failure — too far back for cuRobo to solve.)
-GRASP_OFFSET = np.array([-0.008, 0.0, 0.0], dtype=np.float32)
+# -8mm X: pull hand back so fingertips (not root) reach cube.
+# +10mm Z: clearance above table (cuRobo collision sphere=25mm,
+#   table top at Z≈0.252, without Z offset hand at Z=0.278=26mm margin,
+#   IK fails with collision spheres clipping table).
+GRASP_OFFSET = np.array([-0.008, 0.0, 0.01], dtype=np.float32)
 LIFT_OFFSET = np.array([0.0, 0.0, 0.06], dtype=np.float32)  # gentle 6cm lift
 BOWL_APPROACH_OFFSET = np.array([0.0, 0.0, 0.15], dtype=np.float32)
 PLACE_LOWER_OFFSET = np.array([0.0, 0.0, 0.05], dtype=np.float32)
