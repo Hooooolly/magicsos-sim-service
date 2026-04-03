@@ -398,6 +398,10 @@ try:
     _CMD_TIMEOUT = float(os.environ.get("BRIDGE_CMD_TIMEOUT_SEC", "30"))
 except Exception:
     _CMD_TIMEOUT = 30.0
+try:
+    _SCENE_LOAD_TIMEOUT = float(os.environ.get("BRIDGE_SCENE_LOAD_TIMEOUT_SEC", "300"))
+except Exception:
+    _SCENE_LOAD_TIMEOUT = 300.0
 _estop_event = threading.Event()
 
 # ── Health server (port 5900) ────────────────────────────────
@@ -1316,7 +1320,11 @@ def scene_load():
     usd_path = data.get("usd_path")
     if not usd_path:
         return jsonify({"error": "usd_path required"}), 400
-    return _enqueue_cmd("scene_load", usd_path=usd_path)
+    return _enqueue_cmd(
+        "scene_load",
+        usd_path=usd_path,
+        timeout_override=max(_CMD_TIMEOUT, _SCENE_LOAD_TIMEOUT),
+    )
 
 
 @bridge.route("/scene/save", methods=["POST"])
