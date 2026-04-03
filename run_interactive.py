@@ -3140,6 +3140,34 @@ def _process_commands():
                         if not _recreate_world_for_open_stage("scene_load"):
                             cmd["error"] = "Failed to recreate world after scene load"
                         else:
+                            # Re-bind viewport camera to new stage's camera prim
+                            # (open_stage invalidates the old render target binding)
+                            try:
+                                from omni.kit.viewport.utility import get_active_viewport
+                                vp_api = get_active_viewport()
+                                if vp_api is not None:
+                                    # Find camera in new stage
+                                    new_stage = omni.usd.get_context().get_stage()
+                                    cam_path = "/OmniverseKit_Persp"
+                                    cam_prim = new_stage.GetPrimAtPath(cam_path) if new_stage else None
+                                    if cam_prim is None or not cam_prim.IsValid():
+                                        # Create a default perspective camera
+                                        cam_prim = new_stage.DefinePrim(cam_path, "Camera")
+                                        xf = UsdGeom.Xformable(cam_prim)
+                                        xf.AddTranslateOp().Set(Gf.Vec3d(3, -3, 4))
+                                        xf.AddRotateXYZOp().Set(Gf.Vec3f(55, 0, 35))
+                                        UsdGeom.Camera(cam_prim).GetFocalLengthAttr().Set(18.0)
+                                        print(f"[scene_load] Created default camera at {cam_path}")
+                                    vp_api.set_active_camera(cam_path)
+                                    print(f"[scene_load] Viewport camera bound to {cam_path}")
+
+                                    # Force several render frames to re-initialize RTX pipeline
+                                    for _ in range(60):
+                                        simulation_app.update()
+                                    print("[scene_load] Render pipeline refreshed (60 frames)")
+                            except Exception as vp_exc:
+                                print(f"[scene_load] WARNING: viewport rebind failed: {vp_exc}")
+
                             _state["scene"] = usd_path
                             _state["robots"] = {}
                             _state["physics"] = False
