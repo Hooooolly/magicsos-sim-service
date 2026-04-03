@@ -3119,61 +3119,49 @@ def _process_commands():
 
             elif cmd_type == "scene_load":
                 usd_path = cmd["usd_path"]
+                ctx = omni.usd.get_context()
                 print(f"[interactive] Loading scene: {usd_path}")
 
                 if not os.path.exists(usd_path):
                     cmd["error"] = f"Scene file not found: {usd_path}"
                 else:
-                    # Use add_reference instead of open_stage to preserve WebRTC stream.
-                    # open_stage replaces the entire USD stage, which kills the NVCF
-                    # streaming render target. Adding a reference keeps the existing
-                    # stage (cameras, Render prim, ground plane) intact.
-                    try:
-                        stage = _get_stage()
-                        from pxr import Sdf
-
-                        # 1. Clear previous scene content under /World
-                        world_prim = stage.GetPrimAtPath("/World")
-                        if world_prim and world_prim.IsValid():
-                            children_to_remove = []
-                            for child in world_prim.GetChildren():
-                                name = child.GetName()
-                                # Keep ground plane and physics-related prims
-                                if name in ("defaultGroundPlane", "GroundPlane"):
-                                    continue
-                                children_to_remove.append(child.GetPath().pathString)
-                            for path in children_to_remove:
-                                stage.RemovePrim(path)
-                            print(f"[scene_load] Cleared {len(children_to_remove)} prims from /World")
-
-                        # Also remove any previous /World/Scene reference
-                        scene_prim_path = "/World/Scene"
-                        old = stage.GetPrimAtPath(scene_prim_path)
-                        if old and old.IsValid():
-                            stage.RemovePrim(scene_prim_path)
-
-                        # 2. Add new scene as a reference (composing /World from USD)
-                        scene_prim = stage.DefinePrim(scene_prim_path, "Xform")
-                        scene_prim.GetReferences().AddReference(
-                            usd_path, Sdf.Path("/World")
-                        )
-
-                        # 3. Verify content loaded
-                        prim_count = sum(1 for _ in stage.Traverse())
-                        print(f"[scene_load] Added reference: {prim_count} total prims")
-
-                        # 4. Let renderer catch up
-                        for _ in range(30):
+                    ok = ctx.open_stage(usd_path)
+                    if not ok:
+                        cmd["error"] = f"Failed to open stage: {usd_path}"
+                    else:
+                        for _ in range(300):
                             simulation_app.update()
+                            if ctx.get_stage_state() == omni.usd.StageState.OPENED:
+                                break
+                            time.sleep(0.05)
+                        if not _recreate_world_for_open_stage("scene_load"):
+                            cmd["error"] = "Failed to recreate world after scene load"
+                        else:
+                            # Restart NVCF streaming after open_stage
+                            # (open_stage invalidates the streaming render target)
+                            try:
+                                _ext_mgr = omni.kit.app.get_app().get_extension_manager()
+                                # Disable then re-enable to force full re-init
+                                _ext_mgr.set_extension_enabled_immediate("omni.services.livestream.nvcf", False)
+                                for _ in range(10):
+                                    simulation_app.update()
+                                _ext_mgr.set_extension_enabled_immediate("omni.services.livestream.nvcf", True)
+                                print("[scene_load] NVCF streaming restarted")
+                            except Exception as _nvcf_exc:
+                                print(f"[scene_load] WARNING: NVCF restart: {_nvcf_exc}")
 
-                        _state["scene"] = usd_path
-                        _state["robots"] = {}
-                        cmd["result"] = {"success": True, "scene": usd_path}
-                        print(f"[interactive] Scene loaded: {usd_path}")
+                            # Force render warmup
+                            for _ in range(120):
+                                simulation_app.update()
+                            print("[scene_load] Render warmup done (120 frames)")
 
-                    except Exception as load_exc:
-                        cmd["error"] = f"Scene load failed: {load_exc}"
-                        print(f"[scene_load] ERROR: {load_exc}")
+                            _state["scene"] = usd_path
+                            _state["robots"] = {}
+                            _state["physics"] = False
+                            _save_autosave_stage("scene_load")
+                            print(f"[interactive] Scene loaded: {usd_path}")
+                            # reconnect_stream tells frontend to disconnect+reconnect WebRTC
+                            cmd["result"] = {"success": True, "scene": usd_path, "reconnect_stream": True}
 
             elif cmd_type == "scene_save":
                 stage = _get_stage()
