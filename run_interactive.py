@@ -1582,7 +1582,7 @@ def _handle_export_scene(scene_dir, output_name, room_filter=None):
             xf.AddScaleOp().Set(Gf.Vec3d(float(sf), float(sf), float(sf)))
 
         asset_prim = stage.DefinePrim(f"{prim_path}/asset", "Xform")
-        asset_prim.GetReferences().AddReference(os.path.abspath(usd_file))
+        asset_prim.GetReferences().AddReference(_relative_usd_reference(scene_path, usd_file))
 
     # Apply collision on all meshes
     col_count = 0
@@ -1594,6 +1594,8 @@ def _handle_export_scene(scene_dir, output_name, room_filter=None):
             col_count += 1
 
     stage.GetRootLayer().Save()
+    _make_tree_world_readable(cache_dir)
+    _make_tree_world_readable(scene_path)
     print(f"[export_scene] DONE: {scene_path} ({len(converted)} objects, "
           f"{len(room_walls)} walls, {len(ceiling_lights)} lights, {col_count} collision meshes)")
 
@@ -1693,6 +1695,45 @@ def _make_scene_download_archive(scene_dir: str) -> Path:
     return Path(archive_path)
 
 
+def _write_portable_usd_root_copy(source_usd: Path, target_usd: Path, assets_dir: Path | None) -> None:
+    if source_usd.suffix.lower() != ".usda" or assets_dir is None:
+        shutil.copy2(source_usd, target_usd)
+        return
+
+    text = source_usd.read_text(encoding="utf-8")
+    for child in sorted(assets_dir.rglob("*")):
+        if not child.is_file():
+            continue
+        abs_path = os.path.abspath(str(child))
+        rel_path = f"./{assets_dir.name}/{child.relative_to(assets_dir).as_posix()}"
+        text = text.replace(abs_path, rel_path)
+
+    target_usd.write_text(text, encoding="utf-8")
+
+
+def _make_tree_world_readable(root: str | Path) -> None:
+    base = Path(root)
+    if not base.exists():
+        return
+
+    targets = [base]
+    if base.is_dir():
+        targets.extend(sorted(base.rglob("*")))
+
+    for path in targets:
+        try:
+            if path.is_symlink():
+                continue
+            path.chmod(0o755 if path.is_dir() else 0o644)
+        except Exception:
+            continue
+
+
+def _relative_usd_reference(scene_path: str | Path, asset_path: str | Path) -> str:
+    rel = os.path.relpath(str(asset_path), start=str(Path(scene_path).parent))
+    return Path(rel).as_posix()
+
+
 def _resolve_downloadable_usd_assets_dir(usd_path: Path) -> Path | None:
     assets_dir = usd_path.with_name(f"{usd_path.stem}_assets")
     if assets_dir.exists() and assets_dir.is_dir():
@@ -1711,8 +1752,10 @@ def _make_usd_download_archive(usd_path: str) -> Path:
 
     base_name = _safe_token(root.stem) or "scene"
     archive_path = DOWNLOAD_CACHE_DIR / f"{base_name}_{int(time.time())}_{os.getpid()}_usd_bundle.zip"
+    portable_root = DOWNLOAD_CACHE_DIR / f"{base_name}_{int(time.time())}_{os.getpid()}_portable{root.suffix}"
+    _write_portable_usd_root_copy(root, portable_root, assets_dir)
     with zipfile.ZipFile(archive_path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
-        archive.write(root, arcname=root.name)
+        archive.write(portable_root, arcname=root.name)
         for child in sorted(assets_dir.rglob("*")):
             if child.is_file():
                 rel_path = child.relative_to(assets_dir).as_posix()
@@ -1883,7 +1926,7 @@ def _assemble_scene_usd(scene_path, converted_objects, ceiling_lights=None):
 
         prim_path = f"/World/{safe_id}"
         prim = stage.OverridePrim(prim_path)
-        prim.GetReferences().AddReference(os.path.abspath(usd_file))
+        prim.GetReferences().AddReference(_relative_usd_reference(scene_path, usd_file))
 
         xf = UsdGeom.Xformable(prim)
         xf.ClearXformOpOrder()
@@ -1899,6 +1942,9 @@ def _assemble_scene_usd(scene_path, converted_objects, ceiling_lights=None):
 
     n_lights = len(ceiling_lights or [])
     stage.GetRootLayer().Save()
+    assets_dir = Path(str(scene_path)).with_name(f"{Path(str(scene_path)).stem}_assets")
+    _make_tree_world_readable(assets_dir)
+    _make_tree_world_readable(scene_path)
     print(f"[scenesmith-import] Assembled scene: {scene_path} ({len(converted_objects)} objects, {n_lights} ceiling lights)")
     return True
 
