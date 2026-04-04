@@ -1713,11 +1713,10 @@ def _handle_export_scene(scene_dir, output_name, room_filter=None):
         xf.AddScaleOp().Set(Gf.Vec3d(asset_scale, asset_scale, asset_scale))
 
         asset_prim = stage.DefinePrim(f"{prim_path}/asset", "Xform")
-        # GLTF is Y-up, USD/Isaac Sim is Z-up. asset_converter converts the
-        # mesh geometry but the resulting USD still needs a -90° X rotation
-        # to stand upright in Z-up scenes.
+        # asset_converter outputs Y-up USD from GLTF. Rotate +90° around X
+        # so Y-up becomes Z-up (upright in Isaac Sim's Z-up scene).
         asset_xf = UsdGeom.Xformable(asset_prim)
-        asset_xf.AddRotateXYZOp().Set(Gf.Vec3f(-90, 0, 0))
+        asset_xf.AddRotateXYZOp().Set(Gf.Vec3f(90, 0, 0))
         asset_prim.GetReferences().AddReference(_relative_usd_reference(scene_path, usd_file))
 
     # Apply collision on all meshes
