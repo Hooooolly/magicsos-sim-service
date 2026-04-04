@@ -1449,17 +1449,19 @@ def _handle_export_scene(scene_dir, output_name, room_filter=None):
         scene_root = str(Path(state_path).parent.parent)
         layout = scene_state.get("layout", {})
 
-        # Room offsets: match layout.rooms[i].id with placed_rooms[i].position
-        # (placed_rooms may have empty id fields)
+        # Room offsets: match layout.rooms[i] with placed_rooms[i] by index.
+        # placed_rooms often has empty id fields, so we match by index
+        # and use the room id from layout.rooms as the key.
         layout_rooms_list = layout.get("rooms", [])
         placed_rooms_list = layout.get("placed_rooms", [])
         for i, lr in enumerate(layout_rooms_list):
-            rid = lr.get("id", "")
+            rid = lr.get("id", f"room_{i}")
             if i < len(placed_rooms_list):
                 pos = placed_rooms_list[i].get("position", [0, 0])
             else:
                 pos = lr.get("position", [0, 0])
             placed_rooms[rid] = (float(pos[0]), float(pos[1]))
+            print(f"[export_scene] room '{rid}' offset=({pos[0]}, {pos[1]})")
 
         # Room geometries → walls (optionally filtered)
         for rname, rg in layout.get("room_geometries", {}).items():
@@ -1536,6 +1538,18 @@ def _handle_export_scene(scene_dir, output_name, room_filter=None):
                     "pos": tuple(float(v) for v in t),
                     "bbox_min": wall.get("bbox_min", [-0.5, -0.02, -0.5]),
                     "bbox_max": wall.get("bbox_max", [0.5, 0.02, 0.5]),
+                })
+            # Floor for single room
+            floor_data = rg.get("floor", {})
+            if floor_data:
+                w = float(rg.get("width", 5.0))
+                l = float(rg.get("length", 5.0))
+                room_walls.append({
+                    "id": "floor",
+                    "pos": (0.0, 0.0, 0.0),
+                    "bbox_min": [-w/2, -l/2, -0.01],
+                    "bbox_max": [w/2, l/2, 0.0],
+                    "is_floor": True,
                 })
         print(f"[export_scene] single room: {len(all_objects)} objects, {len(room_walls)} walls")
 
