@@ -1547,6 +1547,20 @@ def _handle_export_scene(scene_dir, output_name, room_filter=None):
     cache_dir = os.path.join(library, f"{safe_name}_{ts}_assets")
     os.makedirs(cache_dir, exist_ok=True)
 
+    # Copy gltf/pbr.mdl so asset_converter's MDL references resolve at runtime
+    _mdl_candidates = [
+        Path("/isaac-sim/kit/mdl/core/mdl/gltf/pbr.mdl"),
+        Path("/isaacsim/kit/mdl/core/mdl/gltf/pbr.mdl"),
+    ]
+    for _mdl_src in _mdl_candidates:
+        if _mdl_src.is_file():
+            _mdl_dst = Path(cache_dir) / "gltf"
+            _mdl_dst.mkdir(exist_ok=True)
+            import shutil
+            shutil.copy2(str(_mdl_src), str(_mdl_dst / "pbr.mdl"))
+            print(f"[export_scene] Copied pbr.mdl to {_mdl_dst}")
+            break
+
     converted = []  # list of (oid, usd_path, obj)
     skipped = 0
 
@@ -1568,9 +1582,6 @@ def _handle_export_scene(scene_dir, output_name, room_filter=None):
         loop.run_until_complete(task.wait_until_finished())
         if not Path(dst).exists():
             return None
-        # Replace MDL shaders with UsdPreviewSurface to avoid RTX shader
-        # compilation overload that freezes NVCF streaming on 2080 Ti.
-        _strip_mdl_shaders(dst)
         return dst
 
     for oid, obj in all_objects.items():
@@ -1593,6 +1604,14 @@ def _handle_export_scene(scene_dir, output_name, room_filter=None):
                 print(f"[export_scene] SKIP {oid}: convert failed")
                 skipped += 1
                 continue
+            # Copy gltf/pbr.mdl next to each USD so MDL references resolve
+            _obj_gltf_dir = Path(obj_cache_dir) / "gltf"
+            if not (_obj_gltf_dir / "pbr.mdl").exists():
+                for _mc in _mdl_candidates:
+                    if _mc.is_file():
+                        _obj_gltf_dir.mkdir(exist_ok=True)
+                        shutil.copy2(str(_mc), str(_obj_gltf_dir / "pbr.mdl"))
+                        break
         converted.append((oid, usd_file, obj))
         if len(converted) % 10 == 0:
             print(f"[export_scene] converted {len(converted)} objects...")
