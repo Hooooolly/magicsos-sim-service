@@ -1467,17 +1467,42 @@ def _handle_export_scene(scene_dir, output_name, room_filter=None):
             placed_rooms[rid] = (cx, cy)
             print(f"[export_scene] room '{rid}' pos=({pos[0]},{pos[1]}) size={pw}x{pd} center=({cx},{cy})")
 
+        # Build wall opening map from placed_rooms
+        # Key: (room_id, direction) → list of openings
+        _wall_openings = {}
+        for pr in placed_rooms_list:
+            prid = pr.get("room_id", "")
+            for pw in pr.get("walls", []):
+                direction = pw.get("direction", "")
+                openings = pw.get("openings", [])
+                if openings:
+                    _wall_openings[(prid, direction)] = openings
+
         # Room geometries → walls (optionally filtered)
         for rname, rg in layout.get("room_geometries", {}).items():
             if room_filter and rname != room_filter:
                 continue
             ox, oy = placed_rooms.get(rname, (0, 0))
             for wall in rg.get("walls", []):
+                wid = wall.get("object_id", "wall")
                 t = wall.get("transform", {}).get("translation", [0, 0, 0])
                 bmin = wall.get("bbox_min", [-0.5, -0.02, -0.5])
                 bmax = wall.get("bbox_max", [0.5, 0.02, 0.5])
+
+                # Check openings for this wall
+                direction = wid.replace("_wall", "")  # "north_wall" → "north"
+                openings = _wall_openings.get((rname, direction), [])
+
+                # Skip wall entirely if it has a full "open" opening
+                has_full_open = any(
+                    o.get("opening_type") == "open" for o in openings
+                )
+                if has_full_open:
+                    print(f"[export_scene] skip open wall {rname}/{wid}")
+                    continue
+
                 room_walls.append({
-                    "id": f"{rname}_{wall.get('object_id', 'wall')}",
+                    "id": f"{rname}_{wid}",
                     "pos": (float(t[0]) + ox, float(t[1]) + oy, float(t[2])),
                     "bbox_min": bmin, "bbox_max": bmax,
                 })
