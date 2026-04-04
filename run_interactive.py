@@ -206,14 +206,16 @@ try:
     simulation_app = app_launcher.app
     print("[interactive] Isaac Sim started via IsaacLab AppLauncher")
 except ImportError:
-    # Fallback: try direct SimulationApp
+    # Fallback: try direct SimulationApp (Isaac Sim 5.x+)
     from isaacsim import SimulationApp
     simulation_app = SimulationApp({
         "headless": True,
         "width": 1920,
         "height": 1080,
+        "enable_livestream": True,
+        "livestream_library": "omni.services.livestream.nvcf",
     })
-    print("[interactive] Isaac Sim started via SimulationApp (fallback)")
+    print("[interactive] Isaac Sim started via SimulationApp (fallback, livestream enabled)")
 
 # ── Imports available only after Kit starts ───────────────────
 import omni.usd
@@ -263,8 +265,17 @@ except Exception as exc:
 # ── Enable NVCF streaming extension ──────────────────────────
 try:
     ext_mgr = omni.kit.app.get_app().get_extension_manager()
-    ext_mgr.set_extension_enabled_immediate("omni.services.livestream.nvcf", True)
-    print("[interactive] NVCF streaming extension enabled")
+    # WebRTC core must be enabled before NVCF
+    for ext_name in (
+        "omni.kit.livestream.core",
+        "omni.kit.livestream.webrtc",
+        "omni.services.livestream.nvcf",
+    ):
+        try:
+            ext_mgr.set_extension_enabled_immediate(ext_name, True)
+        except Exception:
+            pass
+    print("[interactive] NVCF streaming extensions enabled")
 except Exception as exc:
     print(f"[interactive] WARNING: NVCF extension: {exc}")
 
