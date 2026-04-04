@@ -1601,6 +1601,29 @@ def _handle_export_scene(scene_dir, output_name, room_filter=None):
         loop.run_until_complete(task.wait_until_finished())
         if not Path(dst).exists():
             return None
+        # Fix up-axis: asset_converter outputs Y-up from GLTF.
+        # Set stage upAxis to Z and add a root rotation to compensate.
+        try:
+            from pxr import Usd
+            fix_stage = Usd.Stage.Open(str(dst))
+            UsdGeom.SetStageUpAxis(fix_stage, UsdGeom.Tokens.z)
+            # Add -90° X rotation to the root prim so Y-up mesh stands upright in Z-up
+            root = fix_stage.GetDefaultPrim()
+            if root and root.IsValid():
+                rxf = UsdGeom.Xformable(root)
+                # Prepend rotation before any existing transforms
+                rxf.AddRotateXYZOp(opSuffix="upAxisFix").Set(Gf.Vec3f(-90, 0, 0))
+                # Reorder so upAxisFix comes first
+                ops = rxf.GetOrderedXformOps()
+                op_names = [op.GetOpName() for op in ops]
+                if "xformOp:rotateXYZ:upAxisFix" in op_names:
+                    idx = op_names.index("xformOp:rotateXYZ:upAxisFix")
+                    if idx > 0:
+                        op_names.insert(0, op_names.pop(idx))
+                        root.GetAttribute("xformOpOrder").Set(op_names)
+            fix_stage.GetRootLayer().Save()
+        except Exception as fix_exc:
+            print(f"[export] WARNING: upAxis fix failed for {dst}: {fix_exc}")
         return dst
 
     for oid, obj in all_objects.items():
