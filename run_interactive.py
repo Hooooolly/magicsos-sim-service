@@ -1449,19 +1449,23 @@ def _handle_export_scene(scene_dir, output_name, room_filter=None):
         scene_root = str(Path(state_path).parent.parent)
         layout = scene_state.get("layout", {})
 
-        # Room offsets: match layout.rooms[i] with placed_rooms[i] by index.
-        # placed_rooms often has empty id fields, so we match by index
-        # and use the room id from layout.rooms as the key.
+        # Room offsets: placed_rooms[i].position is the room's bottom-left corner
+        # in global coords. room_geometries walls are relative to room center.
+        # So offset = position + (width/2, depth/2) to get the center.
         layout_rooms_list = layout.get("rooms", [])
         placed_rooms_list = layout.get("placed_rooms", [])
-        for i, lr in enumerate(layout_rooms_list):
-            rid = lr.get("id", f"room_{i}")
-            if i < len(placed_rooms_list):
-                pos = placed_rooms_list[i].get("position", [0, 0])
-            else:
-                pos = lr.get("position", [0, 0])
-            placed_rooms[rid] = (float(pos[0]), float(pos[1]))
-            print(f"[export_scene] room '{rid}' offset=({pos[0]}, {pos[1]})")
+        for i, pr in enumerate(placed_rooms_list):
+            rid = pr.get("room_id", "")
+            if not rid and i < len(layout_rooms_list):
+                rid = layout_rooms_list[i].get("id", f"room_{i}")
+            pos = pr.get("position", [0, 0])
+            pw = float(pr.get("width", 0))
+            pd = float(pr.get("depth", 0))
+            # Center = bottom-left + half size
+            cx = float(pos[0]) + pw / 2.0
+            cy = float(pos[1]) + pd / 2.0
+            placed_rooms[rid] = (cx, cy)
+            print(f"[export_scene] room '{rid}' pos=({pos[0]},{pos[1]}) size={pw}x{pd} center=({cx},{cy})")
 
         # Room geometries → walls (optionally filtered)
         for rname, rg in layout.get("room_geometries", {}).items():
