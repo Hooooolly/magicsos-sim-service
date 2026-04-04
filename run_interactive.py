@@ -3197,49 +3197,79 @@ def _process_commands():
 
             elif cmd_type == "scene_load":
                 usd_path = cmd["usd_path"]
-                ctx = omni.usd.get_context()
                 print(f"[interactive] Loading scene: {usd_path}")
 
                 if not os.path.exists(usd_path):
                     cmd["error"] = f"Scene file not found: {usd_path}"
                 else:
-                    ok = ctx.open_stage(usd_path)
-                    if not ok:
-                        cmd["error"] = f"Failed to open stage: {usd_path}"
-                    else:
-                        for _ in range(300):
-                            simulation_app.update()
-                            if ctx.get_stage_state() == omni.usd.StageState.OPENED:
-                                break
-                            time.sleep(0.05)
-                        if not _recreate_world_for_open_stage("scene_load"):
-                            cmd["error"] = "Failed to recreate world after scene load"
+                    # Enqueue individual object loads so main loop keeps
+                    # running between them (preserves NVCF streaming heartbeat).
+                    # Read the scene USD to find all object references, then
+                    # add them one by one with simulation_app.update() in between.
+                    try:
+                        stage = _get_stage()
+                        from pxr import Sdf, UsdLux
+
+                        # 1. Clear previous scene
+                        for child in list(stage.GetPrimAtPath("/World").GetChildren()):
+                            name = child.GetName()
+                            if name in ("defaultGroundPlane", "GroundPlane"):
+                                continue
+                            stage.RemovePrim(child.GetPath().pathString)
+                        simulation_app.update()
+
+                        # 2. Read scene USD to extract object refs + transforms
+                        scene_stage = Usd.Stage.Open(usd_path)
+                        scene_world = scene_stage.GetPrimAtPath("/World")
+                        if not scene_world or not scene_world.IsValid():
+                            cmd["error"] = f"No /World prim in {usd_path}"
                         else:
-                            # Restart NVCF streaming after open_stage
-                            # (open_stage invalidates the streaming render target)
-                            try:
-                                _ext_mgr = omni.kit.app.get_app().get_extension_manager()
-                                # Disable then re-enable to force full re-init
-                                _ext_mgr.set_extension_enabled_immediate("omni.services.livestream.nvcf", False)
-                                for _ in range(10):
-                                    simulation_app.update()
-                                _ext_mgr.set_extension_enabled_immediate("omni.services.livestream.nvcf", True)
-                                print("[scene_load] NVCF streaming restarted")
-                            except Exception as _nvcf_exc:
-                                print(f"[scene_load] WARNING: NVCF restart: {_nvcf_exc}")
-
-                            # Force render warmup
-                            for _ in range(120):
+                            # Add lights first (from /World/Lights)
+                            lights_prim = scene_stage.GetPrimAtPath("/World/Lights")
+                            if lights_prim and lights_prim.IsValid():
+                                light_xf = stage.DefinePrim("/World/SceneLights", "Xform")
+                                light_xf.GetReferences().AddReference(usd_path, Sdf.Path("/World/Lights"))
                                 simulation_app.update()
-                            print("[scene_load] Render warmup done (120 frames)")
+                                print("[scene_load] Lights added")
 
+                            # Add structure (walls) as single reference
+                            struct_prim = scene_stage.GetPrimAtPath("/World/Structure")
+                            if struct_prim and struct_prim.IsValid():
+                                wall_xf = stage.DefinePrim("/World/SceneWalls", "Xform")
+                                wall_xf.GetReferences().AddReference(usd_path, Sdf.Path("/World/Structure"))
+                                simulation_app.update()
+                                print("[scene_load] Walls added")
+
+                            # Add objects one by one from /World/Objects
+                            objects_prim = scene_stage.GetPrimAtPath("/World/Objects")
+                            obj_count = 0
+                            if objects_prim and objects_prim.IsValid():
+                                for child in objects_prim.GetChildren():
+                                    child_name = child.GetName()
+                                    obj_xf = stage.DefinePrim(f"/World/SceneObjects/{child_name}", "Xform")
+                                    obj_xf.GetReferences().AddReference(
+                                        usd_path, Sdf.Path(f"/World/Objects/{child_name}")
+                                    )
+                                    obj_count += 1
+                                    # Let main loop breathe every 3 objects
+                                    if obj_count % 3 == 0:
+                                        simulation_app.update()
+
+                            # Final settle
+                            for _ in range(10):
+                                simulation_app.update()
+
+                            prim_count = sum(1 for _ in stage.Traverse())
                             _state["scene"] = usd_path
                             _state["robots"] = {}
-                            _state["physics"] = False
-                            _save_autosave_stage("scene_load")
-                            print(f"[interactive] Scene loaded: {usd_path}")
-                            # reconnect_stream tells frontend to disconnect+reconnect WebRTC
-                            cmd["result"] = {"success": True, "scene": usd_path, "reconnect_stream": True}
+                            print(f"[interactive] Scene loaded: {usd_path} ({obj_count} objects, {prim_count} prims)")
+                            cmd["result"] = {"success": True, "scene": usd_path, "objects": obj_count}
+
+                    except Exception as load_exc:
+                        cmd["error"] = f"Scene load failed: {load_exc}"
+                        print(f"[scene_load] ERROR: {load_exc}")
+                        import traceback
+                        traceback.print_exc()
 
             elif cmd_type == "scene_save":
                 stage = _get_stage()
