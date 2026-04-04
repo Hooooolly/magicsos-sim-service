@@ -3250,6 +3250,14 @@ def _process_commands():
                                     obj_xf.GetReferences().AddReference(
                                         usd_path, Sdf.Path(f"/World/Objects/{child_name}")
                                     )
+                                    # Check if object has scale (older exports lack 0.01 cm→m)
+                                    xformable = UsdGeom.Xformable(obj_xf)
+                                    has_scale = any(
+                                        op.GetOpName() == "xformOp:scale"
+                                        for op in xformable.GetOrderedXformOps()
+                                    )
+                                    if not has_scale:
+                                        xformable.AddScaleOp().Set(Gf.Vec3d(0.01, 0.01, 0.01))
                                     obj_count += 1
                                     # Let main loop breathe every 3 objects
                                     if obj_count % 3 == 0:
