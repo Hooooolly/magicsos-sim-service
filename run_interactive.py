@@ -1590,6 +1590,7 @@ def _handle_export_scene(scene_dir, output_name, room_filter=None):
         ctx.ignore_light = True
         ctx.export_preview_surface = True
         ctx.use_meter_as_world_unit = True
+        ctx.convert_stage_up_z = True  # GLTF Y-up → USD Z-up
         task = ac.get_instance().create_converter_task(str(src), str(dst), ctx)
         # Wait for converter to finish (use asyncio loop, not sim app update)
         try:
@@ -1713,10 +1714,6 @@ def _handle_export_scene(scene_dir, output_name, room_filter=None):
         xf.AddScaleOp().Set(Gf.Vec3d(asset_scale, asset_scale, asset_scale))
 
         asset_prim = stage.DefinePrim(f"{prim_path}/asset", "Xform")
-        # asset_converter outputs Y-up USD from GLTF. Rotate +90° around X
-        # so Y-up becomes Z-up (upright in Isaac Sim's Z-up scene).
-        asset_xf = UsdGeom.Xformable(asset_prim)
-        asset_xf.AddRotateXYZOp().Set(Gf.Vec3f(90, 0, 0))
         asset_prim.GetReferences().AddReference(_relative_usd_reference(scene_path, usd_file))
 
     # Apply collision on all meshes
