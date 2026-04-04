@@ -1481,16 +1481,25 @@ def _handle_export_scene(scene_dir, output_name, room_filter=None):
                     "pos": (float(t[0]) + ox, float(t[1]) + oy, float(t[2])),
                     "bbox_min": bmin, "bbox_max": bmax,
                 })
-            # Floor
+            # Floor — geometry.width is Y extent, geometry.length is X extent
+            # Use placed_rooms width (X) and depth (Y) from the matching room
             floor_data = rg.get("floor", {})
             if floor_data:
-                w = float(rg.get("width", 5.0))
-                l = float(rg.get("length", 5.0))
+                pr_match = next(
+                    (pr for pr in placed_rooms_list if pr.get("room_id") == rname),
+                    None,
+                )
+                if pr_match:
+                    fx = float(pr_match.get("width", rg.get("length", 5.0)))
+                    fy = float(pr_match.get("depth", rg.get("width", 5.0)))
+                else:
+                    fx = float(rg.get("length", 5.0))
+                    fy = float(rg.get("width", 5.0))
                 room_walls.append({
                     "id": f"{rname}_floor",
                     "pos": (ox, oy, 0.0),
-                    "bbox_min": [-w/2, -l/2, -0.01],
-                    "bbox_max": [w/2, l/2, 0.0],
+                    "bbox_min": [-fx/2, -fy/2, 0.0],
+                    "bbox_max": [fx/2, fy/2, 0.01],
                     "is_floor": True,
                 })
 
@@ -1543,16 +1552,16 @@ def _handle_export_scene(scene_dir, output_name, room_filter=None):
                     "bbox_min": wall.get("bbox_min", [-0.5, -0.02, -0.5]),
                     "bbox_max": wall.get("bbox_max", [0.5, 0.02, 0.5]),
                 })
-            # Floor for single room
+            # Floor for single room — geometry.length=X, geometry.width=Y
             floor_data = rg.get("floor", {})
             if floor_data:
-                w = float(rg.get("width", 5.0))
-                l = float(rg.get("length", 5.0))
+                fx = float(rg.get("length", 5.0))
+                fy = float(rg.get("width", 5.0))
                 room_walls.append({
                     "id": "floor",
                     "pos": (0.0, 0.0, 0.0),
-                    "bbox_min": [-w/2, -l/2, -0.01],
-                    "bbox_max": [w/2, l/2, 0.0],
+                    "bbox_min": [-fx/2, -fy/2, 0.0],
+                    "bbox_max": [fx/2, fy/2, 0.01],
                     "is_floor": True,
                 })
         print(f"[export_scene] single room: {len(all_objects)} objects, {len(room_walls)} walls")
@@ -1601,20 +1610,8 @@ def _handle_export_scene(scene_dir, output_name, room_filter=None):
         loop.run_until_complete(task.wait_until_finished())
         if not Path(dst).exists():
             return None
-        # Fix up-axis: asset_converter outputs Y-up from GLTF.
-        # Clear root xform, set upAxis=Z, add -90° X rotation.
-        try:
-            from pxr import Usd
-            fix_stage = Usd.Stage.Open(str(dst))
-            root = fix_stage.GetPrimAtPath("/World")
-            if root and root.IsValid():
-                rxf = UsdGeom.Xformable(root)
-                rxf.ClearXformOpOrder()
-                rxf.AddRotateXYZOp().Set(Gf.Vec3f(-90, 0, 0))
-            UsdGeom.SetStageUpAxis(fix_stage, UsdGeom.Tokens.z)
-            fix_stage.GetRootLayer().Save()
-        except Exception as fix_exc:
-            print(f"[export] WARNING: upAxis fix failed for {dst}: {fix_exc}")
+        # No post-conversion rotation here — the +90° X rotation is applied
+        # on the asset prim in the scene USD assembly (see Objects section below).
         return dst
 
     for oid, obj in all_objects.items():
@@ -1728,6 +1725,9 @@ def _handle_export_scene(scene_dir, output_name, room_filter=None):
         xf.AddScaleOp().Set(Gf.Vec3d(asset_scale, asset_scale, asset_scale))
 
         asset_prim = stage.DefinePrim(f"{prim_path}/asset", "Xform")
+        # GLTF Y-up → USD Z-up: +90° X rotation on asset prim
+        asset_axf = UsdGeom.Xformable(asset_prim)
+        asset_axf.AddRotateXYZOp().Set(Gf.Vec3f(90, 0, 0))
         asset_prim.GetReferences().AddReference(_relative_usd_reference(scene_path, usd_file))
 
     # Apply collision on all meshes
