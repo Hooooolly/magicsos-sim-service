@@ -1342,6 +1342,68 @@ def scene_save():
 
 # ── SceneSmith → USD export (main-thread, uses asset_converter) ──
 
+
+def _strip_mdl_shaders(usd_path):
+    """Replace MDL shaders with UsdPreviewSurface in a converted USD.
+
+    asset_converter outputs MDL materials (gltf/pbr.mdl) which cause RTX
+    shader compilation overload on 2080 Ti, freezing NVCF streaming.
+    This rewrites each MDL Shader to UsdPreviewSurface, preserving the
+    diffuse color and texture bindings.
+    """
+    try:
+        from pxr import Usd, UsdShade, Sdf
+        stage = Usd.Stage.Open(str(usd_path))
+        if not stage:
+            return
+
+        changed = False
+        for prim in stage.Traverse():
+            if prim.GetTypeName() != "Shader":
+                continue
+            shader = UsdShade.Shader(prim)
+            impl_src = shader.GetImplementationSource()
+            if impl_src != "sourceAsset":
+                continue
+            mdl_asset = shader.GetSourceAsset("mdl")
+            if not mdl_asset or "pbr.mdl" not in str(mdl_asset.resolvedPath or mdl_asset.path):
+                continue
+
+            # Read existing texture/color inputs before overwriting
+            diff_tex = None
+            diff_color = None
+            for inp in shader.GetInputs():
+                name = inp.GetBaseName()
+                if name == "diffuse_texture":
+                    diff_tex = inp.Get()
+                elif name == "diffuse_color_constant":
+                    diff_color = inp.Get()
+
+            # Overwrite to UsdPreviewSurface
+            shader.SetShaderId("UsdPreviewSurface")
+            # Clear MDL source asset attrs
+            for attr_name in ("info:mdl:sourceAsset", "info:mdl:sourceAsset:subIdentifier"):
+                attr = prim.GetAttribute(attr_name)
+                if attr and attr.IsValid():
+                    prim.RemoveProperty(attr_name)
+
+            # Set basic PBR params
+            shader.CreateInput("roughness", Sdf.ValueTypeNames.Float).Set(0.5)
+            shader.CreateInput("metallic", Sdf.ValueTypeNames.Float).Set(0.0)
+            if diff_color:
+                shader.CreateInput("diffuseColor", Sdf.ValueTypeNames.Color3f).Set(diff_color)
+            else:
+                shader.CreateInput("diffuseColor", Sdf.ValueTypeNames.Color3f).Set((0.7, 0.7, 0.7))
+
+            changed = True
+
+        if changed:
+            stage.GetRootLayer().Save()
+            print(f"[export] Stripped MDL shaders in {Path(usd_path).name}")
+    except Exception as exc:
+        print(f"[export] WARNING: MDL strip failed for {usd_path}: {exc}")
+
+
 def _handle_export_scene(scene_dir, output_name, room_filter=None):
     """Export SceneSmith scene to USD. Uses omni.kit.asset_converter.
 
@@ -1493,7 +1555,12 @@ def _handle_export_scene(scene_dir, output_name, room_filter=None):
             loop = asyncio.new_event_loop()
             asyncio.set_event_loop(loop)
         loop.run_until_complete(task.wait_until_finished())
-        return dst if Path(dst).exists() else None
+        if not Path(dst).exists():
+            return None
+        # Replace MDL shaders with UsdPreviewSurface to avoid RTX shader
+        # compilation overload that freezes NVCF streaming on 2080 Ti.
+        _strip_mdl_shaders(dst)
+        return dst
 
     for oid, obj in all_objects.items():
         geom_rel = obj.get("geometry_path", "")
