@@ -1508,11 +1508,115 @@ def _handle_export_scene(scene_dir, output_name, room_filter=None):
                     print(f"[export_scene] skip open wall {rname}/{wid}")
                     continue
 
-                room_walls.append({
-                    "id": f"{rname}_{wid}",
-                    "pos": (float(t[0]) + ox, float(t[1]) + oy, float(t[2])),
-                    "bbox_min": bmin, "bbox_max": bmax,
-                })
+                # Determine wall orientation: north/south walls extend along X,
+                # east/west walls extend along Y
+                is_ns = "north" in wid or "south" in wid  # extends along X
+                wall_pos = (float(t[0]) + ox, float(t[1]) + oy, float(t[2]))
+
+                # Filter to door/window openings (not "open" type)
+                real_openings = [
+                    o for o in openings
+                    if o.get("opening_type") in ("door", "window")
+                ]
+
+                if not real_openings:
+                    # Solid wall, no openings
+                    room_walls.append({
+                        "id": f"{rname}_{wid}",
+                        "pos": wall_pos,
+                        "bbox_min": bmin, "bbox_max": bmax,
+                    })
+                else:
+                    # Split wall around openings
+                    # Wall local extent along primary axis
+                    if is_ns:
+                        wall_min, wall_max = float(bmin[0]), float(bmax[0])
+                        wall_thick_min, wall_thick_max = float(bmin[1]), float(bmax[1])
+                    else:
+                        wall_min, wall_max = float(bmin[1]), float(bmax[1])
+                        wall_thick_min, wall_thick_max = float(bmin[0]), float(bmax[0])
+                    wall_len = wall_max - wall_min
+                    wall_z_min, wall_z_max = float(bmin[2]), float(bmax[2])
+                    wall_height = wall_z_max - wall_z_min
+
+                    # Sort openings by position along wall
+                    sorted_openings = sorted(
+                        real_openings,
+                        key=lambda o: float(o.get("position_along_wall", 0))
+                    )
+
+                    # Build wall segments
+                    cursor = wall_min
+                    seg_idx = 0
+                    for opening in sorted_openings:
+                        o_pos = float(opening.get("position_along_wall", 0))
+                        o_width = float(opening.get("width", 0.9))
+                        o_height = float(opening.get("height", 2.1))
+                        o_sill = float(opening.get("sill_height", 0))
+                        # Opening center in local wall coords
+                        o_start = wall_min + o_pos
+                        o_end = o_start + o_width
+
+                        # Segment before opening
+                        if o_start > cursor + 0.01:
+                            seg_min = cursor
+                            seg_max = o_start
+                            if is_ns:
+                                sb = [seg_min, wall_thick_min, wall_z_min]
+                                se = [seg_max, wall_thick_max, wall_z_max]
+                            else:
+                                sb = [wall_thick_min, seg_min, wall_z_min]
+                                se = [wall_thick_max, seg_max, wall_z_max]
+                            room_walls.append({
+                                "id": f"{rname}_{wid}_s{seg_idx}",
+                                "pos": wall_pos, "bbox_min": sb, "bbox_max": se,
+                            })
+                            seg_idx += 1
+
+                        # Segment above opening (lintel)
+                        if o_sill + o_height < wall_height - 0.01:
+                            lintel_z_min = wall_z_min + o_sill + o_height
+                            if is_ns:
+                                sb = [o_start, wall_thick_min, lintel_z_min]
+                                se = [o_end, wall_thick_max, wall_z_max]
+                            else:
+                                sb = [wall_thick_min, o_start, lintel_z_min]
+                                se = [wall_thick_max, o_end, wall_z_max]
+                            room_walls.append({
+                                "id": f"{rname}_{wid}_above{seg_idx}",
+                                "pos": wall_pos, "bbox_min": sb, "bbox_max": se,
+                            })
+                            seg_idx += 1
+
+                        # Segment below opening (sill, for windows)
+                        if o_sill > 0.01:
+                            sill_z_max = wall_z_min + o_sill
+                            if is_ns:
+                                sb = [o_start, wall_thick_min, wall_z_min]
+                                se = [o_end, wall_thick_max, sill_z_max]
+                            else:
+                                sb = [wall_thick_min, o_start, wall_z_min]
+                                se = [wall_thick_max, o_end, sill_z_max]
+                            room_walls.append({
+                                "id": f"{rname}_{wid}_sill{seg_idx}",
+                                "pos": wall_pos, "bbox_min": sb, "bbox_max": se,
+                            })
+                            seg_idx += 1
+
+                        cursor = o_end
+
+                    # Final segment after last opening
+                    if cursor < wall_max - 0.01:
+                        if is_ns:
+                            sb = [cursor, wall_thick_min, wall_z_min]
+                            se = [wall_max, wall_thick_max, wall_z_max]
+                        else:
+                            sb = [wall_thick_min, cursor, wall_z_min]
+                            se = [wall_thick_max, wall_max, wall_z_max]
+                        room_walls.append({
+                            "id": f"{rname}_{wid}_s{seg_idx}",
+                            "pos": wall_pos, "bbox_min": sb, "bbox_max": se,
+                        })
             # Floor — geometry.width is Y extent, geometry.length is X extent
             # Use placed_rooms width (X) and depth (Y) from the matching room
             floor_data = rg.get("floor", {})
