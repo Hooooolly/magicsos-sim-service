@@ -1493,9 +1493,16 @@ def _handle_export_scene(scene_dir, output_name, room_filter=None):
                 direction = wid.replace("_wall", "")  # "north_wall" → "north"
                 openings = _wall_openings.get((rname, direction), [])
 
-                # Skip wall entirely if it has a full "open" opening
+                # Skip wall if an "open" opening covers the full wall length
+                # (wall extent along its primary axis)
+                wall_extent = max(
+                    abs(bmax[0] - bmin[0]),
+                    abs(bmax[1] - bmin[1]),
+                )
                 has_full_open = any(
-                    o.get("opening_type") == "open" for o in openings
+                    o.get("opening_type") == "open"
+                    and float(o.get("width", 0)) >= wall_extent * 0.9
+                    for o in openings
                 )
                 if has_full_open:
                     print(f"[export_scene] skip open wall {rname}/{wid}")
