@@ -1513,11 +1513,20 @@ def _handle_export_scene(scene_dir, output_name, room_filter=None):
                 is_ns = "north" in wid or "south" in wid  # extends along X
                 wall_pos = (float(t[0]) + ox, float(t[1]) + oy, float(t[2]))
 
-                # Filter to door/window openings (not "open" type)
-                real_openings = [
-                    o for o in openings
-                    if o.get("opening_type") in ("door", "window")
-                ]
+                # All openings that create gaps in the wall
+                real_openings = []
+                full_wall_h = float(bmax[2] - bmin[2]) * 2  # full height
+                for o in openings:
+                    otype = o.get("opening_type", "")
+                    if otype in ("door", "window"):
+                        real_openings.append(o)
+                    elif otype == "open":
+                        # Open = full-height gap
+                        real_openings.append({
+                            **o,
+                            "height": full_wall_h,
+                            "sill_height": 0.0,
+                        })
 
                 if not real_openings:
                     # Solid wall, no openings
