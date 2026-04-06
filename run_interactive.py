@@ -198,9 +198,9 @@ sys.argv.append(f"--kit_args=--/exts/omni.services.transport.server.http/port={K
 sys.argv.append(f"--kit_args=--/app/livestream/fixedHostPort={MEDIA_PORT}")
 print(f"[interactive] WebRTC media UDP fixed to port {MEDIA_PORT}")
 
-# Suppress deprecation warnings from Isaac Sim 5.x transition at Kit level
-sys.argv.append("--kit_args=--/log/level=error")
-sys.argv.append("--kit_args=--/log/fileLogLevel=warning")
+# Note: Isaac Sim 5.1.0 emits ~90 deprecation warnings from internal
+# extension wrappers (omni.isaac.* → isaacsim.*). These are harmless and
+# cannot be suppressed without modifying the container. Will disappear in 6.x.
 
 # ── Start Isaac Sim via IsaacLab AppLauncher ──────────────────
 print("[interactive] Starting Isaac Sim (headless + NVCF streaming)...")
