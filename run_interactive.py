@@ -305,6 +305,9 @@ except Exception as exc:
     print(f"[interactive] WARNING: NVCF extension: {exc}")
 
 # Initialize Isaac API compat layer (must be after extension startup)
+# Force a few app updates to ensure all extensions finish loading
+for _ in range(5):
+    simulation_app.update()
 _init_isaac_compat()
 
 # ── Detect actual Kit API port (may differ from KIT_API_PORT if taken) ──
