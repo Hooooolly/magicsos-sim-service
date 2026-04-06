@@ -1429,7 +1429,7 @@ def _handle_export_scene(scene_dir, output_name, room_filter=None):
     """
     import asyncio
     import omni.kit.asset_converter as ac
-    from pxr import Gf, Usd, UsdGeom, UsdPhysics, UsdLux, Vt
+    from pxr import Gf, Sdf, Usd, UsdGeom, UsdPhysics, UsdLux, UsdShade, Vt
 
     scene_dir = str(scene_dir)
     state_path, is_house = _find_scenesmith_scene_state(scene_dir)
@@ -1443,6 +1443,7 @@ def _handle_export_scene(scene_dir, output_name, room_filter=None):
     all_objects = {}     # oid → obj dict (with _room_dir, _room_offset)
     ceiling_lights = []
     room_walls = []      # list of wall dicts with global coords
+    glass_panes = []     # list of window glass pane dicts
     placed_rooms = {}    # room_name → (ox, oy)
 
     if is_house and "rooms" in scene_state:
@@ -1611,6 +1612,22 @@ def _handle_export_scene(scene_dir, output_name, room_filter=None):
                                 "pos": wall_pos, "bbox_min": sb, "bbox_max": se,
                             })
                             seg_idx += 1
+
+                        # Glass pane for windows
+                        if opening.get("opening_type") == "window" and o_sill > 0.01:
+                            glass_z_min = wall_z_min + o_sill
+                            glass_z_max = wall_z_min + o_sill + o_height
+                            thick_center = (wall_thick_min + wall_thick_max) / 2
+                            if is_ns:
+                                gb = [o_start, thick_center - 0.005, glass_z_min]
+                                ge = [o_end, thick_center + 0.005, glass_z_max]
+                            else:
+                                gb = [thick_center - 0.005, o_start, glass_z_min]
+                                ge = [thick_center + 0.005, o_end, glass_z_max]
+                            glass_panes.append({
+                                "id": f"{rname}_{wid}_glass{seg_idx}",
+                                "pos": wall_pos, "bbox_min": gb, "bbox_max": ge,
+                            })
 
                         cursor = o_end
 
@@ -1843,6 +1860,39 @@ def _handle_export_scene(scene_dir, output_name, room_filter=None):
         wxf.AddTranslateOp().Set(Gf.Vec3d(cx, cy, cz))
         wxf.AddScaleOp().Set(Gf.Vec3d(sx, sy, sz))
         UsdPhysics.CollisionAPI.Apply(cube.GetPrim())
+
+    # Glass panes for windows
+    for gdata in glass_panes:
+        gid = _safe_prim_name(gdata["id"])
+        gbmin = gdata["bbox_min"]
+        gbmax = gdata["bbox_max"]
+        gsx = max(0.001, float(gbmax[0] - gbmin[0]))
+        gsy = max(0.001, float(gbmax[1] - gbmin[1]))
+        gsz = max(0.001, float(gbmax[2] - gbmin[2]))
+        gcx = float((gbmin[0] + gbmax[0]) * 0.5 + gdata["pos"][0])
+        gcy = float((gbmin[1] + gbmax[1]) * 0.5 + gdata["pos"][1])
+        gcz = float((gbmin[2] + gbmax[2]) * 0.5 + gdata["pos"][2])
+        glass_path = f"/World/Structure/{gid}"
+        glass_cube = UsdGeom.Cube.Define(stage, glass_path)
+        glass_cube.GetSizeAttr().Set(1.0)
+        glass_cube.GetDisplayColorAttr().Set([(0.85, 0.92, 0.97)])  # light blue tint
+        glass_cube.GetDisplayOpacityAttr().Set([0.2])
+        gxf = UsdGeom.Xformable(glass_cube.GetPrim())
+        gxf.AddTranslateOp().Set(Gf.Vec3d(gcx, gcy, gcz))
+        gxf.AddScaleOp().Set(Gf.Vec3d(gsx, gsy, gsz))
+        # Add glass material
+        glass_mat = UsdShade.Material.Define(stage, f"{glass_path}/GlassMaterial")
+        glass_shader = UsdShade.Shader.Define(stage, f"{glass_path}/GlassMaterial/Shader")
+        glass_shader.SetShaderId("UsdPreviewSurface")
+        glass_shader.CreateInput("diffuseColor", Sdf.ValueTypeNames.Color3f).Set(Gf.Vec3f(0.85, 0.92, 0.97))
+        glass_shader.CreateInput("opacity", Sdf.ValueTypeNames.Float).Set(0.25)
+        glass_shader.CreateInput("ior", Sdf.ValueTypeNames.Float).Set(1.5)
+        glass_shader.CreateInput("roughness", Sdf.ValueTypeNames.Float).Set(0.05)
+        glass_shader.CreateInput("metallic", Sdf.ValueTypeNames.Float).Set(0.0)
+        glass_mat.CreateSurfaceOutput().ConnectToSource(glass_shader.ConnectableAPI(), "surface")
+        UsdShade.MaterialBindingAPI(glass_cube.GetPrim()).Bind(glass_mat)
+    if glass_panes:
+        print(f"[export_scene] Added {len(glass_panes)} glass panes")
 
     # Objects
     for oid, usd_file, obj in converted:
