@@ -198,6 +198,10 @@ sys.argv.append(f"--kit_args=--/exts/omni.services.transport.server.http/port={K
 sys.argv.append(f"--kit_args=--/app/livestream/fixedHostPort={MEDIA_PORT}")
 print(f"[interactive] WebRTC media UDP fixed to port {MEDIA_PORT}")
 
+# Suppress deprecation warnings from Isaac Sim 5.x transition at Kit level
+sys.argv.append("--kit_args=--/log/level=error")
+sys.argv.append("--kit_args=--/log/fileLogLevel=warning")
+
 # ── Start Isaac Sim via IsaacLab AppLauncher ──────────────────
 print("[interactive] Starting Isaac Sim (headless + NVCF streaming)...")
 parser = argparse.ArgumentParser(description="Interactive Isaac Sim")
@@ -279,16 +283,6 @@ try:
     _settings.set("/exts/omni.services.transport.server.http/port", KIT_API_PORT)
     # Keep Isaac app alive when control-ui websocket disconnects.
     _settings.set("/app/livestream/nvcf/allowSessionResume", True)
-    # Filter "has been deprecated" warnings from 5.x transition modules.
-    # These spam the console but are not actionable (internal wrapper modules).
-    _settings.set("/log/enabledChannels", "")  # reset
-    # Set known noisy deprecated channels to error-only
-    for _ch in ("omni.isaac.core", "omni.isaac.franka", "omni.isaac.manipulators",
-                "omni.isaac.motion_generation", "omni.isaac.sensor",
-                "omni.isaac.wheeled_robots", "omni.isaac.cortex",
-                "omni.isaac.dynamic_control", "omni.isaac.cloner",
-                "omni.isaac.version", "omni.isaac.kit", "omni.isaac.lula"):
-        _settings.set(f"/log/channels/{_ch}/level", "error")
     print(f"[interactive] Carb settings: livestream/port={WEBRTC_PORT}, "
           f"fixedHostPort={MEDIA_PORT}, http/port={KIT_API_PORT}")
 except Exception as exc:
