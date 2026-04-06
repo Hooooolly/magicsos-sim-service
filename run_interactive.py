@@ -28,6 +28,11 @@ import zipfile
 from pathlib import Path
 from urllib.parse import urlencode
 
+# ── Suppress Isaac Sim deprecation warnings (5.1.0 transition) ──
+import warnings
+warnings.filterwarnings("ignore", message=".*has been deprecated in favor of.*")
+warnings.filterwarnings("ignore", message=".*is deprecated.*")
+
 # ── Env defaults ──────────────────────────────────────────────
 os.environ.setdefault("ACCEPT_EULA", "Y")
 os.environ.setdefault("PRIVACY_CONSENT", "Y")
@@ -274,6 +279,16 @@ try:
     _settings.set("/exts/omni.services.transport.server.http/port", KIT_API_PORT)
     # Keep Isaac app alive when control-ui websocket disconnects.
     _settings.set("/app/livestream/nvcf/allowSessionResume", True)
+    # Filter "has been deprecated" warnings from 5.x transition modules.
+    # These spam the console but are not actionable (internal wrapper modules).
+    _settings.set("/log/enabledChannels", "")  # reset
+    # Set known noisy deprecated channels to error-only
+    for _ch in ("omni.isaac.core", "omni.isaac.franka", "omni.isaac.manipulators",
+                "omni.isaac.motion_generation", "omni.isaac.sensor",
+                "omni.isaac.wheeled_robots", "omni.isaac.cortex",
+                "omni.isaac.dynamic_control", "omni.isaac.cloner",
+                "omni.isaac.version", "omni.isaac.kit", "omni.isaac.lula"):
+        _settings.set(f"/log/channels/{_ch}/level", "error")
     print(f"[interactive] Carb settings: livestream/port={WEBRTC_PORT}, "
           f"fixedHostPort={MEDIA_PORT}, http/port={KIT_API_PORT}")
 except Exception as exc:
