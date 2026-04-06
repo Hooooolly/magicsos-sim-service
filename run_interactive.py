@@ -3601,42 +3601,28 @@ def _process_commands():
                             frame_viewport_prims(vp, paths[:30])
                         cmd["result"] = {"camera": "overview"}
                     else:
-                        # Move: read current camera transform, offset, write back
-                        cam_path = vp.camera_path or "/OmniverseKit_Persp"
-                        cam = stage.GetPrimAtPath(cam_path)
-                        if cam and cam.IsValid():
-                            xf = UsdGeom.Xformable(cam)
-                            mat = xf.ComputeLocalToWorldTransform(0)
-                            pos = mat.ExtractTranslation()
-                            # Direction offsets
-                            offsets = {
-                                "left": Gf.Vec3d(-step, 0, 0),
-                                "right": Gf.Vec3d(step, 0, 0),
-                                "forward": Gf.Vec3d(0, step, 0),
-                                "back": Gf.Vec3d(0, -step, 0),
-                                "up": Gf.Vec3d(0, 0, step),
-                                "down": Gf.Vec3d(0, 0, -step),
-                            }
-                            if direction in ("zoomIn", "zoomOut"):
-                                factor = 0.8 if direction == "zoomIn" else 1.25
-                                new_pos = Gf.Vec3d(pos[0]*factor, pos[1]*factor, pos[2]*factor)
-                            else:
-                                d = offsets.get(direction, Gf.Vec3d(0, 0, 0))
-                                new_pos = pos + d
-                            # Use frame_viewport_prims with a dummy prim at new position
-                            # to move camera there (safe, no crash)
-                            dummy_path = "/World/_cam_target"
-                            dummy = stage.DefinePrim(dummy_path, "Xform")
-                            dxf = UsdGeom.Xformable(dummy)
-                            dxf.ClearXformOpOrder()
-                            dxf.AddTranslateOp().Set(new_pos)
-                            simulation_app.update()
-                            frame_viewport_prims(vp, [dummy_path])
-                            simulation_app.update()
-                            stage.RemovePrim(dummy_path)
-                            cmd["result"] = {"camera": direction, "pos": [new_pos[0], new_pos[1], new_pos[2]]}
+                        # Move camera via viewport.transform in main loop (safe here)
+                        t = vp.transform
+                        pos = t.GetRow(3)
+                        offsets = {
+                            "left": (-step, 0, 0, 0),
+                            "right": (step, 0, 0, 0),
+                            "forward": (0, step, 0, 0),
+                            "back": (0, -step, 0, 0),
+                            "up": (0, 0, step, 0),
+                            "down": (0, 0, -step, 0),
+                        }
+                        nt = Gf.Matrix4d(t)
+                        if direction in ("zoomIn", "zoomOut"):
+                            f = 0.85 if direction == "zoomIn" else 1.18
+                            nt.SetRow(3, Gf.Vec4d(pos[0]*f, pos[1]*f, pos[2]*f, pos[3]))
                         else:
-                            cmd["error"] = "No camera found"
+                            d = offsets.get(direction, (0, 0, 0, 0))
+                            nt.SetRow(3, Gf.Vec4d(pos[0]+d[0], pos[1]+d[1], pos[2]+d[2], pos[3]))
+                        vp.transform = nt
+                        simulation_app.update()
+                        new_pos = vp.transform.GetRow(3)
+                        cmd["result"] = {"camera": direction, "pos": [new_pos[0], new_pos[1], new_pos[2]]}
                     print(f"[camera] {direction}")
                 except Exception as cam_exc:
                     cmd["error"] = f"Camera move failed: {cam_exc}"
