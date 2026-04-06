@@ -223,21 +223,29 @@ import omni.kit.app
 from pxr import Gf, UsdGeom, Usd
 
 # Isaac Sim version-compat imports (5.1.0 isaacsim.* or 4.5.0 omni.isaac.*)
-try:
-    from isaacsim.core.api import World as _World
-    from isaacsim.core.utils.stage import add_reference_to_stage as _add_ref
-    from isaacsim.core.utils.prims import create_prim as _create_prim
-    from isaacsim.core.api.articulations import Articulation as _Articulation
-    from isaacsim.core.utils.types import ArticulationAction as _ArticulationAction
-    _ISAAC_API = "5.x"
-except ImportError:
-    World = _World  # compat as _World
-    add_reference_to_stage = _add_ref  # compat as _add_ref
-    from omni.isaac.core.utils.prims import create_prim as _create_prim
-    from omni.isaac.core.articulations import Articulation as _Articulation
-    from omni.isaac.core.utils.types import ArticulationAction as _ArticulationAction
-    _ISAAC_API = "4.x"
-print(f"[interactive] Isaac API: {_ISAAC_API}")
+# These must run after Kit extensions are loaded. On 5.1.0, isaacsim.core.*
+# is only available after extension startup, so we defer with a lazy loader.
+_ISAAC_API = None
+
+def _init_isaac_compat():
+    global _World, _add_ref, _create_prim, _Articulation, _ArticulationAction, _ISAAC_API
+    if _ISAAC_API is not None:
+        return
+    try:
+        from isaacsim.core.api import World as _World
+        from isaacsim.core.utils.stage import add_reference_to_stage as _add_ref
+        from isaacsim.core.utils.prims import create_prim as _create_prim
+        from isaacsim.core.api.articulations import Articulation as _Articulation
+        from isaacsim.core.utils.types import ArticulationAction as _ArticulationAction
+        _ISAAC_API = "5.x"
+    except ImportError:
+        from omni.isaac.core import World as _World
+        from omni.isaac.core.utils.stage import add_reference_to_stage as _add_ref
+        from omni.isaac.core.utils.prims import create_prim as _create_prim
+        from omni.isaac.core.articulations import Articulation as _Articulation
+        from omni.isaac.core.utils.types import ArticulationAction as _ArticulationAction
+        _ISAAC_API = "4.x"
+    print(f"[interactive] Isaac API: {_ISAAC_API}")
 
 # ── Create viewport for NVCF frame capture ────────────────────
 try:
@@ -296,6 +304,9 @@ try:
 except Exception as exc:
     print(f"[interactive] WARNING: NVCF extension: {exc}")
 
+# Initialize Isaac API compat layer (must be after extension startup)
+_init_isaac_compat()
+
 # ── Detect actual Kit API port (may differ from KIT_API_PORT if taken) ──
 _actual_kit_port = KIT_API_PORT
 try:
@@ -333,7 +344,8 @@ def _normalize_collect_output_dir(output_dir: str | None, skill: str) -> str:
 
 
 def _create_world(*, add_ground_plane: bool):
-    World = _World  # compat
+    _init_isaac_compat()
+    World = _World
 
     w = World(physics_dt=1.0 / 120.0, rendering_dt=1.0 / 30.0)
     if add_ground_plane:
