@@ -222,6 +222,23 @@ import omni.usd
 import omni.kit.app
 from pxr import Gf, UsdGeom, Usd
 
+# Isaac Sim version-compat imports (5.1.0 isaacsim.* or 4.5.0 omni.isaac.*)
+try:
+    from isaacsim.core.api import World as _World
+    from isaacsim.core.utils.stage import add_reference_to_stage as _add_ref
+    from isaacsim.core.utils.prims import create_prim as _create_prim
+    from isaacsim.core.api.articulations import Articulation as _Articulation
+    from isaacsim.core.utils.types import ArticulationAction as _ArticulationAction
+    _ISAAC_API = "5.x"
+except ImportError:
+    World = _World  # compat as _World
+    add_reference_to_stage = _add_ref  # compat as _add_ref
+    from omni.isaac.core.utils.prims import create_prim as _create_prim
+    from omni.isaac.core.articulations import Articulation as _Articulation
+    from omni.isaac.core.utils.types import ArticulationAction as _ArticulationAction
+    _ISAAC_API = "4.x"
+print(f"[interactive] Isaac API: {_ISAAC_API}")
+
 # ── Create viewport for NVCF frame capture ────────────────────
 try:
     from omni.kit.viewport.utility import get_active_viewport
@@ -316,7 +333,7 @@ def _normalize_collect_output_dir(output_dir: str | None, skill: str) -> str:
 
 
 def _create_world(*, add_ground_plane: bool):
-    from omni.isaac.core import World
+    World = _World  # compat
 
     w = World(physics_dt=1.0 / 120.0, rendering_dt=1.0 / 30.0)
     if add_ground_plane:
@@ -689,7 +706,7 @@ def _runtime_create_franka(
 ):
     """Runtime scene helper exposed to scene-chat code as create_franka(...)."""
     from pxr import UsdGeom, Gf
-    from omni.isaac.core.utils.stage import add_reference_to_stage
+    add_reference_to_stage = _add_ref  # compat
 
     stage = stage or _get_stage()
     if stage is None:
@@ -700,7 +717,10 @@ def _runtime_create_franka(
         candidates.append(str(usd_path))
 
     try:
-        from omni.isaac.core.utils.nucleus import get_assets_root_path
+        try:
+            from isaacsim.core.utils.nucleus import get_assets_root_path
+        except ImportError:
+            from omni.isaac.core.utils.nucleus import get_assets_root_path
 
         assets_root = get_assets_root_path()
         if assets_root:
@@ -781,7 +801,7 @@ def _runtime_create_mug(
     Current policy: lock to SM_Mug_C1 only, so grasp annotations stay consistent.
     """
     from pxr import UsdGeom, UsdPhysics, Gf
-    from omni.isaac.core.utils.stage import add_reference_to_stage
+    add_reference_to_stage = _add_ref  # compat
 
     stage = stage or _get_stage()
     if stage is None:
@@ -802,7 +822,10 @@ def _runtime_create_mug(
     candidates = []
 
     try:
-        from omni.isaac.core.utils.nucleus import get_assets_root_path
+        try:
+            from isaacsim.core.utils.nucleus import get_assets_root_path
+        except ImportError:
+            from omni.isaac.core.utils.nucleus import get_assets_root_path
 
         assets_root = get_assets_root_path()
         if assets_root:
@@ -897,7 +920,7 @@ def _runtime_create_apple(
 ):
     """Runtime scene helper exposed to scene-chat code as create_apple(...)."""
     from pxr import UsdGeom, UsdPhysics, Gf
-    from omni.isaac.core.utils.stage import add_reference_to_stage
+    add_reference_to_stage = _add_ref  # compat
 
     stage = stage or _get_stage()
     if stage is None:
@@ -1004,7 +1027,7 @@ def _runtime_create_ball(
 ):
     """Runtime scene helper exposed to scene-chat code as create_ball(...)."""
     from pxr import UsdGeom, UsdPhysics, Gf
-    from omni.isaac.core.utils.stage import add_reference_to_stage
+    add_reference_to_stage = _add_ref  # compat
 
     stage = stage or _get_stage()
     if stage is None:
@@ -3548,7 +3571,7 @@ def _process_commands():
                 if not stage:
                     cmd["error"] = "No stage loaded"
                 else:
-                    from omni.isaac.core.utils.stage import add_reference_to_stage
+                    add_reference_to_stage = _add_ref  # compat
                     add_reference_to_stage(usd_path=cmd["usd_path"], prim_path=cmd["prim_path"])
                     xform = UsdGeom.Xformable(stage.GetPrimAtPath(cmd["prim_path"]))
                     xform.ClearXformOpOrder()
@@ -3644,12 +3667,12 @@ def _process_commands():
                 # Try importing common Isaac Sim utilities
                 _extra_globals = {}
                 try:
-                    from omni.isaac.core.utils.stage import add_reference_to_stage
+                    add_reference_to_stage = _add_ref  # compat
                     _extra_globals["add_reference_to_stage"] = add_reference_to_stage
                 except ImportError:
                     pass
                 try:
-                    from omni.isaac.core.utils.prims import create_prim
+                    create_prim = _create_prim  # compat
                     _extra_globals["create_prim"] = create_prim
                 except ImportError:
                     pass
@@ -4179,7 +4202,7 @@ def _run_pending_replay():
             # Step once so physics engine registers the articulation
             world.step(render=True)
 
-        from omni.isaac.core.articulations import Articulation
+        Articulation = _Articulation  # compat
         robot = Articulation(robot_prims[0].GetPath().pathString)
         robot.initialize()
 
@@ -4425,7 +4448,7 @@ def _run_pending_replay():
             print("[replay] WARNING: no wrist camera configs found in camera_meta")
 
         # Replay loop — all PD control with high finger gains for physical grip
-        from omni.isaac.core.utils.types import ArticulationAction
+        ArticulationAction = _ArticulationAction  # compat
         frame_interval = 1.0 / (fps * speed) if fps > 0 and speed > 0 else 1.0 / 30.0
         log_every = max(1, int(fps))  # log every 1 second
         finger_contact = {}
@@ -4670,7 +4693,7 @@ def _run_pending_replay_record():
             _state["physics"] = True
             world.step(render=True)
 
-        from omni.isaac.core.articulations import Articulation
+        Articulation = _Articulation  # compat
         robot = Articulation(robot_prims[0].GetPath().pathString)
         robot.initialize()
         dof_names = list(robot.dof_names)
@@ -4779,7 +4802,7 @@ def _run_pending_replay_record():
         )
 
         # ── Replay each episode ──
-        from omni.isaac.core.utils.types import ArticulationAction
+        ArticulationAction = _ArticulationAction  # compat
         finger_contact = {}
         global_frame = 0
 
@@ -4995,8 +5018,7 @@ def _run_deferred_inference_init():
             print(f"[init_inference] Found ArticulationRoot: {prim_path}")
             # Step world once (same pattern as collection code line 2717)
             world.step(render=True)
-            from omni.isaac.core.articulations import Articulation as _Art
-            art = _Art(prim_path)
+            art = _Articulation(prim_path)
             art.initialize()
             _inf_dc = art
             names = [str(n) for n in art.dof_names] if art.dof_names is not None else []
