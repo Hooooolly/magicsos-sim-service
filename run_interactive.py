@@ -2766,6 +2766,15 @@ def scene_info():
     })
 
 
+@bridge.route("/camera/move", methods=["POST"])
+def camera_move():
+    """Move camera in a direction. Enqueued to main loop for safe execution."""
+    data = request.get_json(silent=True) or {}
+    direction = data.get("direction", "overview")
+    step = float(data.get("step", 2.0))
+    return _enqueue_cmd("camera_move", direction=direction, step=step)
+
+
 @bridge.route("/viewport/reset", methods=["POST"])
 def viewport_reset():
     """Reset viewport camera to default overview angle."""
@@ -3572,6 +3581,66 @@ def _process_commands():
                         print(f"[scene_load] ERROR: {load_exc}")
                         import traceback
                         traceback.print_exc()
+
+            elif cmd_type == "camera_move":
+                try:
+                    from omni.kit.viewport.utility import get_active_viewport, frame_viewport_prims
+                    vp = get_active_viewport()
+                    direction = cmd.get("direction", "overview")
+                    step = float(cmd.get("step", 2.0))
+                    stage = _get_stage()
+
+                    if direction == "overview":
+                        # Frame all scene objects
+                        paths = []
+                        for group in ("SceneObjects", "SceneWalls"):
+                            grp = stage.GetPrimAtPath(f"/World/{group}")
+                            if grp and grp.IsValid():
+                                paths += [str(c.GetPath()) for c in grp.GetChildren()]
+                        if paths:
+                            frame_viewport_prims(vp, paths[:30])
+                        cmd["result"] = {"camera": "overview"}
+                    else:
+                        # Move: read current camera transform, offset, write back
+                        cam_path = vp.camera_path or "/OmniverseKit_Persp"
+                        cam = stage.GetPrimAtPath(cam_path)
+                        if cam and cam.IsValid():
+                            xf = UsdGeom.Xformable(cam)
+                            mat = xf.ComputeLocalToWorldTransform(0)
+                            pos = mat.ExtractTranslation()
+                            # Direction offsets
+                            offsets = {
+                                "left": Gf.Vec3d(-step, 0, 0),
+                                "right": Gf.Vec3d(step, 0, 0),
+                                "forward": Gf.Vec3d(0, step, 0),
+                                "back": Gf.Vec3d(0, -step, 0),
+                                "up": Gf.Vec3d(0, 0, step),
+                                "down": Gf.Vec3d(0, 0, -step),
+                            }
+                            if direction in ("zoomIn", "zoomOut"):
+                                factor = 0.8 if direction == "zoomIn" else 1.25
+                                new_pos = Gf.Vec3d(pos[0]*factor, pos[1]*factor, pos[2]*factor)
+                            else:
+                                d = offsets.get(direction, Gf.Vec3d(0, 0, 0))
+                                new_pos = pos + d
+                            # Use frame_viewport_prims with a dummy prim at new position
+                            # to move camera there (safe, no crash)
+                            dummy_path = "/World/_cam_target"
+                            dummy = stage.DefinePrim(dummy_path, "Xform")
+                            dxf = UsdGeom.Xformable(dummy)
+                            dxf.ClearXformOpOrder()
+                            dxf.AddTranslateOp().Set(new_pos)
+                            simulation_app.update()
+                            frame_viewport_prims(vp, [dummy_path])
+                            simulation_app.update()
+                            stage.RemovePrim(dummy_path)
+                            cmd["result"] = {"camera": direction, "pos": [new_pos[0], new_pos[1], new_pos[2]]}
+                        else:
+                            cmd["error"] = "No camera found"
+                    print(f"[camera] {direction}")
+                except Exception as cam_exc:
+                    cmd["error"] = f"Camera move failed: {cam_exc}"
+                    print(f"[camera] ERROR: {cam_exc}")
 
             elif cmd_type == "scene_save":
                 stage = _get_stage()
