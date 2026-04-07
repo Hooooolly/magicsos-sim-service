@@ -2769,7 +2769,7 @@ def scene_info():
 @bridge.route("/camera/move", methods=["POST"])
 def camera_move():
     """Move camera in a direction. Enqueued to main loop for safe execution."""
-    data = request.get_json(silent=True) or {}
+    data = flask_request.get_json(silent=True) or {}
     direction = data.get("direction", "overview")
     step = float(data.get("step", 2.0))
     return _enqueue_cmd("camera_move", direction=direction, step=step)
