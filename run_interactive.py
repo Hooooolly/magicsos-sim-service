@@ -3601,26 +3601,63 @@ def _process_commands():
                             frame_viewport_prims(vp, paths[:30])
                         cmd["result"] = {"camera": "overview"}
                     else:
-                        # Move camera via ViewportCameraState (the only API that
-                        # overrides the viewport manipulator's per-frame lock)
+                        # Move camera in screen-relative directions using ViewportCameraState
                         from omni.kit.viewport.utility.camera_state import ViewportCameraState
+                        import math
                         cam = ViewportCameraState(str(vp.camera_path), vp)
-                        cur = cam.position_world
-                        offsets = {
-                            "left": (-step, 0, 0),
-                            "right": (step, 0, 0),
-                            "forward": (0, step, 0),
-                            "back": (0, -step, 0),
-                            "up": (0, 0, step),
-                            "down": (0, 0, -step),
-                        }
+                        pos = cam.position_world
+                        tgt = cam.target_world
+                        # Compute view-relative axes
+                        fwd = Gf.Vec3d(tgt[0]-pos[0], tgt[1]-pos[1], tgt[2]-pos[2])
+                        fwd_len = math.sqrt(fwd[0]**2 + fwd[1]**2 + fwd[2]**2)
+                        if fwd_len > 1e-6:
+                            fwd = Gf.Vec3d(fwd[0]/fwd_len, fwd[1]/fwd_len, fwd[2]/fwd_len)
+                        world_up = Gf.Vec3d(0, 0, 1)
+                        # right = cross(fwd, world_up)
+                        right = Gf.Vec3d(
+                            fwd[1]*world_up[2] - fwd[2]*world_up[1],
+                            fwd[2]*world_up[0] - fwd[0]*world_up[2],
+                            fwd[0]*world_up[1] - fwd[1]*world_up[0])
+                        r_len = math.sqrt(right[0]**2 + right[1]**2 + right[2]**2)
+                        if r_len > 1e-6:
+                            right = Gf.Vec3d(right[0]/r_len, right[1]/r_len, right[2]/r_len)
+                        # up = cross(right, fwd)
+                        up = Gf.Vec3d(
+                            right[1]*fwd[2] - right[2]*fwd[1],
+                            right[2]*fwd[0] - right[0]*fwd[2],
+                            right[0]*fwd[1] - right[1]*fwd[0])
+
                         if direction in ("zoomIn", "zoomOut"):
-                            f = 0.85 if direction == "zoomIn" else 1.18
-                            new_pos = Gf.Vec3d(cur[0]*f, cur[1]*f, cur[2]*f)
+                            f = step if direction == "zoomIn" else -step
+                            delta = Gf.Vec3d(fwd[0]*f, fwd[1]*f, fwd[2]*f)
+                        elif direction == "up":
+                            delta = Gf.Vec3d(up[0]*step, up[1]*step, up[2]*step)
+                        elif direction == "down":
+                            delta = Gf.Vec3d(-up[0]*step, -up[1]*step, -up[2]*step)
+                        elif direction == "left":
+                            delta = Gf.Vec3d(-right[0]*step, -right[1]*step, -right[2]*step)
+                        elif direction == "right":
+                            delta = Gf.Vec3d(right[0]*step, right[1]*step, right[2]*step)
+                        elif direction == "forward":
+                            # Horizontal forward (project fwd onto XY plane)
+                            fwd_h = Gf.Vec3d(fwd[0], fwd[1], 0)
+                            h_len = math.sqrt(fwd_h[0]**2 + fwd_h[1]**2)
+                            if h_len > 1e-6:
+                                fwd_h = Gf.Vec3d(fwd_h[0]/h_len, fwd_h[1]/h_len, 0)
+                            delta = Gf.Vec3d(fwd_h[0]*step, fwd_h[1]*step, 0)
+                        elif direction == "back":
+                            fwd_h = Gf.Vec3d(fwd[0], fwd[1], 0)
+                            h_len = math.sqrt(fwd_h[0]**2 + fwd_h[1]**2)
+                            if h_len > 1e-6:
+                                fwd_h = Gf.Vec3d(fwd_h[0]/h_len, fwd_h[1]/h_len, 0)
+                            delta = Gf.Vec3d(-fwd_h[0]*step, -fwd_h[1]*step, 0)
                         else:
-                            d = offsets.get(direction, (0, 0, 0))
-                            new_pos = Gf.Vec3d(cur[0]+d[0], cur[1]+d[1], cur[2]+d[2])
+                            delta = Gf.Vec3d(0, 0, 0)
+
+                        new_pos = Gf.Vec3d(pos[0]+delta[0], pos[1]+delta[1], pos[2]+delta[2])
+                        new_tgt = Gf.Vec3d(tgt[0]+delta[0], tgt[1]+delta[1], tgt[2]+delta[2])
                         cam.set_position_world(new_pos, True)
+                        cam.set_target_world(new_tgt, True)
                         cmd["result"] = {"camera": direction, "pos": [new_pos[0], new_pos[1], new_pos[2]]}
                     print(f"[camera] {direction}")
                 except Exception as cam_exc:
