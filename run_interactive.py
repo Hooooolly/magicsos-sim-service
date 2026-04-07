@@ -3619,8 +3619,11 @@ def _process_commands():
                         else:
                             d = offsets.get(direction, (0, 0, 0, 0))
                             nt.SetRow(3, Gf.Vec4d(pos[0]+d[0], pos[1]+d[1], pos[2]+d[2], pos[3]))
-                        vp.transform = nt
-                        simulation_app.update()
+                        # Set transform multiple times across frames to override
+                        # viewport controller's per-frame camera reset
+                        for _ in range(10):
+                            vp.transform = nt
+                            simulation_app.update()
                         new_pos = vp.transform.GetRow(3)
                         cmd["result"] = {"camera": direction, "pos": [new_pos[0], new_pos[1], new_pos[2]]}
                     print(f"[camera] {direction}")
