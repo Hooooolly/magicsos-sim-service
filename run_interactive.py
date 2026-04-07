@@ -3601,38 +3601,27 @@ def _process_commands():
                             frame_viewport_prims(vp, paths[:30])
                         cmd["result"] = {"camera": "overview"}
                     else:
-                        # Move camera by modifying prim USD attributes directly
-                        # (same approach as Luban — viewport controller reads prim attrs each frame)
-                        cam_prim = stage.GetPrimAtPath("/OmniverseKit_Persp")
-                        if not cam_prim or not cam_prim.IsValid():
-                            cmd["error"] = "Camera prim /OmniverseKit_Persp not found"
+                        # Move camera via ViewportCameraState (the only API that
+                        # overrides the viewport manipulator's per-frame lock)
+                        from omni.kit.viewport.utility.camera_state import ViewportCameraState
+                        cam = ViewportCameraState(str(vp.camera_path), vp)
+                        cur = cam.position_world
+                        offsets = {
+                            "left": (-step, 0, 0),
+                            "right": (step, 0, 0),
+                            "forward": (0, step, 0),
+                            "back": (0, -step, 0),
+                            "up": (0, 0, step),
+                            "down": (0, 0, -step),
+                        }
+                        if direction in ("zoomIn", "zoomOut"):
+                            f = 0.85 if direction == "zoomIn" else 1.18
+                            new_pos = Gf.Vec3d(cur[0]*f, cur[1]*f, cur[2]*f)
                         else:
-                            xf = UsdGeom.Xformable(cam_prim)
-                            translate_op = None
-                            for op in xf.GetOrderedXformOps():
-                                if op.GetOpName() == "xformOp:translate":
-                                    translate_op = op
-                                    break
-                            if translate_op is None:
-                                cmd["error"] = "No translate op on camera prim"
-                            else:
-                                cur = translate_op.Get()
-                                offsets = {
-                                    "left": (-step, 0, 0),
-                                    "right": (step, 0, 0),
-                                    "forward": (0, step, 0),
-                                    "back": (0, -step, 0),
-                                    "up": (0, 0, step),
-                                    "down": (0, 0, -step),
-                                }
-                                if direction in ("zoomIn", "zoomOut"):
-                                    f = 0.85 if direction == "zoomIn" else 1.18
-                                    new_pos = Gf.Vec3d(cur[0]*f, cur[1]*f, cur[2]*f)
-                                else:
-                                    d = offsets.get(direction, (0, 0, 0))
-                                    new_pos = Gf.Vec3d(cur[0]+d[0], cur[1]+d[1], cur[2]+d[2])
-                                translate_op.Set(new_pos)
-                                cmd["result"] = {"camera": direction, "pos": [new_pos[0], new_pos[1], new_pos[2]]}
+                            d = offsets.get(direction, (0, 0, 0))
+                            new_pos = Gf.Vec3d(cur[0]+d[0], cur[1]+d[1], cur[2]+d[2])
+                        cam.set_position_world(new_pos, True)
+                        cmd["result"] = {"camera": direction, "pos": [new_pos[0], new_pos[1], new_pos[2]]}
                     print(f"[camera] {direction}")
                 except Exception as cam_exc:
                     cmd["error"] = f"Camera move failed: {cam_exc}"
